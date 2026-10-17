@@ -1,0 +1,627 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { Store } from "../server/store.js";
+import { CoyoteDevice } from "../server/device.js";
+import { Controller, type AiBridge } from "../server/controller.js";
+import type {
+  AiDecision,
+  ControlBounds,
+  PlaybackConfig,
+  Stage,
+  TaskPlan,
+  Waveform,
+} from "../shared/types.js";
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+const until = async (condition: () => boolean, timeout = 2000) => {
+  const end = Date.now() + timeout;
+  while (!condition()) {
+    if (Date.now() > end) throw new Error("Timed out");
+    await sleep(10);
+  }
+};
+const deferred = <T>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((accept) => {
+    resolve = accept;
+  });
+  return { promise, resolve };
+};
+const executeTick = (controller: Controller) =>
+  (controller as unknown as { tick(): void }).tick();
+
+async function fixture() {
+  const directory = mkdtempSync(join(tmpdir(), "coyote-controller-"));
+  const store = new Store(directory);
+  store.saveSettings({
+    baseUrl: "http://127.0.0.1:9876/v1",
+    model: "fixture-model",
+    apiKey: "fixture-secret",
+  });
+  let decision = async (): Promise<AiDecision> => ({
+    action: "rest",
+    channels: [],
+    waveformId: "",
+    intensity: 0,
+    durationSec: 1,
+    reason: "Fixture rest",
+  });
+  let draft!: Omit<TaskPlan, "id" | "version" | "createdAt">;
+  const ai: AiBridge = {
+    status: { ready: true },
+    decide: () => decision(),
+    draft: async () => draft,
+  };
+  const device = new CoyoteDevice();
+  const controller = new Controller(store, device, ai, [
+    { name: "测试波形", frames: ["0A0A0A0A00000000", "0B0B0B0B10101010"] },
+  ]);
+  await controller.connect({ protocol: "simulator" });
+  const wave = store.list<Waveform>("waveforms")[0]!;
+  await controller.updateChannels({
+    channels: {
+      A: { limit: 20, rampPerSecond: 20, target: 4, waveformId: wave.id },
+      B: { limit: 20, rampPerSecond: 20, target: 7, waveformId: wave.id },
+    },
+  });
+  const stage = (overrides: Partial<Stage> = {}): Stage => ({
+    id: randomUUID(),
+    name: "测试阶段",
+    durationSec: 5,
+    gapSec: 0,
+    channels: ["A"],
+    waveformId: wave.id,
+    intensity: 4,
+    startIntensity: 0,
+    behavior: "hold",
+    ...overrides,
+  });
+  const bounds = (overrides: Partial<ControlBounds> = {}): ControlBounds => ({
+    channels: ["A"],
+    waveformIds: [wave.id],
+    minIntensity: 0,
+    maxIntensity: 10,
+    rampPerSecond: 20,
+    allowSync: false,
+    allowRandom: false,
+    allowRamp: true,
+    allowRest: true,
+    maxActionSec: 10,
+    durationSec: 60,
+    decisionIntervalSec: 15,
+    preference: "fixture",
+    ...overrides,
+  });
+  const playback = (
+    overrides: Partial<PlaybackConfig> = {},
+  ): PlaybackConfig => ({
+    mode: "single",
+    stages: [stage()],
+    repeat: 0,
+    shuffle: false,
+    durationSec: 60,
+    ...overrides,
+  });
+  const plan = (b = bounds(), stages = [stage()]) => {
+    const p: TaskPlan = {
+      id: randomUUID(),
+      version: 1,
+      title: "Fixture task",
+      description: "确认内容",
+      completionCriteria: "计时或文字反馈",
+      bounds: b,
+      stages,
+      createdAt: Date.now(),
+    };
+    store.set("plans", p.id, p);
+    draft = p;
+    return p;
+  };
+  return {
+    directory,
+    store,
+    device,
+    controller,
+    ai,
+    wave,
+    stage,
+    bounds,
+    playback,
+    plan,
+    decide: (fn: () => Promise<AiDecision>) => {
+      decision = fn;
+    },
+    cleanup: async () => {
+      await controller.close();
+      await device.dispose();
+      store.close();
+      assert.ok(
+        resolve(directory).startsWith(resolve(tmpdir())) &&
+          basename(directory).startsWith("coyote-controller-"),
+      );
+      rmSync(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+test("manual single mode preserves independent channel targets and stops both channels", async () => {
+  const f = await fixture();
+  try {
+    await f.controller.startPlayback(
+      f.playback({ stages: [f.stage({ channels: ["A", "B"] })] }),
+      randomUUID(),
+    );
+    await until(
+      () =>
+        f.device.state.intensities.A === 4 &&
+        f.device.state.intensities.B === 7,
+    );
+    assert.equal(f.controller.run!.owner, "manual");
+    await f.controller.updateChannels({ channels: { A: { target: 2 } } });
+    await until(() => f.device.state.intensities.A === 2);
+    assert.equal(f.device.state.intensities.B, 7);
+    await f.controller.stop("manual");
+    assert.equal(f.controller.run!.status, "stopped");
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    assert.equal(f.controller.stopping, false);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("single-player explicit targets validate before reset and update actual channel controls", async () => {
+  const f = await fixture();
+  const originalStop = f.device.stop.bind(f.device);
+  let resets = 0;
+  f.device.stop = async () => {
+    resets++;
+    return originalStop();
+  };
+  try {
+    const imported = f.controller.importWaveform(
+      ["0C0C0C0C00000000"],
+      "播放器选择",
+    );
+    await f.controller.updateChannels({
+      channels: { A: { target: 0 }, B: { target: 0 } },
+    });
+    await assert.rejects(
+      f.controller.startPlayback(
+        f.playback({ singleTargets: { A: 21 } }),
+        randomUUID(),
+      ),
+      /播放强度超过上限/,
+    );
+    assert.equal(
+      resets,
+      0,
+      "invalid targets must be rejected before physical prepare",
+    );
+    await f.controller.startPlayback(
+      f.playback({
+        stages: [f.stage({ waveformId: imported.id, channels: ["A", "B"] })],
+        singleTargets: { A: 3, B: 6 },
+      }),
+      randomUUID(),
+    );
+    assert.equal(f.controller.config.A.waveformId, imported.id);
+    assert.equal(f.controller.config.B.waveformId, imported.id);
+    assert.equal(f.controller.config.A.target, 3);
+    assert.equal(f.controller.config.B.target, 6);
+    await until(
+      () =>
+        f.device.state.intensities.A === 3 &&
+        f.device.state.intensities.B === 6,
+    );
+  } finally {
+    f.device.stop = originalStop;
+    await f.cleanup();
+  }
+});
+
+test("locked tasks reject mutations, ordinary controls and takeover; repeated starts are idempotent", async () => {
+  const f = await fixture();
+  try {
+    const p = f.plan();
+    const requestId = randomUUID();
+    await f.controller.startTask(p.id, requestId);
+    const id = f.controller.run!.id;
+    await f.controller.startTask(p.id, requestId);
+    assert.equal(f.controller.run!.id, id);
+    await assert.rejects(
+      f.controller.updateChannels({ channels: { A: { target: 1 } } }),
+      /上锁任务/,
+    );
+    assert.throws(
+      () => f.controller.importWaveform(["0A0A0A0A01010101"]),
+      /上锁任务/,
+    );
+    assert.throws(() => f.controller.updatePlan(p.id, p), /上锁任务/);
+    await assert.rejects(f.controller.pause(), /上锁任务/);
+    await assert.rejects(f.controller.stop(), /上锁任务/);
+    await assert.rejects(f.controller.takeover(), /上锁任务/);
+    await assert.rejects(
+      f.controller.startAi(f.bounds(), randomUUID()),
+      /上锁任务/,
+    );
+    await f.controller.feedback("阶段已完成", "locked-task");
+    await f.controller.emergency();
+    assert.equal(f.controller.isLocked(), false);
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("emergency awaits a pending start reset and permanently invalidates that start", async () => {
+  const f = await fixture();
+  const gate = deferred<boolean>();
+  const stop = f.device.stop.bind(f.device);
+  let calls = 0;
+  f.device.stop = async () => {
+    calls++;
+    return gate.promise;
+  };
+  try {
+    const starting = f.controller.startPlayback(f.playback(), randomUUID());
+    const rejected = assert.rejects(starting, /取消/);
+    await until(() => calls === 1);
+    let finished = false;
+    const emergency = f.controller.emergency().then(() => {
+      finished = true;
+    });
+    await sleep(20);
+    assert.equal(
+      finished,
+      false,
+      "emergency must await physical stop confirmation",
+    );
+    assert.equal(f.controller.stopping, true);
+    gate.resolve(true);
+    await Promise.all([rejected, emergency]);
+    assert.equal(calls, 1, "the same in-flight physical reset is shared");
+    assert.equal(f.controller.stopping, false);
+    assert.equal(f.controller.isActive(), false);
+    f.device.stop = stop;
+    await f.controller.startPlayback(f.playback(), randomUUID());
+    assert.equal(
+      f.controller.run!.status,
+      "running",
+      "cancelled start does not leave a permanent stopping flag",
+    );
+  } finally {
+    gate.resolve(true);
+    f.device.stop = stop;
+    await f.cleanup();
+  }
+});
+
+test("emergency during pause wins over the stale pause result", async () => {
+  const f = await fixture();
+  const gate = deferred<boolean>();
+  const stop = f.device.stop.bind(f.device);
+  try {
+    await f.controller.startPlayback(f.playback(), randomUUID());
+    f.device.stop = () => gate.promise;
+    const pausing = f.controller.pause("manual");
+    const emergency = f.controller.emergency();
+    gate.resolve(true);
+    await Promise.all([pausing, emergency]);
+    assert.equal(f.controller.run!.status, "stopped");
+    assert.match(f.controller.run!.reason!, /紧急停止/);
+    assert.equal(f.controller.stopping, false);
+    await assert.rejects(f.controller.resume(), /没有可恢复/);
+  } finally {
+    gate.resolve(true);
+    f.device.stop = stop;
+    await f.cleanup();
+  }
+});
+
+test("emergency during connection blocks starts until cancelled connection cleanup finishes", async () => {
+  const f = await fixture();
+  const gate = deferred<void>();
+  const connect = f.device.connect.bind(f.device);
+  let entered = false;
+  f.device.connect = async (options) => {
+    entered = true;
+    await gate.promise;
+    await connect(options);
+  };
+  try {
+    const connecting = f.controller.connect({ protocol: "simulator" });
+    const rejected = assert.rejects(connecting, /取消/);
+    await until(() => entered);
+    let finished = false;
+    const emergency = f.controller.emergency().then(() => {
+      finished = true;
+    });
+    await sleep(20);
+    assert.equal(finished, false);
+    await assert.rejects(
+      f.controller.startPlayback(f.playback(), randomUUID()),
+      /先停止/,
+    );
+    gate.resolve();
+    await Promise.all([rejected, emergency]);
+    assert.equal(f.device.state.connected, false);
+    assert.equal(f.controller.stopping, false);
+    f.device.connect = connect;
+    await f.controller.connect({ protocol: "simulator" });
+    assert.equal(f.device.state.connected, true);
+  } finally {
+    gate.resolve();
+    f.device.connect = connect;
+    await f.cleanup();
+  }
+});
+
+test("late AI responses cannot restore stopped output or a discarded range", async () => {
+  const f = await fixture();
+  const request = deferred<AiDecision>();
+  try {
+    f.decide(() => request.promise);
+    await f.controller.startAi(f.bounds(), randomUUID());
+    executeTick(f.controller);
+    assert.equal(f.controller.run!.thinking, true);
+    await f.controller.emergency();
+    request.resolve({
+      action: "adjust",
+      channels: ["A"],
+      waveformId: f.wave.id,
+      intensity: 9,
+      durationSec: 5,
+      reason: "late",
+    });
+    await sleep(120);
+    assert.equal(f.controller.run!.status, "stopped");
+    assert.equal(f.controller.run!.lastDecision, undefined);
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("feedback supersedes earlier AI results; confirmed range changes remain paused", async () => {
+  const f = await fixture();
+  const old = deferred<AiDecision>();
+  const next = deferred<AiDecision>();
+  let calls = 0;
+  try {
+    f.decide(() => (++calls === 1 ? old.promise : next.promise));
+    await f.controller.startAi(f.bounds(), randomUUID());
+    executeTick(f.controller);
+    await f.controller.feedback("请减弱", "ai-control");
+    executeTick(f.controller);
+    assert.equal(calls, 2);
+    old.resolve({
+      action: "adjust",
+      channels: ["A"],
+      waveformId: f.wave.id,
+      intensity: 9,
+      durationSec: 5,
+      reason: "stale",
+    });
+    next.resolve({
+      action: "adjust",
+      channels: ["A"],
+      waveformId: f.wave.id,
+      intensity: 2,
+      durationSec: 5,
+      reason: "updated",
+    });
+    await until(() => f.controller.run?.lastDecision?.reason === "updated");
+    await f.controller.changeBounds(
+      f.bounds({ maxIntensity: 3, durationSec: 20 }),
+    );
+    assert.equal(f.controller.run!.status, "paused");
+    assert.equal(f.controller.run!.boundsVersion, 2);
+    assert.equal(f.controller.run!.bounds!.maxIntensity, 3);
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("deadlines end paused and background runs without a browser", async () => {
+  const f = await fixture();
+  try {
+    await f.controller.startPlayback(f.playback(), randomUUID());
+    await f.controller.pause();
+    f.controller.run!.deadlineAt = Date.now() - 1;
+    executeTick(f.controller);
+    await until(
+      () => f.controller.run!.status === "completed" && !f.controller.stopping,
+    );
+    await f.controller.startPlayback(
+      f.playback({ durationSec: 0.2 }),
+      randomUUID(),
+    );
+    await until(
+      () => f.controller.run!.status === "completed" && !f.controller.stopping,
+    );
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("random playback repeats a recorded seed and stays inside its authorized range", async () => {
+  const f = await fixture();
+  try {
+    const config = f.playback({
+      mode: "random",
+      stages: [],
+      random: {
+        channels: ["A"],
+        waveformIds: [f.wave.id],
+        minIntensity: 3,
+        maxIntensity: 6,
+        minIntervalSec: 1,
+        maxIntervalSec: 1,
+        minDurationSec: 1,
+        maxDurationSec: 1,
+        randomWaveform: true,
+        randomIntensity: true,
+        randomDuration: true,
+        seed: 12345,
+      },
+    });
+    const sequence = async () => {
+      await f.controller.startPlayback(config, randomUUID());
+      const values: number[] = [];
+      const internals = f.controller as unknown as {
+        playbackDesired(now: number): {
+          A: { target: number };
+          B: { target: number };
+        };
+      };
+      const start = Date.now();
+      for (let i = 0; i < 8; i++) {
+        const desired = internals.playbackDesired(start + i * 1001);
+        assert.ok(desired.A.target >= 3 && desired.A.target <= 6);
+        assert.equal(desired.B.target, 0);
+        values.push(desired.A.target);
+      }
+      assert.equal(f.controller.run!.randomSeed, 12345);
+      await f.controller.stop();
+      return values;
+    };
+    assert.deepEqual(await sequence(), await sequence());
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("task authorization rejects unapproved ramp, rest gaps and simultaneous channels", async () => {
+  const f = await fixture();
+  try {
+    const noRamp = f.plan(f.bounds({ allowRamp: false }), [
+      f.stage({ behavior: "ramp" }),
+    ]);
+    await assert.rejects(
+      f.controller.startTask(noRamp.id, randomUUID()),
+      /授权范围/,
+    );
+    const noRest = f.plan(f.bounds({ allowRest: false }), [
+      f.stage({ gapSec: 1 }),
+    ]);
+    await assert.rejects(
+      f.controller.startTask(noRest.id, randomUUID()),
+      /授权范围/,
+    );
+    const noSync = f.plan(f.bounds({ channels: ["A", "B"] }), [
+      f.stage({ channels: ["A", "B"] }),
+    ]);
+    await assert.rejects(
+      f.controller.startTask(noSync.id, randomUUID()),
+      /授权范围/,
+    );
+    assert.equal(f.controller.isActive(), false);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("unapproved AI actions fault the session and cannot send out-of-range output", async () => {
+  const f = await fixture();
+  try {
+    f.decide(async () => ({
+      action: "adjust",
+      channels: ["A"],
+      waveformId: f.wave.id,
+      intensity: 15,
+      durationSec: 5,
+      reason: "Unapproved target",
+    }));
+    await f.controller.startAi(f.bounds(), randomUUID());
+    executeTick(f.controller);
+    await until(
+      () => f.controller.run!.status === "faulted" && !f.controller.stopping,
+    );
+    assert.match(f.controller.run!.reason!, /授权范围/);
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("an unavailable AI runtime immediately ends an active session between decision intervals", async () => {
+  const f = await fixture();
+  try {
+    f.decide(async () => ({
+      action: "adjust",
+      channels: ["A"],
+      waveformId: f.wave.id,
+      intensity: 4,
+      durationSec: 10,
+      reason: "Continue",
+    }));
+    await f.controller.startAi(f.bounds(), randomUUID());
+    executeTick(f.controller);
+    await until(() => f.device.state.intensities.A === 4);
+    f.ai.status = { ready: false, error: "Fixture runtime disconnected" };
+    executeTick(f.controller);
+    await until(
+      () => f.controller.run!.status === "faulted" && !f.controller.stopping,
+    );
+    assert.match(f.controller.run!.reason!, /runtime disconnected/);
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a fresh task draft sees the current library and no ended-run authorization", async () => {
+  const f = await fixture();
+  try {
+    const p = f.plan();
+    await f.controller.startTask(p.id, randomUUID());
+    await f.controller.emergency();
+    const imported = f.controller.importWaveform(
+      ["0C0C0C0C00000000"],
+      "后来导入",
+    );
+    let context:
+      | { run: unknown; bounds?: unknown; waveforms: { id: string }[] }
+      | undefined;
+    f.ai.draft = async (_profile, _prompt, input) => {
+      context = input as typeof context;
+      return p;
+    };
+    await f.controller.draftTask("新的独立任务");
+    assert.equal(context!.run, null);
+    assert.equal(context!.bounds, undefined);
+    assert.ok(context!.waveforms.some((w) => w.id === imported.id));
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("service restart marks persisted execution interrupted and never restarts output", async () => {
+  const f = await fixture();
+  try {
+    await f.controller.startPlayback(f.playback(), randomUUID());
+    const persisted = structuredClone(f.controller.run!);
+    persisted.status = "running";
+    await f.controller.close();
+    f.store.set("runtime", "current", persisted);
+    const other = new Controller(f.store, f.device, f.ai);
+    try {
+      assert.equal(other.run!.status, "interrupted");
+      assert.equal(other.config.A.target, 0);
+      assert.equal(other.config.B.target, 0);
+      await sleep(150);
+      assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    } finally {
+      await other.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});

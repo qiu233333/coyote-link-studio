@@ -1,0 +1,11 @@
+node_modules/
+dist/
+data/
+.eve/
+.output/
+.env
+.env.*
+!.env.example
+artifacts/
+*.log
+ai-runtime/node_modules/
