@@ -13,7 +13,7 @@
 
 启动器仅设置本次启动进程的 PATH，不修改系统或用户全局环境。项目不需要 `.env` 文件；AI Base URL、API Key 和模型名在网页系统设置中填写。
 
-- `Start-Coyote.cmd`：后台启动项目，检查网页和 AI 运行时，并打开浏览器。
+- `Start-Coyote.cmd`：检查代码与依赖版本，需要时自动安装锁定依赖并重建网页和 AI 运行时，再启动后台、检查就绪并打开浏览器。
 - `Stop-Coyote.cmd`：停止本项目服务；结束前先尝试急停归零。
 - `scripts/local-service.ps1 status`：查询本项目服务状态。
 - `scripts/local-service.ps1 start -NoBrowser`：后台启动，不自动打开外部浏览器。
@@ -26,9 +26,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\local-service.ps1 
 
 `ExecutionPolicy Bypass` 仅用于这次脚本进程，不更改系统执行策略。
 
+更新代码后，先停止、再启动即可，启动器不再仅检查旧的构建文件是否存在。`scripts/build-state.mjs` 按文件路径与内容生成指纹，不依赖 Git 或修改时间；首次缺少成功记录、源码变化或产物缺失时都会重建。依赖配置变化时重新执行锁定安装。
+
+安装或构建失败会退出并保留诊断，不启动旧产物；构建期间代码发生变化也不会记录成功。已有后台还在运行时不修改其网页或 AI 产物，而是提示先停止再启动。
+
 ## 状态与日志
 
 - `data/service.json`：本项目后台进程及端口记录，不含 AI 密钥。
+- `data/build-state.json`：依赖安装和完整构建的成功指纹，不含 AI 密钥。
 - `data/service.stdout.log`：启动日志。
 - `data/service.stderr.log`：错误日志。
 - `GET /api/health`：本地服务健康状态，以及独立 AI 运行时是否就绪。

@@ -11,7 +11,7 @@
 
 ## 自动化测试
 
-`pnpm test`：76 项全部通过，覆盖以下边界：
+控制与 AI 功能的 76 项自动化测试全部通过，另有下文所列的 12 项启动器专项测试。控制功能覆盖以下边界：
 
 - 官方 SDK 的 V3/V4 模拟中继：扫码内容、发现和选择设备、强度转换、短波形发送。
 - 显式模拟设备、波形协议和上限校验。
@@ -83,6 +83,16 @@
 结果：`artifacts/live/verification.json`。截图：`idle-desktop.png`、`running-desktop.png`、`lowered-limits-desktop.png`、`locked-desktop.png`、`mobile.png`（均在 `artifacts/live/`）。
 
 浏览器验证同时发现隐藏祖先目录 `.codex` 会被 Express 的绝对路径 `sendFile` 判为隐藏文件并阻止首页。首页改为从限定 `dist` 根目录发送相对的 `index.html`，未放开隐藏文件访问；两个浏览器验收脚本均已通过该路径。
+
+## 启动器更新检测回归
+
+修复原启动器只检查旧构建是否存在的问题。代码合并后，Stop → Start 会检查源码内容指纹，必要时重建 `dist/` 与 `.output/`，构建成功后才启动服务；构建失败不能复用旧成功记录。现有后台仍运行时只提示先停止，不在运行期间替换 AI 产物。
+
+`pnpm exec tsx --test tests/build-state.test.ts`：12 项全部通过。临时目录验证首次启动、无 Git 目录、时间戳回退仍能检测内容变化、依赖变化、失败重试、缺失产物、构建期间源码变化、忽略日志和数据库，以及 CLI 成功/失败退出规则。CLI 的机器可读 JSON 使用 ASCII 转义，避免 Windows PowerShell 5.1 默认控制台编码破坏中文字符串。
+
+在本机实际验证了不含 Codex 临时 PATH 的启动环境，以及隐藏默认控制台下的 `Start-Coyote.cmd -NoBrowser`：自动发现 Node/pnpm、完整构建网页与 eve、后台启动并报告 AI 就绪。重复启动复用同一后台，版本检测确认无需安装或构建。原服务先通过既有归零确认流程结束，未强杀无法确认的设备输出。
+
+只读浏览器核对实际运行地址，确认网页加载最新构建资源，列表、阶段、随机及 AI 控制均显示 A/B 独立输入，刷新后仍为新版。当前服务 AI 已就绪、通道为零，未发送任何控制或模型请求。结果与截图：`artifacts/startup-current.json`、`artifacts/startup-current.png`。验证记录也保留了 WebSocket 403 后页面通过 HTTP 轮询获取状态的情况；没有放宽原有会话或连接限制。
 
 ## 尚未验证
 

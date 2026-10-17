@@ -15,6 +15,7 @@ $recordFile = Join-Path $recordDirectory 'service.json'
 $runtimeRoot = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies'
 $stdoutFile = Join-Path $recordDirectory 'service.stdout.log'
 $stderrFile = Join-Path $recordDirectory 'service.stderr.log'
+$buildStateScript = Join-Path $PSScriptRoot 'build-state.mjs'
 
 function Read-ServiceRecord {
     if (-not (Test-Path -LiteralPath $recordFile)) { return $null }
@@ -79,29 +80,52 @@ function Find-Pnpm {
     throw '依赖或构建产物缺失，且未找到 pnpm。请先安装 pnpm 11.5 或更新版本。'
 }
 
+function Get-ProjectBuildState([string]$NodePath) {
+    $json = & $NodePath $buildStateScript inspect
+    if ($LASTEXITCODE -ne 0) { throw '无法检查项目构建版本，请查看上方诊断。' }
+    $state = $json | ConvertFrom-Json
+    if ($state.sourceFingerprint -notmatch '^[a-f0-9]{64}$' -or $state.dependencyFingerprint -notmatch '^[a-f0-9]{64}$' -or $state.needsInstall -isnot [bool] -or $state.needsBuild -isnot [bool]) {
+        throw '项目构建版本检查结果无效，未启动后台。'
+    }
+    return $state
+}
+
 function Prepare-Project {
     $node = Find-Node
     $env:PATH = (Split-Path -Parent $node) + ';' + $env:PATH
     $fallbackDirectory = Join-Path $runtimeRoot 'bin\fallback'
     if (Test-Path -LiteralPath $fallbackDirectory) { $env:PATH = $fallbackDirectory + ';' + $env:PATH }
-    $dependenciesMissing = -not (Test-Path -LiteralPath (Join-Path $workspace 'node_modules\tsx\package.json'))
-    $buildMissing = -not (Test-Path -LiteralPath (Join-Path $workspace 'dist\index.html')) -or -not (Test-Path -LiteralPath (Join-Path $workspace '.output\server\index.mjs'))
-    if ($dependenciesMissing -or $buildMissing) {
+    $buildState = Get-ProjectBuildState $node
+    if ($buildState.needsInstall -or $buildState.needsBuild) {
         $pnpm = Find-Pnpm
         Push-Location -LiteralPath $workspace
         try {
-            if ($dependenciesMissing) {
+            if ($buildState.needsInstall) {
+                & $node $buildStateScript invalidate-dependencies | Out-Host
+                if ($LASTEXITCODE -ne 0) { throw '无法更新依赖记录，未启动后台。' }
                 Write-Host '正在安装锁定版本的项目依赖…'
                 & $pnpm install --frozen-lockfile | Out-Host
                 if ($LASTEXITCODE -ne 0) { throw '依赖安装失败，请检查网络后重试。' }
+                & $node $buildStateScript mark-dependencies $buildState.dependencyFingerprint | Out-Host
+                if ($LASTEXITCODE -ne 0) { throw '安装期间依赖配置发生变化，未启动旧版本。请重新运行 Start-Coyote.cmd。' }
+                $buildState = Get-ProjectBuildState $node
             }
-            Write-Host '正在构建前端和 AI 运行时…'
-            & $pnpm build | Out-Host
-            if ($LASTEXITCODE -ne 0) { throw '项目构建失败，请查看上方诊断。' }
+            if ($buildState.needsBuild) {
+                & $node $buildStateScript invalidate-build | Out-Host
+                if ($LASTEXITCODE -ne 0) { throw '无法更新构建记录，未启动后台。' }
+                Write-Host ('需要重新构建：{0}' -f $buildState.reason)
+                Write-Host '正在构建最新版网页和 AI 运行时，请等待完成…'
+                & $pnpm build | Out-Host
+                if ($LASTEXITCODE -ne 0) { throw '项目构建失败，未启动旧产物。请查看上方诊断后重试。' }
+                & $node $buildStateScript mark-build $buildState.sourceFingerprint | Out-Host
+                if ($LASTEXITCODE -ne 0) { throw '构建记录未确认（可能在构建时修改了代码），未启动后台。请重新运行 Start-Coyote.cmd。' }
+                $buildState = Get-ProjectBuildState $node
+            }
         }
         finally { Pop-Location }
     }
-    return $node
+    if ($buildState.needsInstall -or $buildState.needsBuild) { throw '项目构建版本尚未就绪，未启动后台。' }
+    return [pscustomobject]@{ nodePath = $node; sourceFingerprint = $buildState.sourceFingerprint }
 }
 
 function Wait-ServiceReady($Record) {
@@ -168,12 +192,17 @@ try {
 
     if ($null -ne $ownedProcess) {
         if ([int]$record.port -ne $Port) { throw ('后台已在端口 {0} 运行。请先停止，或使用相同端口启动。' -f $record.port) }
+        $currentBuild = Get-ProjectBuildState (Find-Node)
+        if ($currentBuild.needsInstall -or $currentBuild.needsBuild -or $record.sourceFingerprint -ne $currentBuild.sourceFingerprint) {
+            throw '代码已有更新，当前后台尚未加载最新版。请先运行 Stop-Coyote.cmd，再运行 Start-Coyote.cmd；启动器会自动完成重建。'
+        }
         Wait-ServiceReady $record
         exit 0
     }
     if (Test-PortOccupied $Port) { throw ('端口 {0} 已被其他进程占用，未启动或终止任何进程。请释放端口，或显式指定 -Port。' -f $Port) }
 
-    $node = Prepare-Project
+    $prepared = Prepare-Project
+    $node = $prepared.nodePath
     $null = New-Item -ItemType Directory -Path $recordDirectory -Force
     $env:COYOTE_PORT = [string]$Port
     $serviceProcess = Start-Process -FilePath $node -ArgumentList @('--import', 'tsx', ('"{0}"' -f $serverFile)) -WorkingDirectory $workspace -WindowStyle Hidden -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru
@@ -185,6 +214,7 @@ try {
         port = $Port
         startedUtc = [DateTime]::UtcNow.ToString('o')
         processCreationUtc = $processInfo.CreationDate.ToUniversalTime().ToString('o')
+        sourceFingerprint = $prepared.sourceFingerprint
     }
     $record | ConvertTo-Json | Set-Content -LiteralPath $recordFile -Encoding UTF8
     Write-Host '后台服务正在启动…'
