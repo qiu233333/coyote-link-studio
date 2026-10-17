@@ -185,39 +185,364 @@ test("manual single mode preserves independent channel targets and stops both ch
   }
 });
 
-test("20/19 hardware telemetry preserves zero user authorization until explicit save", async () => {
+test("20/19 device ceilings allow live control with legacy user limits still zero", async () => {
   const f = await fixture({ authorize: false, limits: { A: 20, B: 19 } });
   try {
     assert.deepEqual(f.controller.snapshot().device.limits, { A: 20, B: 19 });
     assert.equal(f.controller.config.A.limit, 0);
     assert.equal(f.controller.config.B.limit, 0);
-    await assert.rejects(
-      f.controller.startPlayback(
-        f.playback({ singleTargets: { A: 5 } }),
-        randomUUID(),
-      ),
-      /尚未设置用户上限/,
-    );
-    await assert.rejects(
-      f.controller.updateChannels({ channels: { A: { target: 1 } } }),
-      /超过上限/,
-    );
-    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
-    assert.equal(f.controller.run, null);
-    await f.controller.updateChannels({
-      channels: { A: { limit: 20 }, B: { limit: 19 } },
+    await f.controller.updateLiveChannels({
+      channels: { A: { target: 20 }, B: { target: 19 } },
     });
     assert.deepEqual(
       f.device.state.intensities,
       { A: 0, B: 0 },
-      "saving authorization never emits output",
+      "editing idle targets never emits output",
     );
-    await f.controller.startPlayback(
-      f.playback({ singleTargets: { A: 5 } }),
-      randomUUID(),
+    await f.controller.startLive(randomUUID());
+    await until(
+      () =>
+        f.device.state.intensities.A === 20 &&
+        f.device.state.intensities.B === 19,
     );
-    await until(() => f.device.state.intensities.A === 5, 4000);
+    assert.equal(f.controller.run!.mode, "live");
+    assert.equal(f.controller.config.A.limit, 0);
+    assert.equal(f.controller.config.B.limit, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("first live start clears persisted sync before reset telemetry can lower independent targets", async () => {
+  const f = await fixture({ authorize: false, limits: { A: 20, B: 19 } });
+  try {
+    f.controller.synced = true;
+    f.store.set("settings", "synced", true);
+    f.controller.config.A.target = 20;
+    f.controller.config.B.target = 19;
+    f.store.set("settings", "channels", f.controller.config);
+    await f.controller.startLive(randomUUID());
+    assert.equal(f.controller.synced, false);
+    assert.equal(f.store.get("settings", "synced"), false);
+    assert.deepEqual(
+      [f.controller.config.A.target, f.controller.config.B.target],
+      [20, 19],
+    );
+    await until(
+      () =>
+        f.device.state.intensities.A === 20 &&
+        f.device.state.intensities.B === 19,
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("live targets ignore old sync settings and hot channel/waveform changes reach device frames", async () => {
+  const f = await fixture({ authorize: false, limits: { A: 20, B: 19 } });
+  const frames: { channel: Channel; frames: string[] }[] = [];
+  const send = f.device.sendFrames.bind(f.device);
+  f.device.sendFrames = async (channel, values) => {
+    frames.push({ channel, frames: values });
+    return send(channel, values);
+  };
+  try {
+    f.controller.synced = true;
+    f.store.set("settings", "synced", true);
+    await f.controller.updateLiveChannels({
+      channels: { A: { target: 6 }, B: { enabled: false, target: 0 } },
+    });
+    assert.equal(f.controller.synced, false);
+    assert.equal(f.store.get("settings", "synced"), false);
+    assert.deepEqual(
+      [f.controller.config.A.target, f.controller.config.B.target],
+      [6, 0],
+    );
+    const request = randomUUID();
+    await f.controller.startLive(request);
+    const runId = f.controller.run!.id;
+    await f.controller.startLive(request);
+    assert.equal(f.controller.run!.id, runId);
+    await until(() => f.device.state.intensities.A === 6);
     assert.equal(f.device.state.intensities.B, 0);
+    assert.ok(frames.some((call) => call.channel === "A"));
+    assert.ok(!frames.some((call) => call.channel === "B"));
+    await f.controller.updateLiveChannels({
+      channels: { B: { enabled: true } },
+    });
+    await sleep(120);
+    assert.equal(
+      f.device.state.intensities.B,
+      0,
+      "enabling never restores the old target",
+    );
+    const wave = f.controller.importWaveform(["0C0C0C0C32323232"], "实时切换");
+    await f.controller.updateLiveChannels({
+      channels: { B: { target: 9, waveformId: wave.id } },
+    });
+    await until(() => f.device.state.intensities.B === 9);
+    await until(() =>
+      frames.some(
+        (call) => call.channel === "B" && call.frames.includes(wave.frames[0]),
+      ),
+    );
+    assert.equal(f.device.state.intensities.A, 6);
+    assert.equal(f.controller.run!.id, runId);
+    await f.controller.updateLiveChannels({
+      channels: { B: { enabled: false } },
+    });
+    await until(() => f.device.state.intensities.B === 0);
+    assert.equal(f.device.state.intensities.A, 6);
+    assert.equal(f.controller.run!.status, "running");
+    await f.controller.updateLiveChannels({ channels: { B: { target: 7 } } });
+    executeTick(f.controller);
+    await sleep(120);
+    assert.equal(f.controller.config.B.target, 7);
+    assert.equal(
+      f.device.state.intensities.B,
+      0,
+      "closed channels may be configured without output",
+    );
+    await f.controller.updateLiveChannels({
+      channels: { B: { enabled: true } },
+    });
+    await until(() => f.device.state.intensities.B === 7);
+    assert.equal(f.device.state.intensities.A, 6);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("rapid live patches remain independent and paused configuration only outputs after resume", async () => {
+  const f = await fixture({ authorize: false, limits: { A: 20, B: 19 } });
+  try {
+    await f.controller.startLive(randomUUID());
+    await Promise.all([
+      f.controller.updateLiveChannels({ channels: { A: { target: 2 } } }),
+      f.controller.updateLiveChannels({ channels: { B: { target: 4 } } }),
+      f.controller.updateLiveChannels({ channels: { A: { target: 8 } } }),
+      f.controller.updateLiveChannels({ channels: { B: { target: 3 } } }),
+    ]);
+    await until(
+      () =>
+        f.device.state.intensities.A === 8 &&
+        f.device.state.intensities.B === 3,
+    );
+    await assert.rejects(
+      f.controller.updateLiveChannels({ channels: { B: { target: 20 } } }),
+      /B 通道目标强度超过设备上限/,
+    );
+    await assert.rejects(
+      f.controller.updateLiveChannels({ channels: { A: { limit: 1 } } }),
+    );
+    const runId = f.controller.run!.id;
+    const deadline = f.controller.run!.deadlineAt;
+    await f.controller.pause("manual");
+    const wave = f.controller.importWaveform(["0D0D0D0D10101010"], "暂停配置");
+    await f.controller.updateLiveChannels({
+      channels: {
+        A: { target: 5, waveformId: wave.id },
+        B: { enabled: false },
+      },
+    });
+    executeTick(f.controller);
+    await sleep(150);
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    assert.equal(f.controller.run!.status, "paused");
+    await f.controller.startLive(randomUUID());
+    assert.equal(f.controller.run!.id, runId);
+    assert.equal(f.controller.run!.deadlineAt, deadline);
+    await until(() => f.device.state.intensities.A === 5);
+    assert.equal(f.device.state.intensities.B, 0);
+    assert.ok(f.controller.run!.waveformSnapshots[wave.id]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a late live configuration patch survives pause stop confirmation without sending output", async () => {
+  const f = await fixture({ authorize: false, limits: { A: 20, B: 19 } });
+  const gate = deferred<void>();
+  const stop = f.device.stop.bind(f.device);
+  const set = f.device.setIntensity.bind(f.device);
+  let stopping = false;
+  let intensityCalls = 0;
+  f.device.setIntensity = (channel, target) => {
+    intensityCalls++;
+    return set(channel, target);
+  };
+  try {
+    await f.controller.updateLiveChannels({ channels: { A: { target: 4 } } });
+    await f.controller.startLive(randomUUID());
+    await until(() => f.device.state.intensities.A === 4);
+    const wave = f.controller.importWaveform(
+      ["0E0E0E0E11111111"],
+      "暂停在途配置",
+    );
+    f.device.stop = async () => {
+      stopping = true;
+      await gate.promise;
+      return stop();
+    };
+    const pausing = f.controller.pause("manual");
+    await until(() => stopping);
+    assert.equal(f.controller.stopping, true);
+    assert.equal(f.controller.run!.status, "paused");
+    const before = intensityCalls;
+    await f.controller.updateLiveChannels({
+      channels: {
+        A: { target: 7, waveformId: wave.id },
+        B: { enabled: false, target: 3 },
+      },
+    });
+    executeTick(f.controller);
+    assert.equal(
+      intensityCalls,
+      before,
+      "configuration patch must never send device commands",
+    );
+    assert.equal(f.controller.config.A.target, 7);
+    gate.resolve();
+    await pausing;
+    assert.equal(f.controller.run!.status, "paused");
+    assert.equal(f.controller.stopping, false);
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    assert.equal(f.controller.config.A.waveformId, wave.id);
+    assert.equal(f.controller.config.B.target, 3);
+    await f.controller.startLive(randomUUID());
+    await until(() => f.device.state.intensities.A === 7);
+    assert.equal(f.device.state.intensities.B, 0);
+    const emergencyGate = deferred<void>();
+    f.device.stop = async () => {
+      await emergencyGate.promise;
+      return stop();
+    };
+    const emergency = f.controller.emergency();
+    await assert.rejects(
+      f.controller.updateLiveChannels({ channels: { A: { target: 9 } } }),
+      /设备正在停止/,
+    );
+    emergencyGate.resolve();
+    await emergency;
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+  } finally {
+    gate.resolve();
+    f.device.stop = stop;
+    await f.cleanup();
+  }
+});
+
+test("live controls retain device, waveform, ownership and locked-task checks", async () => {
+  const f = await fixture({ authorize: false, limits: { A: 20, B: 19 } });
+  try {
+    await assert.rejects(
+      f.controller.updateLiveChannels({
+        channels: { A: { waveformId: "missing" } },
+      }),
+      /波形不存在/,
+    );
+    await assert.rejects(
+      f.controller.updateLiveChannels({ channels: { A: { target: 21 } } }),
+      /设备上限/,
+    );
+    await f.controller.startAi(f.bounds({ maxIntensity: 20 }), randomUUID());
+    await assert.rejects(
+      f.controller.startLive(randomUUID()),
+      /先停止当前控制/,
+    );
+    await assert.rejects(
+      f.controller.updateLiveChannels({ channels: { A: { target: 3 } } }),
+      /先停止当前控制/,
+    );
+    await f.controller.emergency();
+    const plan = f.plan();
+    await f.controller.startTask(plan.id, randomUUID());
+    await assert.rejects(f.controller.startLive(randomUUID()), /上锁任务/);
+    await assert.rejects(
+      f.controller.updateLiveChannels({ channels: { A: { target: 3 } } }),
+      /上锁任务/,
+    );
+    await f.controller.emergency();
+    await f.controller.startPlayback(f.playback(), randomUUID());
+    await assert.rejects(
+      f.controller.startLive(randomUUID()),
+      /先停止当前控制/,
+    );
+    await assert.rejects(
+      f.controller.updateLiveChannels({ channels: { A: { target: 3 } } }),
+      /先停止当前控制/,
+    );
+    await f.controller.emergency();
+    await f.controller.disconnect();
+    await assert.rejects(f.controller.startLive(randomUUID()), /请先连接/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("AI uses current device ceilings and its own bounds when legacy limit fields are zero", async () => {
+  const f = await fixture({ authorize: false, limits: { A: 20, B: 19 } });
+  try {
+    let observed = false;
+    f.ai.decide = async (_profile, input) => {
+      const context = input as {
+        channels: Record<Channel, { limit: number; rampPerSecond?: number }>;
+        bounds: ControlBounds;
+      };
+      assert.equal(context.channels.A.limit, 20);
+      assert.equal(context.channels.B.limit, 19);
+      assert.equal(context.channels.A.rampPerSecond, undefined);
+      assert.equal(context.bounds.maxIntensity, 10);
+      observed = true;
+      return {
+        action: "adjust",
+        channels: ["A"],
+        waveformId: f.wave.id,
+        intensity: 6,
+        durationSec: 5,
+        reason: "设备边界内运行",
+      };
+    };
+    await f.controller.startAi(f.bounds(), randomUUID());
+    executeTick(f.controller);
+    await until(() => f.device.state.intensities.A === 6, 4000);
+    assert.equal(observed, true);
+    assert.equal(f.controller.config.A.limit, 0);
+    assert.equal(f.controller.config.B.limit, 0);
+    assert.equal(f.device.state.intensities.B, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("live hardware decreases clamp independent targets and excessive actual telemetry still stops", async () => {
+  const f = await fixture({ authorize: false, limits: { A: 20, B: 19 } });
+  try {
+    await f.controller.updateLiveChannels({
+      channels: { A: { target: 15 }, B: { target: 6 } },
+    });
+    await f.controller.startLive(randomUUID());
+    await until(
+      () =>
+        f.device.state.intensities.A >= 5 && f.device.state.intensities.B >= 5,
+    );
+    f.device.state.limits.A = 8;
+    f.device.emit("state", f.device.state);
+    assert.equal(f.controller.config.A.target, 8);
+    assert.equal(f.controller.config.B.target, 6);
+    await until(
+      () =>
+        f.device.state.intensities.A === 8 &&
+        f.device.state.intensities.B === 6,
+    );
+    assert.equal(f.controller.run!.status, "running");
+    f.device.state.limits.A = 2;
+    f.device.emit("state", f.device.state);
+    await until(
+      () => f.controller.run!.status === "faulted" && !f.controller.stopping,
+    );
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    assert.match(f.controller.run!.reason!, /回传强度超出确认边界/);
   } finally {
     await f.cleanup();
   }
@@ -307,7 +632,7 @@ test("a single selected channel survives disable and enable and still excludes t
   }
 });
 
-test("explicitly saving a lower user ceiling only lowers idle targets and never starts output", async () => {
+test("legacy user ceiling fields no longer constrain targets or start output", async () => {
   const f = await fixture();
   try {
     await f.controller.updateChannels({
@@ -321,7 +646,7 @@ test("explicitly saving a lower user ceiling only lowers idle targets and never 
     );
     assert.deepEqual(
       [f.controller.config.A.target, f.controller.config.B.target],
-      [6, 6],
+      [12, 12],
     );
     assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
     assert.equal(f.controller.run, null);
@@ -579,7 +904,7 @@ test("start rechecks a lower ceiling reported during initial reset", async () =>
 });
 
 test("single-player explicit targets validate before reset and update actual channel controls", async () => {
-  const f = await fixture();
+  const f = await fixture({ limits: { A: 20, B: 19 } });
   const originalStop = f.device.stop.bind(f.device);
   let resets = 0;
   f.device.stop = async () => {

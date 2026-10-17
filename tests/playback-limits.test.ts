@@ -96,25 +96,20 @@ function playback(
   };
 }
 
-test("播放器解释 20/19 设备已连接但用户上限 0，选择或预览均不扩大授权", () => {
+test("强度上限直接读取设备 A20/B19，旧用户上限 0 不再阻止配置", () => {
   const snapshot = state();
   const before = structuredClone(snapshot.channels);
-  assert.equal(effectiveChannelLimit(snapshot, "A"), 0);
-  assert.equal(playbackChannelsLimit(snapshot, ["A", "B"]).limit, 0);
-  assert.match(
-    playbackConfigIssue(snapshot, playback())!,
-    /用户上限为 0.*保存/,
-  );
+  assert.equal(effectiveChannelLimit(snapshot, "A"), 20);
+  assert.equal(effectiveChannelLimit(snapshot, "B"), 19);
+  assert.equal(playbackChannelsLimit(snapshot, ["A", "B"]).limit, 19);
+  assert.equal(playbackConfigIssue(snapshot, playback()), null);
   assert.deepEqual(snapshot.channels, before);
 
   snapshot.channels.A.limit = 12;
   assert.equal(playbackConfigIssue(snapshot, playback(["A"])), null);
-  assert.match(
-    playbackConfigIssue(snapshot, playback())!,
-    /B 通道用户上限为 0/,
-  );
+  assert.equal(playbackConfigIssue(snapshot, playback()), null);
   snapshot.channels.B.limit = 19;
-  assert.equal(playbackChannelsLimit(snapshot, ["A", "B"]).limit, 12);
+  assert.equal(playbackChannelsLimit(snapshot, ["A", "B"]).limit, 19);
   assert.equal(playbackConfigIssue(snapshot, playback()), null);
 });
 
@@ -128,7 +123,7 @@ test("所选通道分别受 20/19 限制，双通道共用强度和同步采用�
   assert.equal(playbackConfigIssue(snapshot, playback(["A"], 20)), null);
   assert.match(
     playbackConfigIssue(snapshot, playback(["A", "B"], 20))!,
-    /有效上限 19/,
+    /强度上限 19/,
   );
   const independent = playback();
   independent.singleTargets = { A: 20, B: 19 };
@@ -178,7 +173,7 @@ test("已打开的方案在设备上限下降后失效，各模式都保留草�
     const before = structuredClone(config);
     assert.equal(playbackConfigIssue(snapshot, config), null);
     snapshot.device.limits.B = 9;
-    assert.match(playbackConfigIssue(snapshot, config)!, /有效上限 9/);
+    assert.match(playbackConfigIssue(snapshot, config)!, /强度上限 9/);
     assert.deepEqual(config, before);
     assert.equal(snapshot.channels.B.limit, 19);
     snapshot.device.limits.B = 19;

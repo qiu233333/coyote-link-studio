@@ -7459,72 +7459,41 @@ button:disabled {
   color: #7189ac;
   margin-left: 6px;
 }
-/* Explicit channel authorization stays visible beside live device limits. */
-.channel-limits {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-  margin: 13px 0;
-  padding: 11px 0;
-  border-block: 1px solid #dce6f278;
+/* Live output follows each channel's device ceiling independently. */
+.live-layout.live-controls {
+  grid-template-columns: minmax(0, 1fr);
 }
-.channel-limits > span {
+.live-controls .channel-grid {
+  gap: 22px;
+}
+.live-play-button {
+  min-width: 144px;
+  min-height: 39px;
+}
+.channel-cap {
   display: flex;
-  flex-direction: column;
-  gap: 5px;
-  font-size: 10px;
-  color: #788cab;
-}
-.channel-limits strong {
-  display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 4px;
-  font-size: 17px;
-  color: #5e7fae;
-}
-.channel-b .channel-limits strong {
-  color: #b783a6;
-}
-.channel-limits small {
-  font-size: 9px;
-  font-weight: 500;
-  color: #a77592;
-}
-.channel-limit-notice {
-  display: flex;
-  align-items: flex-start;
-  flex-wrap: wrap;
-  gap: 7px;
-  padding: 11px;
-  margin-bottom: 12px;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 14px;
+  margin: 16px 0 12px;
   border: 1px solid #dce7f5;
   border-radius: 10px;
-  background: linear-gradient(120deg, #eaf3ffb5, #fff0f8a8);
-  color: #6e84a5;
+  background: linear-gradient(120deg, #eaf3ff80, #fff8fc80);
+  font-size: 12px;
+  color: #788cab;
 }
-.channel-limit-notice > svg {
-  flex-shrink: 0;
-  margin-top: 2px;
+.channel-cap strong {
+  color: #5e7fae;
+  font-size: 18px;
 }
-.channel-limit-notice > div {
-  flex: 1;
-  min-width: 100px;
+.channel-b .channel-cap {
+  border-color: #eddfea;
+  background: linear-gradient(120deg, #fff0f780, #f6f8ff80);
 }
-.channel-limit-notice strong,
-.channel-limit-notice > div > span {
-  display: block;
-  font-size: 11px;
-  line-height: 1.65;
+.channel-b .channel-cap strong {
+  color: #b783a6;
 }
-.channel-limit-notice > div > span {
-  margin-top: 3px;
-  font-size: 10px;
-}
-.channel-limit-notice .text-button {
-  font-size: 11px;
-}
-.channel-limit-hint,
 .playback-limit-summary {
   color: #788dac;
   font-size: 11px;
@@ -7534,14 +7503,17 @@ button:disabled {
 .playback-limit-summary strong {
   color: #6586b6;
 }
-.channel-advanced {
-  grid-template-columns: 1fr;
-}
-.channel-advanced .adopt-device-limit {
-  font-size: 11px;
-  white-space: normal;
-  min-height: 32px;
-  margin-top: 5px;
+@media (max-width: 680px) {
+  .live-controls .channel-grid {
+    gap: 12px;
+  }
+  .live-controls .subsection-heading {
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .live-play-button {
+    min-width: 116px;
+  }
 }
 .playback-issue {
   padding: 10px 12px;

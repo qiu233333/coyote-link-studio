@@ -73,6 +73,8 @@ test("HTTP 本机同源保护、密钥加密、WebSocket 和实际模拟器控�
       (await call("/api/device/connect", { protocol: "simulator" })).status,
       200,
     );
+    app.device.state.limits = { A: 20, B: 19 };
+    app.device.emit("state", app.device.state);
     assert.equal(
       (
         await call(
@@ -146,6 +148,66 @@ test("HTTP 本机同源保护、密钥加密、WebSocket 和实际模拟器控�
     assert.equal(stopped.result.data.run.status, "stopped");
     assert.equal(stopped.result.data.device.intensities.A, 0);
     assert.equal(stopped.result.data.stopUnconfirmed, false);
+    app.controller.synced = true;
+    const livePatch = await call(
+      "/api/console/live/channels",
+      { channels: { A: { target: 5 }, B: { target: 3 } } },
+      "PATCH",
+    );
+    assert.equal(livePatch.status, 200);
+    assert.equal(livePatch.result.data.synced, false);
+    assert.deepEqual(livePatch.result.data.device.intensities, { A: 0, B: 0 });
+    const liveStart = await call("/api/console/live/start", {
+      requestId: crypto.randomUUID(),
+    });
+    assert.equal(liveStart.status, 200);
+    assert.equal(liveStart.result.data.run.mode, "live");
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 450));
+    assert.deepEqual(app.device.state.intensities, { A: 5, B: 3 });
+    assert.equal(
+      (
+        await call(
+          "/api/console/live/channels",
+          { channels: { B: { target: 20 } } },
+          "PATCH",
+        )
+      ).status,
+      400,
+    );
+    assert.equal(
+      (
+        await call(
+          "/api/console/live/channels",
+          { channels: { A: { rampPerSecond: 1 } } },
+          "PATCH",
+        )
+      ).status,
+      400,
+    );
+    assert.equal((await call("/api/console/pause")).status, 200);
+    assert.equal(
+      (
+        await call(
+          "/api/console/live/channels",
+          { channels: { A: { target: 2 }, B: { enabled: false } } },
+          "PATCH",
+        )
+      ).status,
+      200,
+    );
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 150));
+    assert.deepEqual(app.device.state.intensities, { A: 0, B: 0 });
+    assert.equal(
+      (
+        await call("/api/console/live/start", {
+          requestId: crypto.randomUUID(),
+        })
+      ).status,
+      200,
+    );
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+    assert.deepEqual(app.device.state.intensities, { A: 2, B: 0 });
+    assert.equal((await call("/api/emergency-stop")).status, 200);
     assert.equal(
       (await call("/api/waveforms/import", { content: ["NOT-A-FRAME"] }))
         .status,

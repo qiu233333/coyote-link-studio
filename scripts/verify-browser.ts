@@ -40,7 +40,6 @@ function modelContext(messages: { role: string; content: unknown }[]) {
   return JSON.parse(text.slice(start)) as {
     bounds?: ControlBounds;
     waveforms: { id: string; name: string }[];
-    channels: Record<"A" | "B", { limit: number }>;
     device: { limits?: Record<"A" | "B", number> };
     feedback?: { role: string; text: string }[];
   };
@@ -67,11 +66,7 @@ const provider = createServer(async (request, response) => {
       const context = modelContext(body.messages);
       const waveformId = context.waveforms[0]?.id;
       assert.ok(waveformId, "必须使用当前库中真实波形 ID");
-      const maxIntensity = Math.min(
-        6,
-        context.channels.A.limit,
-        context.device.limits?.A ?? 200,
-      );
+      const maxIntensity = Math.min(6, context.device.limits?.A ?? 200);
       const bounds: ControlBounds = {
         channels: ["A"],
         waveformIds: [waveformId],
@@ -276,6 +271,7 @@ try {
   assert.ok(providerAddress && typeof providerAddress !== "string");
   application = await createApplication({ directory, dev: false });
   baseUrl = await application.listen(0);
+  assert.notEqual(new URL(baseUrl).port, "3000");
   browser = await chromium.launch({
     executablePath:
       "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
@@ -286,6 +282,17 @@ try {
     locale: "zh-CN",
     timezoneId: "Asia/Shanghai",
     reducedMotion: "reduce",
+  });
+  await context.route("**/*", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.origin === baseUrl || url.protocol === "data:")
+      await route.continue();
+    else {
+      errors.push(
+        `禁止访问独立验收实例以外的地址：${url.origin}${url.pathname}`,
+      );
+      await route.abort("blockedbyclient");
+    }
   });
   const page = await context.newPage();
   page.setDefaultTimeout(15000);
@@ -351,37 +358,29 @@ try {
   const connected = await snapshot(page);
   const wave = connected.waveforms[0];
   assert.ok(wave);
-  const caps = await api(
-    page,
-    "/api/console/channels",
-    {
-      channels: {
-        A: { enabled: true, limit: 12, rampPerSecond: 2, waveformId: wave.id },
-        B: { enabled: true, limit: 12, rampPerSecond: 2, waveformId: wave.id },
-      },
-    },
-    "PATCH",
-  );
-  assert.equal(caps.ok, true);
-  const player = page.locator(".single-player");
-  await player.getByLabel("播放器目标强度", { exact: true }).fill("4");
-  await player
-    .getByLabel("单波形播放方式", { exact: true })
-    .selectOption("timed");
-  await player.getByLabel("持续时间", { exact: true }).fill("60");
-  await player.getByRole("button", { name: "开始播放", exact: true }).click();
-  await page
-    .getByRole("dialog", { name: "确认开始播放" })
-    .getByRole("button", { name: "确认开始", exact: true })
-    .click();
+  await page.getByLabel("A 通道波形", { exact: true }).selectOption(wave.id);
+  await page.getByLabel("B 通道波形", { exact: true }).selectOption(wave.id);
+  await page.getByLabel("A 通道目标强度", { exact: true }).fill("4");
+  await page.getByLabel("B 通道目标强度", { exact: true }).fill("5");
   await waitState(
     page,
-    "单波形非零输出",
+    "实时卡片目标保存但未启动",
+    (state) =>
+      state.channels.A.target === 4 &&
+      state.channels.B.target === 5 &&
+      !state.run,
+  );
+  assert.deepEqual((await snapshot(page)).device.intensities, { A: 0, B: 0 });
+  await page.getByRole("button", { name: "实时播放控制", exact: true }).click();
+  await waitState(
+    page,
+    "实时双通道非零输出",
     (state) =>
       state.run?.owner === "manual" &&
+      state.run.mode === "live" &&
       state.run.status === "running" &&
-      state.device.intensities.A > 0 &&
-      state.device.intensities.B > 0,
+      state.device.intensities.A === 4 &&
+      state.device.intensities.B === 5,
   );
   await page.waitForFunction(
     () =>
@@ -401,7 +400,7 @@ try {
       state.device.intensities.A === 0 &&
       state.device.intensities.B === 0,
   );
-  steps.push("UI 显式模拟连接，双通道限幅设置，单波形非零输出与停止归零");
+  steps.push("UI 显式模拟连接，独立双通道实时目标保存，显式开始输出与停止归零");
 
   await navigate(page, "AI 控制");
   await page.getByLabel("AI 最高强度", { exact: true }).fill("6");
@@ -543,16 +542,16 @@ try {
     true,
   );
   assert.equal(
-    await page
-      .getByRole("switch", { name: "A / B 同步", exact: true })
-      .isDisabled(),
+    await page.getByLabel("A 通道目标强度", { exact: true }).isDisabled(),
     true,
   );
   assert.equal(
-    await player.getByLabel("播放器目标强度", { exact: true }).isDisabled(),
+    await page
+      .getByRole("button", { name: "实时播放控制", exact: true })
+      .isDisabled(),
     true,
   );
-  for (const path of ["/api/console/channels", "/api/ai-control/pause"]) {
+  for (const path of ["/api/console/live/channels", "/api/ai-control/pause"]) {
     expectedRejections.add(path);
     const rejected = await api(
       page,

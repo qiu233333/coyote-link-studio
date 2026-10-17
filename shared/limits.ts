@@ -6,7 +6,7 @@ const channels: Channel[] = ["A", "B"];
 const safeLimit = (value: number) =>
   Number.isFinite(value) ? Math.max(0, Math.min(200, Math.floor(value))) : 0;
 
-/** Enabled channel authorization, current hardware ceiling and session bounds. */
+/** Enabled channel hardware ceiling, optionally narrowed by session bounds. */
 export function channelLimit(
   config: Channels,
   deviceLimits: Limits,
@@ -19,7 +19,6 @@ export function channelLimit(
   )
     return 0;
   return Math.min(
-    safeLimit(config[channel].limit),
     safeLimit(deviceLimits[channel]),
     safeLimit(bounds?.maxIntensity ?? 200),
   );

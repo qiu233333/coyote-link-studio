@@ -150,6 +150,12 @@ export async function createApplication(
   route("patch", "/api/console/channels", (req) =>
     controller.updateChannels(req.body),
   );
+  route("patch", "/api/console/live/channels", (req) =>
+    controller.updateLiveChannels(req.body),
+  );
+  route("post", "/api/console/live/start", (req) =>
+    controller.startLive(text(req.body.requestId, "请求标识", 200)),
+  );
   route("post", "/api/console/play", (req) =>
     controller.startPlayback(
       req.body.config,

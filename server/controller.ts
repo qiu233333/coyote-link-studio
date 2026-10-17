@@ -139,8 +139,8 @@ export class Controller extends EventEmitter {
       this.log("warning", "系统", this.run!.reason);
     }
     device.on("state", (state) => {
-      // Hardware ceilings may fall between ticks. Preserve the user's saved
-      // authorization, but immediately lower live targets and ramp state.
+      // Hardware ceilings may fall between ticks. Immediately lower configured
+      // targets and live ramp state without waiting for another scheduler tick.
       if (state.connected) this.clampToDeviceLimits();
       for (const channel of channels)
         if (state.intensities[channel] !== this.lastReported[channel]) {
@@ -161,7 +161,7 @@ export class Controller extends EventEmitter {
       if (active(this.run) && !this.stopping) {
         // Disabling changes the next output target to zero. While the two zero
         // commands are confirmed independently, telemetry must still be checked
-        // against saved authorization and hardware ceilings rather than treating
+        // against session authorization and hardware ceilings rather than treating
         // the other channel's previous value as a newly unauthorized increase.
         const reportedConfig = {
           A: { ...this.config.A, enabled: true },
@@ -173,6 +173,7 @@ export class Controller extends EventEmitter {
             state.limits,
             channel,
             this.synced &&
+              this.run?.mode !== "live" &&
               this.config.A.enabled &&
               this.config.B.enabled &&
               this.run?.owner === "manual",
@@ -237,18 +238,24 @@ export class Controller extends EventEmitter {
       this.config,
       this.device.state.limits,
       channel,
-      this.synced && (!active(this.run) || this.run?.owner === "manual"),
+      this.synced &&
+        this.run?.mode !== "live" &&
+        (!active(this.run) || this.run?.owner === "manual"),
       active(this.run) ? this.run?.bounds : undefined,
     );
   }
   private clampToDeviceLimits() {
     let changed = false;
+    const configured = {
+      A: { ...this.config.A, enabled: true },
+      B: { ...this.config.B, enabled: true },
+    };
     for (const channel of channels) {
       const maximum = outputLimit(
-        this.config,
+        configured,
         this.device.state.limits,
         channel,
-        this.synced,
+        this.synced && this.run?.mode !== "live",
       );
       if (this.config[channel].target > maximum) {
         this.config[channel].target = maximum;
@@ -264,11 +271,7 @@ export class Controller extends EventEmitter {
     if (changed) {
       this.store.set("settings", "channels", this.config);
       this.persist();
-      this.log(
-        "warning",
-        "控制器",
-        "设备有效上限降低，已同步下调目标强度；用户设置上限保持原授权。",
-      );
+      this.log("warning", "控制器", "设备上限降低，已下调目标强度。");
     }
   }
   snapshot(): AppSnapshot {
@@ -485,6 +488,101 @@ export class Controller extends EventEmitter {
       this.broadcast(true);
     }
   }
+  private checkLiveChannels(config = this.config) {
+    for (const channel of channels) {
+      if (config[channel].enabled) this.requireWave(config[channel].waveformId);
+      assert(
+        config[channel].target <= this.device.state.limits[channel],
+        `${channel} 通道目标强度超过设备上限。`,
+      );
+    }
+  }
+  async updateLiveChannels(input: unknown) {
+    this.assertUnlocked();
+    assert(
+      !active(this.run) ||
+        (this.run?.owner === "manual" && this.run.mode === "live"),
+      "请先停止当前控制，再编辑实时通道。",
+      "OWNER_CONFLICT",
+      409,
+    );
+    const pausingLive =
+      this.run?.owner === "manual" &&
+      this.run.mode === "live" &&
+      this.run.status === "paused";
+    assert(
+      !this.stopping || pausingLive,
+      "设备正在停止，请稍候。",
+      "CONTROLLER_BUSY",
+      409,
+    );
+    const channelPatch = z
+      .object({
+        enabled: z.boolean().optional(),
+        target: z.number().int().min(0).max(200).optional(),
+        waveformId: z.string().min(1).optional(),
+      })
+      .strict();
+    const patch = z
+      .object({
+        channels: z
+          .object({ A: channelPatch.optional(), B: channelPatch.optional() })
+          .strict(),
+      })
+      .strict()
+      .parse(input);
+    const next = structuredClone(this.config);
+    for (const channel of channels) {
+      Object.assign(next[channel], patch.channels[channel]);
+      if (patch.channels[channel]?.waveformId)
+        this.requireWave(next[channel].waveformId);
+    }
+    this.checkLiveChannels(next);
+    this.config = next;
+    // Older installations can have manual synchronization persisted. Live
+    // control explicitly owns independent targets, including its first patch.
+    this.synced = false;
+    this.store.set("settings", "channels", this.config);
+    this.store.set("settings", "synced", false);
+    if (active(this.run) && this.run?.mode === "live") {
+      this.run.waveformSnapshots = Object.fromEntries(
+        this.waves().map((wave) => [wave.id, structuredClone(wave)]),
+      );
+      this.persist();
+    }
+    this.log("info", "实时控制", "已更新实时通道");
+  }
+  async startLive(requestId: string) {
+    if (this.seenRequest(requestId)) return;
+    this.assertUnlocked();
+    assert(
+      !active(this.run) ||
+        (this.run?.owner === "manual" && this.run.mode === "live"),
+      "请先停止当前控制，再开始实时控制。",
+      "OWNER_CONFLICT",
+      409,
+    );
+    this.assertDevice();
+    this.checkLiveChannels();
+    if (active(this.run)) {
+      if (this.run!.status === "paused") await this.resume("manual");
+      this.store.set("requests", requestId, { at: Date.now() });
+      return;
+    }
+    // Reset telemetry must already use independent ceilings on the first start.
+    this.synced = false;
+    this.store.set("settings", "synced", false);
+    await this.prepare(requestId);
+    this.checkLiveChannels();
+    this.run = this.makeRun(
+      "manual",
+      "live",
+      86400,
+      this.waves().map((wave) => wave.id),
+    );
+    this.persist();
+    this.log("info", "实时控制", "已开始实时控制");
+  }
   async updateChannels(patch: {
     channels?: Partial<Record<Channel, Partial<ChannelConfig>>>;
     synced?: boolean;
@@ -510,12 +608,6 @@ export class Controller extends EventEmitter {
             waveformId: z.string(),
           })
           .parse({ ...next[channel], ...item });
-        if (item.limit !== undefined && item.target === undefined)
-          parsed.target = Math.min(parsed.target, parsed.limit);
-        assert(
-          parsed.target <= parsed.limit,
-          `${channel} 通道目标强度不能超过上限。`,
-        );
         if (parsed.waveformId) this.requireWave(parsed.waveformId);
         if (!parsed.enabled) parsed.target = 0;
         next[channel] = parsed;
@@ -528,10 +620,6 @@ export class Controller extends EventEmitter {
         next.A.enabled && next.B.enabled
           ? (changed ?? Math.min(next.A.target, next.B.target))
           : 0;
-      assert(
-        target <= Math.min(next.A.limit, next.B.limit),
-        "同步强度不能超过任一通道上限。",
-      );
       next.A.target = target;
       next.B.target = target;
     }
@@ -540,7 +628,7 @@ export class Controller extends EventEmitter {
         assert(
           next[channel].target <=
             outputLimit(next, this.device.state.limits, channel, synced),
-          `${channel} 通道目标强度超过设备、用户或同步有效上限。`,
+          `${channel} 通道目标强度超过设备或同步有效上限。`,
         );
     if (active(this.run)) {
       assert(
@@ -634,16 +722,12 @@ export class Controller extends EventEmitter {
   private checkBounds(bounds: ControlBounds) {
     for (const channel of bounds.channels) {
       assert(
-        this.config[channel].enabled && this.config[channel].limit > 0,
-        `请先在控制台启用 ${channel} 通道并设置上限。`,
+        this.config[channel].enabled,
+        `请先在控制台启用 ${channel} 通道。`,
       );
       assert(
-        bounds.maxIntensity <=
-          Math.min(
-            this.config[channel].limit,
-            this.device.state.limits[channel],
-          ),
-        `${channel} 通道 AI 范围超过设备或用户上限。`,
+        bounds.maxIntensity <= this.device.state.limits[channel],
+        `${channel} 通道 AI 范围超过设备上限。`,
       );
     }
     for (const id of bounds.waveformIds) this.requireWave(id);
@@ -768,9 +852,7 @@ export class Controller extends EventEmitter {
         assert(
           target <=
             outputLimit(this.config, this.device.state.limits, c, this.synced),
-          this.config[c].limit === 0 && target > 0
-            ? `${c} 通道尚未设置用户上限，请先明确保存上限。`
-            : `${c} 通道播放强度超过上限（设备、用户或同步有效上限）。`,
+          `${c} 通道播放强度超过上限（设备或同步有效上限）。`,
         );
       }
       if (this.synced && stage.channels.length === 2)
@@ -1028,6 +1110,7 @@ export class Controller extends EventEmitter {
       "RUN_EXPIRED",
       409,
     );
+    if (this.run.mode === "live") this.checkLiveChannels();
     this.run.status = "running";
     this.progressAt = Date.now();
     this.tickAt = Date.now();
@@ -1240,6 +1323,16 @@ export class Controller extends EventEmitter {
     return min + this.random() * (max - min);
   }
   private playbackDesired(now: number): Desired {
+    if (this.run!.mode === "live") {
+      const desired = this.zeroDesired();
+      for (const channel of channels)
+        if (this.config[channel].enabled)
+          desired[channel] = {
+            target: this.config[channel].target,
+            waveformId: this.config[channel].waveformId,
+          };
+      return desired;
+    }
     const run = this.run!,
       config = run.playback!,
       result = this.zeroDesired();
@@ -1404,7 +1497,17 @@ export class Controller extends EventEmitter {
         intensities: this.device.state.intensities,
         limits: this.device.state.limits,
       },
-      channels: this.config,
+      channels: Object.fromEntries(
+        channels.map((channel) => [
+          channel,
+          {
+            enabled: this.config[channel].enabled,
+            target: this.config[channel].target,
+            waveformId: this.config[channel].waveformId,
+            limit: this.device.state.limits[channel],
+          },
+        ]),
+      ),
       waveforms: (run
         ? Object.values(run.waveformSnapshots)
         : this.waves()
@@ -1585,7 +1688,7 @@ export class Controller extends EventEmitter {
         this.config,
         { A: 200, B: 200 },
         channel,
-        this.synced && run.owner === "manual",
+        this.synced && run.mode !== "live" && run.owner === "manual",
         run.bounds,
       );
       if (
@@ -1599,7 +1702,7 @@ export class Controller extends EventEmitter {
       output.target = Math.min(output.target, maximum);
       this.levels[channel] = Math.min(this.levels[channel], maximum);
       const rate = Math.min(
-        this.config[channel].rampPerSecond,
+        run.mode === "live" ? 20 : this.config[channel].rampPerSecond,
         run.bounds?.rampPerSecond ?? 20,
       );
       const difference = output.target - this.levels[channel];

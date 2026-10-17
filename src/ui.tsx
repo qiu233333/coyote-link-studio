@@ -264,6 +264,7 @@ export function NumberInput({
   step = 1,
   label,
   disabled,
+  onBlur,
 }: {
   value: number;
   onChange: (n: number) => void;
@@ -272,7 +273,17 @@ export function NumberInput({
   step?: number;
   label: string;
   disabled?: boolean;
+  onBlur?: () => void;
 }) {
+  const [draft, setDraft] = useState(String(value));
+  const focused = useRef(false);
+  useEffect(() => {
+    if (!focused.current || disabled) setDraft(String(value));
+    else if (max !== undefined)
+      setDraft((current) =>
+        Number(current) > max && value <= max ? String(value) : current,
+      );
+  }, [value, max, disabled]);
   return (
     <input
       aria-label={label}
@@ -280,10 +291,23 @@ export function NumberInput({
       min={min}
       max={max}
       step={step}
-      value={value}
+      value={draft}
       disabled={disabled}
+      onFocus={() => {
+        focused.current = true;
+      }}
+      onBlur={() => {
+        focused.current = false;
+        // Empty text is an editing state, never an implicit command to output 0.
+        // Reconcile with the latest committed/optimistic value on leaving it.
+        setDraft(String(value));
+        onBlur?.();
+      }}
       onChange={(e) => {
-        const n = Number(e.target.value);
+        const text = e.target.value;
+        setDraft(text);
+        if (text.trim() === "") return;
+        const n = Number(text);
         if (Number.isFinite(n)) onChange(n);
       }}
     />

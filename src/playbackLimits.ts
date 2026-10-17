@@ -33,16 +33,13 @@ export function playbackChannelsLimit(
     reason = "A / B 同步需要同时选择两个通道；单通道播放请先关闭同步。";
   else {
     const disabled = selectedChannels.filter((c) => !state.channels[c].enabled);
-    const unset = selectedChannels.filter((c) => state.channels[c].limit === 0);
     const unavailable = selectedChannels.filter(
       (c) => state.device.limits[c] === 0,
     );
     if (disabled.length)
       reason = `${disabled.join(" / ")} 通道未启用，请启用或取消选择。`;
-    else if (unset.length)
-      reason = `${unset.join(" / ")} 通道用户上限为 0，请在通道卡片明确保存上限后播放。`;
     else if (unavailable.length)
-      reason = `${unavailable.join(" / ")} 通道设备上限为 0，请检查 APP 的上限设置与回传。`;
+      reason = `${unavailable.join(" / ")} 通道强度上限为 0，请检查 APP 的上限设置与回传。`;
   }
   return { channels: selectedChannels, limit, reason };
 }
@@ -74,7 +71,7 @@ export function playbackConfigIssue(
     if (random.minIntensity < 0 || random.maxIntensity < random.minIntensity)
       return "随机强度上限不能小于下限，且强度不能为负数。";
     if (random.maxIntensity > selection.limit)
-      return `随机强度超过所选通道有效上限 ${selection.limit}，请调低后播放。`;
+      return `随机强度超过所选通道强度上限 ${selection.limit}，请调低后播放。`;
     return null;
   }
   if (!config.stages.length) return "请添加播放条目或阶段。";
@@ -100,12 +97,12 @@ export function playbackConfigIssue(
             target > effectiveChannelLimit(state, selection.channels[index]),
         )
       )
-        return `播放强度超过所选通道有效上限 ${selection.limit}，请调低目标后播放。`;
+        return `播放强度超过所选通道强度上限 ${selection.limit}，请调低目标后播放。`;
     } else if (
       Math.min(stage.intensity, stage.startIntensity) < 0 ||
       Math.max(stage.intensity, stage.startIntensity) > selection.limit
     )
-      return `「${stage.name}」强度超过所选通道有效上限 ${selection.limit}，请调低后播放。`;
+      return `「${stage.name}」强度超过所选通道强度上限 ${selection.limit}，请调低后播放。`;
   }
   return null;
 }

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import {
   Activity,
   ArrowDown,
@@ -55,11 +55,8 @@ import {
   requestId,
   timeLeft,
 } from "./api";
-import {
-  effectiveChannelLimit,
-  playbackChannelsLimit,
-  playbackConfigIssue,
-} from "./playbackLimits";
+import { playbackChannelsLimit, playbackConfigIssue } from "./playbackLimits";
+import { useLiveChannels } from "./useLiveChannels";
 import {
   WaveMetadata,
   Badge,
@@ -109,6 +106,40 @@ export default function ConsolePage({
     state.locked || otherOwner || state.stopping || state.stopUnconfirmed;
   const canPlay = !blocked && state.device.connected;
   const running = active && state.owner === "manual";
+  const liveActive = running && state.run?.mode === "live";
+  const otherManualMode = running && !liveActive;
+  const { patch: patchLive, pending: pendingChannels } =
+    useLiveChannels(action);
+  const liveChannels = (["A", "B"] as Channel[]).filter(
+    (channel) =>
+      pendingChannels[channel]?.enabled ?? state.channels[channel].enabled,
+  );
+  const missingWave = liveChannels.filter(
+    (channel) =>
+      !state.waveforms.some(
+        (wave) =>
+          wave.id ===
+          (pendingChannels[channel]?.waveformId ??
+            state.channels[channel].waveformId),
+      ),
+  );
+  const liveIssue = state.locked
+    ? "任务锁定中，实时控制仅可查看。"
+    : otherOwner
+      ? "其他控制方正在运行，请先停止并接管为手动。"
+      : state.stopping
+        ? "设备正在停止，请等待归零确认。"
+        : state.stopUnconfirmed
+          ? "设备停止尚未确认，请重新连接并清理。"
+          : !state.device.connected
+            ? "连接设备后即可开始实时播放。"
+            : otherManualMode
+              ? "其他播放模式正在运行，请先停止后使用实时控制。"
+              : !liveChannels.length
+                ? "请先启用至少一个通道。"
+                : missingWave.length
+                  ? `请先为 ${missingWave.join(" / ")} 通道选择波形。`
+                  : null;
   const confirmationIssue = confirmConfig
     ? playbackConfigIssue(state, confirmConfig)
     : null;
@@ -233,21 +264,45 @@ export default function ConsolePage({
       </nav>
       {tab === "live" && (
         <>
-          <div className="live-layout">
+          <div className="live-layout live-controls">
             <div>
               <div className="subsection-heading">
                 <h2>
                   <Activity size={18} />
                   双通道控制
                 </h2>
-                <Toggle
-                  label="A / B 同步"
-                  checked={state.synced}
-                  disabled={blocked || running || pending}
-                  onChange={(synced) =>
-                    void action("/api/console/channels", { synced }, "PATCH")
+                <button
+                  className="button primary live-play-button"
+                  aria-label="实时播放控制"
+                  disabled={
+                    liveActive && state.run?.status === "running"
+                      ? blocked
+                      : pending ||
+                        Object.keys(pendingChannels).length > 0 ||
+                        !!liveIssue
                   }
-                />
+                  onClick={() =>
+                    void action(
+                      liveActive && state.run?.status === "running"
+                        ? "/api/console/pause"
+                        : "/api/console/live/start",
+                      liveActive && state.run?.status === "running"
+                        ? {}
+                        : { requestId: requestId() },
+                    )
+                  }
+                >
+                  {liveActive && state.run?.status === "running" ? (
+                    <Pause size={16} />
+                  ) : (
+                    <Play size={16} />
+                  )}
+                  {liveActive
+                    ? state.run?.status === "paused"
+                      ? "继续播放"
+                      : "暂停播放"
+                    : "开始播放"}
+                </button>
               </div>
               <div className="channel-grid">
                 {(["A", "B"] as Channel[]).map((channel) => (
@@ -255,24 +310,27 @@ export default function ConsolePage({
                     key={channel}
                     channel={channel}
                     state={state}
-                    disabled={blocked || pending}
-                    action={action}
+                    disabled={
+                      blocked || otherManualMode || !state.device.connected
+                    }
+                    pendingConfig={pendingChannels[channel]}
+                    onPatch={(part) => patchLive({ [channel]: part })}
                   />
                 ))}
               </div>
               <div className="help-line">
                 <ShieldCheck size={14} />
                 <span>
-                  有效上限取设备与用户设置上限较低值。用户上限为 0
-                  时禁止非零输出。
+                  A / B
+                  独立控制，强度上限随设备回传更新。播放时修改立即生效，暂停时只更新设置。
                 </span>
               </div>
+              {liveIssue && (
+                <p className="playback-issue" role="status">
+                  {liveIssue}
+                </p>
+              )}
             </div>
-            <SinglePlayer
-              state={state}
-              disabled={!canPlay || pending || running}
-              onPlay={setConfirmConfig}
-            />
           </div>
           <div className="live-bottom">
             <Monitor state={state} />
@@ -366,19 +424,16 @@ export default function ConsolePage({
               <strong>{duration(confirmConfig.durationSec)}</strong>
             </div>
             <div>
-              <span>A 通道有效上限</span>
-              <strong>{effectiveChannelLimit(state, "A")}</strong>
+              <span>A 通道强度上限</span>
+              <strong>{state.device.limits.A}</strong>
             </div>
             <div>
-              <span>B 通道有效上限</span>
-              <strong>{effectiveChannelLimit(state, "B")}</strong>
+              <span>B 通道强度上限</span>
+              <strong>{state.device.limits.B}</strong>
             </div>
           </div>
           <p className="field-hint">
-            设备上限 A / B：{state.device.limits.A} / {state.device.limits.B}
-            {" · "}用户设置上限 A / B：{state.channels.A.limit} /{" "}
-            {state.channels.B.limit}
-            {state.synced && " · A / B 同步时采用两通道较低上限"}
+            强度上限由设备回传，所选通道均受各自上限约束。
           </p>
           {confirmConfig.random && (
             <p className="muted">
@@ -560,47 +615,33 @@ function DevicePanel({
   );
 }
 
+type LiveChannelPatch = Partial<
+  Pick<ChannelConfig, "enabled" | "target" | "waveformId">
+>;
+
 function ChannelCard({
   channel,
   state,
   disabled,
-  action,
+  pendingConfig,
+  onPatch,
 }: {
   channel: Channel;
   state: AppSnapshot;
   disabled: boolean;
-  action: Action;
+  pendingConfig?: LiveChannelPatch;
+  onPatch: (part: LiveChannelPatch) => void;
 }) {
-  const config = state.channels[channel];
-  const [form, setForm] = useState(config);
-  const [advanced, setAdvanced] = useState(config.limit === 0);
-  useEffect(
-    () => setForm(config),
-    [
-      config.enabled,
-      config.limit,
-      config.rampPerSecond,
-      config.target,
-      config.waveformId,
-    ],
-  );
-  const wave = state.waveforms.find((w) => w.id === form.waveformId);
+  const config = { ...state.channels[channel], ...pendingConfig };
+  const wave = state.waveforms.find((w) => w.id === config.waveformId);
   const deviceLimit = state.device.limits[channel];
-  const effectiveLimit = effectiveChannelLimit(state, channel);
-  const settingsDisabled = disabled || isActive(state);
-  const validLimit =
-    Number.isInteger(form.limit) &&
-    form.limit >= 0 &&
-    form.limit <= deviceLimit;
-  const needsAuthorization = state.device.connected && config.limit === 0;
-  const canIncrease =
-    state.device.connected && !disabled && !state.stopUnconfirmed;
-  const patch = (part: Partial<ChannelConfig>) =>
-    void action(
-      "/api/console/channels",
-      { channels: { [channel]: part } },
-      "PATCH",
-    );
+  const [invalidTarget, setInvalidTarget] = useState(false);
+  const updateTarget = (target: number) => {
+    const valid =
+      Number.isInteger(target) && target >= 0 && target <= deviceLimit;
+    setInvalidTarget(!valid);
+    if (valid) onPatch({ target });
+  };
   return (
     <Card className={`channel-card channel-${channel.toLowerCase()}`}>
       <div className="channel-heading">
@@ -614,8 +655,8 @@ function ChannelCard({
         <Toggle
           label={`${channel} 通道`}
           checked={config.enabled}
-          disabled={disabled || !state.device.connected}
-          onChange={(enabled) => patch({ enabled })}
+          disabled={disabled}
+          onChange={(enabled) => onPatch({ enabled })}
         />
       </div>
       <div className="intensity-display">
@@ -624,10 +665,7 @@ function ChannelCard({
         </span>
         <div>
           <span>设备强度</span>
-          <small>
-            目标 {config.target} <span className="tiny-dot">·</span> 有效上限{" "}
-            {effectiveLimit}
-          </small>
+          <small>目标 {config.target}</small>
         </div>
         <span
           className={`signal-indicator ${state.device.connected ? "on" : ""}`}
@@ -635,42 +673,10 @@ function ChannelCard({
           <Activity size={17} />
         </span>
       </div>
-      <div className="channel-limits" aria-label={`${channel} 通道上限摘要`}>
-        <span>
-          设备上限<strong>{deviceLimit}</strong>
-        </span>
-        <span>
-          用户设置上限
-          <strong>
-            {config.limit}
-            {config.limit === 0 && <small>未授权</small>}
-          </strong>
-        </span>
-        <span>
-          有效上限<strong>{effectiveLimit}</strong>
-        </span>
+      <div className="channel-cap" aria-label={`${channel} 通道上限摘要`}>
+        <span>强度上限</span>
+        <strong>{deviceLimit}</strong>
       </div>
-      {needsAuthorization && (
-        <div className="channel-limit-notice">
-          <ShieldCheck size={15} />
-          <div>
-            <strong>尚未授权非零输出</strong>
-            <span>设备已连接，请先明确保存此通道的用户上限。</span>
-          </div>
-          <button
-            className="text-button"
-            onClick={() => setAdvanced(true)}
-            aria-label={`设置 ${channel} 通道用户上限`}
-          >
-            设置上限
-          </button>
-        </div>
-      )}
-      {state.synced && (
-        <p className="channel-limit-hint">
-          A / B 同步：有效上限取两通道较低值，两通道均需启用并授权。
-        </p>
-      )}
       <div className="channel-wave">
         <WaveGraph
           frames={wave?.frames || []}
@@ -681,8 +687,8 @@ function ChannelCard({
         <div className="range-control">
           <IconButton
             label={`${channel} 通道减少强度`}
-            disabled={disabled || form.target <= 0 || !state.device.connected}
-            onClick={() => patch({ target: Math.max(0, form.target - 1) })}
+            disabled={disabled || config.target <= 0}
+            onClick={() => updateTarget(Math.max(0, config.target - 1))}
           >
             <Minus size={16} />
           </IconButton>
@@ -690,275 +696,57 @@ function ChannelCard({
             aria-label={`${channel} 通道目标强度滑块`}
             type="range"
             min={0}
-            max={Math.max(1, effectiveLimit)}
-            value={Math.min(form.target, effectiveLimit)}
-            disabled={!canIncrease || !config.enabled || effectiveLimit <= 0}
-            onChange={(e) =>
-              setForm({ ...form, target: Number(e.target.value) })
-            }
-            onPointerUp={() =>
-              patch({ target: Math.min(form.target, effectiveLimit) })
-            }
-            onKeyUp={(e) => {
-              if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key))
-                patch({ target: Math.min(form.target, effectiveLimit) });
-            }}
+            max={deviceLimit}
+            value={Math.min(config.target, deviceLimit)}
+            disabled={disabled || deviceLimit <= 0}
+            onChange={(e) => updateTarget(Number(e.target.value))}
           />
           <IconButton
             label={`${channel} 通道增加强度`}
-            disabled={
-              !canIncrease || !config.enabled || form.target >= effectiveLimit
-            }
-            onClick={() => patch({ target: form.target + 1 })}
+            disabled={disabled || config.target >= deviceLimit}
+            onClick={() => updateTarget(config.target + 1)}
           >
             <Plus size={16} />
           </IconButton>
         </div>
         <div className="range-labels">
           <span>0</span>
-          <span>{effectiveLimit}</span>
+          <span>{deviceLimit}</span>
         </div>
         <div className="target-number">
           <NumberInput
             label={`${channel} 通道目标强度`}
-            value={form.target}
-            max={effectiveLimit}
-            disabled={!canIncrease || !config.enabled}
-            onChange={(target) => setForm({ ...form, target })}
+            value={config.target}
+            max={deviceLimit}
+            disabled={disabled}
+            onChange={updateTarget}
+            onBlur={() => setInvalidTarget(false)}
           />
           <button
-            className="text-button"
-            disabled={
-              !canIncrease ||
-              !config.enabled ||
-              form.target < 0 ||
-              form.target > effectiveLimit ||
-              !Number.isInteger(form.target)
-            }
-            onClick={() => patch({ target: form.target })}
-          >
-            应用
-          </button>
-          <button
             className="text-button muted"
-            disabled={disabled || !state.device.connected}
-            onClick={() => patch({ target: 0 })}
+            disabled={disabled}
+            onClick={() => updateTarget(0)}
           >
             归零
           </button>
         </div>
+        {invalidTarget && (
+          <span className="error-inline">
+            请输入 0–{deviceLimit} 之间的整数。
+          </span>
+        )}
       </Field>
       <Field label="当前波形">
         <WaveSelect
           label={`${channel} 通道波形`}
-          value={form.waveformId}
+          value={config.waveformId}
           waveforms={state.waveforms}
           disabled={disabled}
-          onChange={(waveformId) => patch({ waveformId })}
+          onChange={(waveformId) => {
+            if (waveformId) onPatch({ waveformId });
+          }}
         />
       </Field>
-      <button
-        className="channel-settings-link"
-        onClick={() => setAdvanced(!advanced)}
-        aria-expanded={advanced}
-      >
-        <SlidersHorizontal size={13} />
-        强度上限与变化速率<span>{advanced ? "收起" : "设置"}</span>
-      </button>
-      {advanced && (
-        <div className="form-grid channel-advanced">
-          <Field
-            label="用户设置上限"
-            hint={`设备上限 ${deviceLimit}；保存 0 将禁止非零输出。`}
-          >
-            <NumberInput
-              label={`${channel} 通道强度上限`}
-              value={form.limit}
-              max={deviceLimit}
-              disabled={settingsDisabled || !state.device.connected}
-              onChange={(limit) => setForm({ ...form, limit })}
-            />
-            <button
-              className="text-button"
-              aria-label={`保存 ${channel} 通道上限`}
-              disabled={
-                settingsDisabled || !state.device.connected || !validLimit
-              }
-              onClick={() => patch({ limit: form.limit })}
-            >
-              保存上限
-            </button>
-            <button
-              className="button secondary small adopt-device-limit"
-              aria-label={`${channel} 通道采用设备上限并保存`}
-              disabled={
-                settingsDisabled || !state.device.connected || deviceLimit <= 0
-              }
-              onClick={() => patch({ limit: deviceLimit })}
-            >
-              采用设备上限并保存 · {deviceLimit}
-            </button>
-            {!validLimit && (
-              <span className="error-inline">
-                请输入 0–{deviceLimit} 之间的整数。
-              </span>
-            )}
-          </Field>
-          <Field label="每秒变化">
-            <NumberInput
-              label={`${channel} 通道变化速率`}
-              value={form.rampPerSecond}
-              min={1}
-              max={20}
-              disabled={settingsDisabled}
-              onChange={(rampPerSecond) => setForm({ ...form, rampPerSecond })}
-            />
-            <button
-              className="text-button"
-              aria-label={`保存 ${channel} 通道变化速率`}
-              disabled={
-                settingsDisabled ||
-                !Number.isFinite(form.rampPerSecond) ||
-                form.rampPerSecond < 1 ||
-                form.rampPerSecond > 20
-              }
-              onClick={() => patch({ rampPerSecond: form.rampPerSecond })}
-            >
-              保存速率
-            </button>
-          </Field>
-        </div>
-      )}
-      {advanced && isActive(state) && (
-        <p className="field-hint">
-          运行或暂停期间不能修改上限与变化速率，请先停止。
-        </p>
-      )}
-    </Card>
-  );
-}
-
-function SinglePlayer({
-  state,
-  disabled,
-  onPlay,
-}: {
-  state: AppSnapshot;
-  disabled: boolean;
-  onPlay: (c: PlaybackConfig) => void;
-}) {
-  const [waveId, setWaveId] = useState(state.waveforms[0]?.id || "");
-  const [channels, setChannels] = useState<Channel[]>(["A", "B"]);
-  const [intensity, setIntensity] = useState(5);
-  const [kind, setKind] = useState("once");
-  const [amount, setAmount] = useState(3);
-  const [stageId] = useState(() => crypto.randomUUID());
-  const wave = state.waveforms.find((w) => w.id === waveId);
-  const seconds = Math.max(0.1, (wave?.durationMs || 1000) / 1000);
-  const limits = playbackChannelsLimit(state, channels);
-  const config: PlaybackConfig = {
-    mode: "single",
-    singleTargets: Object.fromEntries(channels.map((c) => [c, intensity])),
-    stages: [
-      {
-        id: stageId,
-        name: wave?.name || "单波形",
-        channels,
-        waveformId: waveId,
-        intensity,
-        startIntensity: 0,
-        behavior: "hold",
-        gapSec: 0,
-        durationSec: kind === "timed" ? amount : seconds,
-      },
-    ],
-    repeat: kind === "repeat" ? amount : 1,
-    shuffle: false,
-    durationSec:
-      kind === "timed" ? amount : seconds * (kind === "repeat" ? amount : 1),
-  };
-  const issue = playbackConfigIssue(state, config);
-  return (
-    <Card
-      title="波形播放器"
-      eyebrow="WAVE PLAYER"
-      icon={<Waves size={18} />}
-      className="single-player"
-    >
-      <Field label="选择波形">
-        <WaveSelect
-          value={waveId}
-          onChange={setWaveId}
-          waveforms={state.waveforms}
-          disabled={disabled}
-        />
-      </Field>
-      <WaveGraph frames={wave?.frames || []} />
-      <div className="wave-meta">
-        <span>{wave?.frames.length || 0} 帧</span>
-        <span>{seconds.toFixed(1)} 秒 / 次</span>
-        <span>相对幅度预览</span>
-      </div>
-      <Field label="输出通道">
-        <ChannelChips
-          value={channels}
-          onChange={setChannels}
-          disabled={disabled}
-        />
-      </Field>
-      <PlaybackLimitSummary
-        state={state}
-        channels={channels}
-        label="播放器上限说明"
-      />
-      <div className="form-grid">
-        <Field label="目标强度">
-          <NumberInput
-            label="播放器目标强度"
-            value={intensity}
-            max={limits.limit}
-            onChange={setIntensity}
-            disabled={disabled}
-          />
-        </Field>
-        <Field label="播放方式">
-          <select
-            aria-label="单波形播放方式"
-            value={kind}
-            onChange={(e) => setKind(e.target.value)}
-            disabled={disabled}
-          >
-            <option value="once">播放一次</option>
-            <option value="repeat">指定次数</option>
-            <option value="timed">指定时间</option>
-          </select>
-        </Field>
-      </div>
-      {kind !== "once" && (
-        <Field label={kind === "repeat" ? "循环次数" : "持续时间 / 秒"}>
-          <NumberInput
-            label={kind === "repeat" ? "循环次数" : "持续时间"}
-            value={amount}
-            min={1}
-            max={3600}
-            onChange={setAmount}
-            disabled={disabled}
-          />
-        </Field>
-      )}
-      <button
-        className="button primary full"
-        disabled={disabled || !wave || !!issue}
-        onClick={() => onPlay(config)}
-      >
-        <Play size={16} fill="currentColor" />
-        开始播放
-      </button>
-      {issue && (
-        <p className="playback-issue" role="status">
-          {issue}
-        </p>
-      )}
     </Card>
   );
 }
@@ -975,14 +763,10 @@ function PlaybackLimitSummary({
   const limits = playbackChannelsLimit(state, channels);
   return (
     <p className="playback-limit-summary" aria-label={label}>
-      当前有效上限 <strong>{limits.limit}</strong>
+      所选通道强度上限 <strong>{limits.limit}</strong>
       {" · "}
       {channels.length ? channels.join(" / ") : "未选择通道"}
-      {state.synced
-        ? " · A / B 同步取低值"
-        : channels.length > 1
-          ? " · 所选通道取低值"
-          : ""}
+      {channels.length > 1 && " · 共用强度取低值"}
     </p>
   );
 }
@@ -1004,11 +788,12 @@ function RunPlayer({
           <Play size={24} />
         </span>
         <strong>留一点空间，等待下一段节奏</strong>
-        <p>选择波形或编排一个播放方案</p>
+        <p>设置通道强度和波形，开始下一段节奏</p>
       </div>
     );
   const own = state.owner === "manual";
   const names: Record<string, string> = {
+    live: "实时控制",
     single: "单波形",
     playlist: "播放列表",
     stages: "阶段编排",
@@ -1031,26 +816,38 @@ function RunPlayer({
         />
       </div>
       <p className="muted">
-        阶段 {run.stageIndex + 1} ·{" "}
-        {run.playback?.stages[run.stageIndex]?.name ||
-          run.plan?.stages[run.stageIndex]?.name ||
-          "自主控制"}
+        {run.mode === "live" ? (
+          "A / B 独立播放 · 参数实时更新"
+        ) : (
+          <>
+            阶段 {run.stageIndex + 1} ·{" "}
+            {run.playback?.stages[run.stageIndex]?.name ||
+              run.plan?.stages[run.stageIndex]?.name ||
+              "自主控制"}
+          </>
+        )}
       </p>
       {own && (
         <div className="button-row">
-          <button
-            className="button secondary"
-            disabled={pending}
-            onClick={() =>
-              void action(
-                `/api/console/${run.status === "paused" ? "resume" : "pause"}`,
-                {},
-              )
-            }
-          >
-            {run.status === "paused" ? <Play size={16} /> : <Pause size={16} />}
-            {run.status === "paused" ? "恢复" : "暂停"}
-          </button>
+          {run.mode !== "live" && (
+            <button
+              className="button secondary"
+              disabled={pending}
+              onClick={() =>
+                void action(
+                  `/api/console/${run.status === "paused" ? "resume" : "pause"}`,
+                  {},
+                )
+              }
+            >
+              {run.status === "paused" ? (
+                <Play size={16} />
+              ) : (
+                <Pause size={16} />
+              )}
+              {run.status === "paused" ? "恢复" : "暂停"}
+            </button>
+          )}
           {run.mode === "playlist" && (
             <IconButton
               label="下一条目"
@@ -1062,7 +859,9 @@ function RunPlayer({
           )}
           <button
             className="button secondary"
-            disabled={pending}
+            disabled={
+              run.mode === "live" ? state.stopping || state.locked : pending
+            }
             onClick={() => void action("/api/console/stop", {})}
           >
             <Square size={15} />
