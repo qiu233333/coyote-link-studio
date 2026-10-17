@@ -27,6 +27,7 @@ async function relay(
   const requests: Record<string, unknown>[] = [];
   let peer: WebSocket | undefined;
   const intensities = { A: 0, B: 0 };
+  const limits = { A: 80, B: 60 };
   const device = () => ({
     slotId: "slot-1",
     name: "Test Coyote",
@@ -38,8 +39,8 @@ async function relay(
     },
     slotState: {
       hasDevice: true,
-      channelA: { intensityMax: 80 },
-      channelB: { intensityMax: 60 },
+      channelA: { intensityMax: limits.A },
+      channelB: { intensityMax: limits.B },
     },
   });
   const send = (data: unknown) =>
@@ -83,6 +84,7 @@ async function relay(
     url: `ws://127.0.0.1:${address.port}/v4`,
     requests,
     intensities,
+    limits,
     send,
     close: async () => {
       for (const client of server.clients) client.terminate();
@@ -162,6 +164,56 @@ test("V4 discovers devices, uses reported limits and translates absolute targets
   } finally {
     await driver.dispose();
     await mock.close();
+  }
+});
+
+test("V4 preserves actual 20/19 ceilings and receives lower slot ceiling patches", async () => {
+  const mock = await relay();
+  mock.limits.A = 20;
+  mock.limits.B = 19;
+  const driver = new CoyoteDevice();
+  try {
+    await driver.connect({ protocol: "v4", relayUrl: mock.url });
+    await until(() => driver.state.devices.length === 1);
+    await driver.selectDevice("app-1", "slot-1");
+    assert.deepEqual(driver.state.limits, { A: 20, B: 19 });
+    await assert.rejects(driver.setIntensity("B", 20), /范围/);
+    mock.limits.B = 6;
+    mock.send({
+      t: "ev",
+      ev: "slots.patch",
+      slots: [
+        { slotId: "slot-1", slotState: { channelB: { intensityMax: 6 } } },
+      ],
+    });
+    await until(() => driver.state.limits.B === 6);
+    assert.deepEqual(driver.state.limits, { A: 20, B: 6 });
+    await assert.rejects(driver.setIntensity("B", 7), /范围/);
+    await driver.setIntensity("B", 6);
+    assert.equal(driver.state.intensities.B, 6);
+  } finally {
+    await driver.dispose();
+    await mock.close();
+  }
+});
+
+test("an intensity already queued is revalidated against a newly lowered hardware ceiling", async () => {
+  const driver = new CoyoteDevice();
+  try {
+    await driver.connect({ protocol: "simulator" });
+    driver.state.limits.A = 20;
+    const queued = driver.setIntensity("A", 15);
+    driver.state.limits.A = 5;
+    await assert.rejects(queued, /设备当前范围.*排队指令/);
+    assert.equal(driver.state.intensities.A, 0);
+    await driver.setIntensity("A", 5);
+    assert.equal(
+      driver.state.intensities.A,
+      5,
+      "rejected stale work does not block subsequent safe commands",
+    );
+  } finally {
+    await driver.dispose();
   }
 });
 

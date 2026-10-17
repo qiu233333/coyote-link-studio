@@ -480,6 +480,9 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
       .then(async () => {
         if (epoch !== this.epoch) throw new Error("动作已被停止操作废弃");
         this.assertReady();
+        // Telemetry can lower a ceiling while this command waits for its lane.
+        if (target > this.state.limits[channel])
+          throw new Error("目标强度超出设备当前范围，已废弃排队指令");
         if (this.state.protocol === "simulator") {
           this.state.intensities[channel] = target;
           this.state.lastSeenAt = Date.now();

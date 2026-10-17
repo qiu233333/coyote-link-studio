@@ -12,7 +12,8 @@
     "start": "tsx server/index.ts",
     "test": "tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "verify:browser": "tsx scripts/verify-browser.ts"
+    "verify:browser": "tsx scripts/verify-browser.ts",
+    "verify:limits": "tsx scripts/verify-limits-browser.ts"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "3.0.70",

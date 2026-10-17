@@ -7459,3 +7459,98 @@ button:disabled {
   color: #7189ac;
   margin-left: 6px;
 }
+/* Explicit channel authorization stays visible beside live device limits. */
+.channel-limits {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 13px 0;
+  padding: 11px 0;
+  border-block: 1px solid #dce6f278;
+}
+.channel-limits > span {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 10px;
+  color: #788cab;
+}
+.channel-limits strong {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 17px;
+  color: #5e7fae;
+}
+.channel-b .channel-limits strong {
+  color: #b783a6;
+}
+.channel-limits small {
+  font-size: 9px;
+  font-weight: 500;
+  color: #a77592;
+}
+.channel-limit-notice {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 7px;
+  padding: 11px;
+  margin-bottom: 12px;
+  border: 1px solid #dce7f5;
+  border-radius: 10px;
+  background: linear-gradient(120deg, #eaf3ffb5, #fff0f8a8);
+  color: #6e84a5;
+}
+.channel-limit-notice > svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.channel-limit-notice > div {
+  flex: 1;
+  min-width: 100px;
+}
+.channel-limit-notice strong,
+.channel-limit-notice > div > span {
+  display: block;
+  font-size: 11px;
+  line-height: 1.65;
+}
+.channel-limit-notice > div > span {
+  margin-top: 3px;
+  font-size: 10px;
+}
+.channel-limit-notice .text-button {
+  font-size: 11px;
+}
+.channel-limit-hint,
+.playback-limit-summary {
+  color: #788dac;
+  font-size: 11px;
+  line-height: 1.7;
+  margin: 10px 0 14px;
+}
+.playback-limit-summary strong {
+  color: #6586b6;
+}
+.channel-advanced {
+  grid-template-columns: 1fr;
+}
+.channel-advanced .adopt-device-limit {
+  font-size: 11px;
+  white-space: normal;
+  min-height: 32px;
+  margin-top: 5px;
+}
+.playback-issue {
+  padding: 10px 12px;
+  margin: 12px 0 0;
+  border: 1px solid #eddae8;
+  border-radius: 10px;
+  background: #fff1f780;
+  color: #9e718d;
+  font-size: 11px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}

@@ -56,6 +56,11 @@ import {
   timeLeft,
 } from "./api";
 import {
+  effectiveChannelLimit,
+  playbackChannelsLimit,
+  playbackConfigIssue,
+} from "./playbackLimits";
+import {
   WaveMetadata,
   Badge,
   Card,
@@ -104,6 +109,9 @@ export default function ConsolePage({
     state.locked || otherOwner || state.stopping || state.stopUnconfirmed;
   const canPlay = !blocked && state.device.connected;
   const running = active && state.owner === "manual";
+  const confirmationIssue = confirmConfig
+    ? playbackConfigIssue(state, confirmConfig)
+    : null;
 
   return (
     <div className="page-content">
@@ -255,7 +263,8 @@ export default function ConsolePage({
               <div className="help-line">
                 <ShieldCheck size={14} />
                 <span>
-                  所有目标值均经过后端限幅与渐变校验。首次使用请先设置通道上限。
+                  有效上限取设备与用户设置上限较低值。用户上限为 0
+                  时禁止非零输出。
                 </span>
               </div>
             </div>
@@ -357,14 +366,20 @@ export default function ConsolePage({
               <strong>{duration(confirmConfig.durationSec)}</strong>
             </div>
             <div>
-              <span>A 通道上限</span>
-              <strong>{state.channels.A.limit}</strong>
+              <span>A 通道有效上限</span>
+              <strong>{effectiveChannelLimit(state, "A")}</strong>
             </div>
             <div>
-              <span>B 通道上限</span>
-              <strong>{state.channels.B.limit}</strong>
+              <span>B 通道有效上限</span>
+              <strong>{effectiveChannelLimit(state, "B")}</strong>
             </div>
           </div>
+          <p className="field-hint">
+            设备上限 A / B：{state.device.limits.A} / {state.device.limits.B}
+            {" · "}用户设置上限 A / B：{state.channels.A.limit} /{" "}
+            {state.channels.B.limit}
+            {state.synced && " · A / B 同步时采用两通道较低上限"}
+          </p>
           {confirmConfig.random && (
             <p className="muted">
               强度 {confirmConfig.random.minIntensity}–
@@ -372,6 +387,11 @@ export default function ConsolePage({
               {confirmConfig.random.waveformIds.length} 个授权波形 · 每{" "}
               {confirmConfig.random.minIntervalSec}–
               {confirmConfig.random.maxIntervalSec} 秒变化
+            </p>
+          )}
+          {confirmationIssue && (
+            <p className="playback-issue" role="status">
+              {confirmationIssue}
             </p>
           )}
           <div className="modal-footer">
@@ -383,7 +403,7 @@ export default function ConsolePage({
             </button>
             <button
               className="button primary"
-              disabled={!canPlay || pending}
+              disabled={!canPlay || pending || active || !!confirmationIssue}
               onClick={async () => {
                 const result = await action("/api/console/play", {
                   config: confirmConfig,
@@ -553,7 +573,7 @@ function ChannelCard({
 }) {
   const config = state.channels[channel];
   const [form, setForm] = useState(config);
-  const [advanced, setAdvanced] = useState(false);
+  const [advanced, setAdvanced] = useState(config.limit === 0);
   useEffect(
     () => setForm(config),
     [
@@ -565,7 +585,14 @@ function ChannelCard({
     ],
   );
   const wave = state.waveforms.find((w) => w.id === form.waveformId);
-  const effectiveLimit = Math.min(config.limit, state.device.limits[channel]);
+  const deviceLimit = state.device.limits[channel];
+  const effectiveLimit = effectiveChannelLimit(state, channel);
+  const settingsDisabled = disabled || isActive(state);
+  const validLimit =
+    Number.isInteger(form.limit) &&
+    form.limit >= 0 &&
+    form.limit <= deviceLimit;
+  const needsAuthorization = state.device.connected && config.limit === 0;
   const canIncrease =
     state.device.connected && !disabled && !state.stopUnconfirmed;
   const patch = (part: Partial<ChannelConfig>) =>
@@ -598,7 +625,7 @@ function ChannelCard({
         <div>
           <span>设备强度</span>
           <small>
-            目标 {config.target} <span className="tiny-dot">·</span> 上限{" "}
+            目标 {config.target} <span className="tiny-dot">·</span> 有效上限{" "}
             {effectiveLimit}
           </small>
         </div>
@@ -608,6 +635,42 @@ function ChannelCard({
           <Activity size={17} />
         </span>
       </div>
+      <div className="channel-limits" aria-label={`${channel} 通道上限摘要`}>
+        <span>
+          设备上限<strong>{deviceLimit}</strong>
+        </span>
+        <span>
+          用户设置上限
+          <strong>
+            {config.limit}
+            {config.limit === 0 && <small>未授权</small>}
+          </strong>
+        </span>
+        <span>
+          有效上限<strong>{effectiveLimit}</strong>
+        </span>
+      </div>
+      {needsAuthorization && (
+        <div className="channel-limit-notice">
+          <ShieldCheck size={15} />
+          <div>
+            <strong>尚未授权非零输出</strong>
+            <span>设备已连接，请先明确保存此通道的用户上限。</span>
+          </div>
+          <button
+            className="text-button"
+            onClick={() => setAdvanced(true)}
+            aria-label={`设置 ${channel} 通道用户上限`}
+          >
+            设置上限
+          </button>
+        </div>
+      )}
+      {state.synced && (
+        <p className="channel-limit-hint">
+          A / B 同步：有效上限取两通道较低值，两通道均需启用并授权。
+        </p>
+      )}
       <div className="channel-wave">
         <WaveGraph
           frames={wave?.frames || []}
@@ -628,15 +691,17 @@ function ChannelCard({
             type="range"
             min={0}
             max={Math.max(1, effectiveLimit)}
-            value={form.target}
+            value={Math.min(form.target, effectiveLimit)}
             disabled={!canIncrease || !config.enabled || effectiveLimit <= 0}
             onChange={(e) =>
               setForm({ ...form, target: Number(e.target.value) })
             }
-            onPointerUp={() => patch({ target: form.target })}
+            onPointerUp={() =>
+              patch({ target: Math.min(form.target, effectiveLimit) })
+            }
             onKeyUp={(e) => {
               if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key))
-                patch({ target: form.target });
+                patch({ target: Math.min(form.target, effectiveLimit) });
             }}
           />
           <IconButton
@@ -663,7 +728,13 @@ function ChannelCard({
           />
           <button
             className="text-button"
-            disabled={!canIncrease || !config.enabled}
+            disabled={
+              !canIncrease ||
+              !config.enabled ||
+              form.target < 0 ||
+              form.target > effectiveLimit ||
+              !Number.isInteger(form.target)
+            }
             onClick={() => patch({ target: form.target })}
           >
             应用
@@ -696,21 +767,42 @@ function ChannelCard({
       </button>
       {advanced && (
         <div className="form-grid channel-advanced">
-          <Field label="强度上限">
+          <Field
+            label="用户设置上限"
+            hint={`设备上限 ${deviceLimit}；保存 0 将禁止非零输出。`}
+          >
             <NumberInput
               label={`${channel} 通道强度上限`}
               value={form.limit}
-              max={state.device.limits[channel]}
-              disabled={disabled}
+              max={deviceLimit}
+              disabled={settingsDisabled || !state.device.connected}
               onChange={(limit) => setForm({ ...form, limit })}
             />
             <button
               className="text-button"
-              disabled={disabled}
+              aria-label={`保存 ${channel} 通道上限`}
+              disabled={
+                settingsDisabled || !state.device.connected || !validLimit
+              }
               onClick={() => patch({ limit: form.limit })}
             >
               保存上限
             </button>
+            <button
+              className="button secondary small adopt-device-limit"
+              aria-label={`${channel} 通道采用设备上限并保存`}
+              disabled={
+                settingsDisabled || !state.device.connected || deviceLimit <= 0
+              }
+              onClick={() => patch({ limit: deviceLimit })}
+            >
+              采用设备上限并保存 · {deviceLimit}
+            </button>
+            {!validLimit && (
+              <span className="error-inline">
+                请输入 0–{deviceLimit} 之间的整数。
+              </span>
+            )}
           </Field>
           <Field label="每秒变化">
             <NumberInput
@@ -718,18 +810,29 @@ function ChannelCard({
               value={form.rampPerSecond}
               min={1}
               max={20}
-              disabled={disabled}
+              disabled={settingsDisabled}
               onChange={(rampPerSecond) => setForm({ ...form, rampPerSecond })}
             />
             <button
               className="text-button"
-              disabled={disabled}
+              aria-label={`保存 ${channel} 通道变化速率`}
+              disabled={
+                settingsDisabled ||
+                !Number.isFinite(form.rampPerSecond) ||
+                form.rampPerSecond < 1 ||
+                form.rampPerSecond > 20
+              }
               onClick={() => patch({ rampPerSecond: form.rampPerSecond })}
             >
               保存速率
             </button>
           </Field>
         </div>
+      )}
+      {advanced && isActive(state) && (
+        <p className="field-hint">
+          运行或暂停期间不能修改上限与变化速率，请先停止。
+        </p>
       )}
     </Card>
   );
@@ -749,8 +852,32 @@ function SinglePlayer({
   const [intensity, setIntensity] = useState(5);
   const [kind, setKind] = useState("once");
   const [amount, setAmount] = useState(3);
+  const [stageId] = useState(() => crypto.randomUUID());
   const wave = state.waveforms.find((w) => w.id === waveId);
   const seconds = Math.max(0.1, (wave?.durationMs || 1000) / 1000);
+  const limits = playbackChannelsLimit(state, channels);
+  const config: PlaybackConfig = {
+    mode: "single",
+    singleTargets: Object.fromEntries(channels.map((c) => [c, intensity])),
+    stages: [
+      {
+        id: stageId,
+        name: wave?.name || "单波形",
+        channels,
+        waveformId: waveId,
+        intensity,
+        startIntensity: 0,
+        behavior: "hold",
+        gapSec: 0,
+        durationSec: kind === "timed" ? amount : seconds,
+      },
+    ],
+    repeat: kind === "repeat" ? amount : 1,
+    shuffle: false,
+    durationSec:
+      kind === "timed" ? amount : seconds * (kind === "repeat" ? amount : 1),
+  };
+  const issue = playbackConfigIssue(state, config);
   return (
     <Card
       title="波形播放器"
@@ -779,12 +906,17 @@ function SinglePlayer({
           disabled={disabled}
         />
       </Field>
+      <PlaybackLimitSummary
+        state={state}
+        channels={channels}
+        label="播放器上限说明"
+      />
       <div className="form-grid">
         <Field label="目标强度">
           <NumberInput
             label="播放器目标强度"
             value={intensity}
-            max={200}
+            max={limits.limit}
             onChange={setIntensity}
             disabled={disabled}
           />
@@ -816,38 +948,42 @@ function SinglePlayer({
       )}
       <button
         className="button primary full"
-        disabled={disabled || !wave || !channels.length}
-        onClick={() =>
-          onPlay({
-            mode: "single",
-            singleTargets: Object.fromEntries(
-              channels.map((c) => [c, intensity]),
-            ),
-            stages: [
-              {
-                ...defaultStage(waveId),
-                name: wave?.name || "单波形",
-                channels,
-                intensity,
-                durationSec: kind === "timed" ? amount : seconds,
-              },
-            ],
-            repeat: kind === "repeat" ? amount : 1,
-            shuffle: false,
-            durationSec:
-              kind === "timed"
-                ? amount
-                : seconds * (kind === "repeat" ? amount : 1),
-          })
-        }
+        disabled={disabled || !wave || !!issue}
+        onClick={() => onPlay(config)}
       >
         <Play size={16} fill="currentColor" />
         开始播放
       </button>
-      {!state.device.connected && (
-        <p className="player-hint">连接设备后，就可以开始了</p>
+      {issue && (
+        <p className="playback-issue" role="status">
+          {issue}
+        </p>
       )}
     </Card>
+  );
+}
+
+function PlaybackLimitSummary({
+  state,
+  channels,
+  label,
+}: {
+  state: AppSnapshot;
+  channels: Channel[];
+  label: string;
+}) {
+  const limits = playbackChannelsLimit(state, channels);
+  return (
+    <p className="playback-limit-summary" aria-label={label}>
+      当前有效上限 <strong>{limits.limit}</strong>
+      {" · "}
+      {channels.length ? channels.join(" / ") : "未选择通道"}
+      {state.synced
+        ? " · A / B 同步取低值"
+        : channels.length > 1
+          ? " · 所选通道取低值"
+          : ""}
+    </p>
   );
 }
 
@@ -1337,12 +1473,14 @@ export function StageEditor({
   waves,
   disabled,
   mode = "stages",
+  state,
 }: {
   stages: Stage[];
   setStages: (stages: Stage[]) => void;
   waves: Waveform[];
   disabled: boolean;
   mode?: "stages" | "playlist";
+  state?: AppSnapshot;
 }) {
   const dragIndex = useRef<number | null>(null);
   const patch = (index: number, changes: Partial<Stage>) =>
@@ -1444,7 +1582,12 @@ export function StageEditor({
                 <NumberInput
                   label={`第 ${index + 1} 项目标强度`}
                   value={stage.intensity}
-                  max={200}
+                  max={
+                    state
+                      ? playbackChannelsLimit(state, stage.channels).limit
+                      : 200
+                  }
+                  disabled={stage.behavior === "rest"}
                   onChange={(intensity) => patch(index, { intensity })}
                 />
               </Field>
@@ -1496,7 +1639,11 @@ export function StageEditor({
                   <NumberInput
                     label={`第 ${index + 1} 项起始强度`}
                     value={stage.startIntensity}
-                    max={200}
+                    max={
+                      state
+                        ? playbackChannelsLimit(state, stage.channels).limit
+                        : 200
+                    }
                     onChange={(startIntensity) =>
                       patch(index, { startIntensity })
                     }
@@ -1505,6 +1652,13 @@ export function StageEditor({
               )}
             </div>
           </fieldset>
+          {state && stage.behavior !== "rest" && (
+            <PlaybackLimitSummary
+              state={state}
+              channels={stage.channels}
+              label={`第 ${index + 1} 项上限说明`}
+            />
+          )}
         </div>
       ))}
       <button
@@ -1548,6 +1702,7 @@ function SequenceEditor({
   const [presetName, setPresetName] = useState("");
   const [showSave, setShowSave] = useState(false);
   const config: PlaybackConfig = { mode, stages, repeat, shuffle, durationSec };
+  const issue = playbackConfigIssue(state, config);
   const presets = state.presets.filter((p) => p.config.mode === mode);
   const total = stages.reduce((sum, s) => sum + s.durationSec + s.gapSec, 0);
   return (
@@ -1597,6 +1752,7 @@ function SequenceEditor({
           waves={state.waveforms}
           disabled={disabled}
           mode={mode}
+          state={state}
         />
       </div>
       <div className="editor-sidebar">
@@ -1638,12 +1794,17 @@ function SequenceEditor({
           </div>
           <button
             className="button primary full"
-            disabled={!canPlay || !stages.length}
+            disabled={!canPlay || !stages.length || !!issue}
             onClick={() => onPlay(config)}
           >
             <Play size={16} />
             确认并播放
           </button>
+          {issue && (
+            <p className="playback-issue" role="status">
+              {issue}
+            </p>
+          )}
         </Card>
         <Card title="我的预设" icon={<FolderOpen size={17} />}>
           {presets.length ? (
@@ -1748,6 +1909,16 @@ function RandomPanel({
   });
   const [total, setTotal] = useState(300);
   const patch = (p: Partial<RandomConfig>) => setConfig({ ...config, ...p });
+  const limits = playbackChannelsLimit(state, config.channels);
+  const playback: PlaybackConfig = {
+    mode: "random",
+    random: config,
+    stages: [],
+    repeat: 1,
+    shuffle: false,
+    durationSec: total,
+  };
+  const issue = playbackConfigIssue(state, playback);
   return (
     <div className="editor-layout">
       <Card
@@ -1764,6 +1935,11 @@ function RandomPanel({
               disabled={disabled}
             />
           </Field>
+          <PlaybackLimitSummary
+            state={state}
+            channels={config.channels}
+            label="随机播放上限说明"
+          />
           <Field label="可选波形">
             <div className="wave-checks">
               {state.waveforms.map((w) => (
@@ -1792,7 +1968,7 @@ function RandomPanel({
               <NumberInput
                 label="随机强度下限"
                 value={config.minIntensity}
-                max={200}
+                max={Math.min(config.maxIntensity, limits.limit)}
                 onChange={(minIntensity) => patch({ minIntensity })}
               />
             </Field>
@@ -1800,7 +1976,8 @@ function RandomPanel({
               <NumberInput
                 label="随机强度上限"
                 value={config.maxIntensity}
-                max={200}
+                min={config.minIntensity}
+                max={limits.limit}
                 onChange={(maxIntensity) => patch({ maxIntensity })}
               />
             </Field>
@@ -1904,23 +2081,17 @@ function RandomPanel({
         </p>
         <button
           className="button primary full"
-          disabled={
-            !canPlay || !config.channels.length || !config.waveformIds.length
-          }
-          onClick={() =>
-            onPlay({
-              mode: "random",
-              random: config,
-              stages: [],
-              repeat: 1,
-              shuffle: false,
-              durationSec: total,
-            })
-          }
+          disabled={!canPlay || !!issue}
+          onClick={() => onPlay(playback)}
         >
           <Shuffle size={16} />
           查看并确认
         </button>
+        {issue && (
+          <p className="playback-issue" role="status">
+            {issue}
+          </p>
+        )}
       </Card>
     </div>
   );

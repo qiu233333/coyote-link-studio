@@ -288,7 +288,7 @@ export async function createApplication(
     app.use(express.static(dist, { index: false }));
     app.use((req, res) => {
       if (req.method === "GET" && existsSync(resolve(dist, "index.html")))
-        res.sendFile(resolve(dist, "index.html"));
+        res.sendFile("index.html", { root: dist });
       else
         res
           .status(404)

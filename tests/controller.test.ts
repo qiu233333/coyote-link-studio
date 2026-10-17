@@ -9,6 +9,7 @@ import { CoyoteDevice } from "../server/device.js";
 import { Controller, type AiBridge } from "../server/controller.js";
 import type {
   AiDecision,
+  Channel,
   ControlBounds,
   PlaybackConfig,
   Stage,
@@ -35,7 +36,12 @@ const deferred = <T>() => {
 const executeTick = (controller: Controller) =>
   (controller as unknown as { tick(): void }).tick();
 
-async function fixture() {
+async function fixture(
+  options: {
+    authorize?: boolean;
+    limits?: Record<Channel, number>;
+  } = {},
+) {
   const directory = mkdtempSync(join(tmpdir(), "coyote-controller-"));
   const store = new Store(directory);
   store.saveSettings({
@@ -62,13 +68,18 @@ async function fixture() {
     { name: "测试波形", frames: ["0A0A0A0A00000000", "0B0B0B0B10101010"] },
   ]);
   await controller.connect({ protocol: "simulator" });
+  if (options.limits) {
+    device.state.limits = options.limits;
+    device.emit("state", device.state);
+  }
   const wave = store.list<Waveform>("waveforms")[0]!;
-  await controller.updateChannels({
-    channels: {
-      A: { limit: 20, rampPerSecond: 20, target: 4, waveformId: wave.id },
-      B: { limit: 20, rampPerSecond: 20, target: 7, waveformId: wave.id },
-    },
-  });
+  if (options.authorize !== false)
+    await controller.updateChannels({
+      channels: {
+        A: { limit: 20, rampPerSecond: 20, target: 4, waveformId: wave.id },
+        B: { limit: 20, rampPerSecond: 20, target: 7, waveformId: wave.id },
+      },
+    });
   const stage = (overrides: Partial<Stage> = {}): Stage => ({
     id: randomUUID(),
     name: "测试阶段",
@@ -170,6 +181,399 @@ test("manual single mode preserves independent channel targets and stops both ch
     assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
     assert.equal(f.controller.stopping, false);
   } finally {
+    await f.cleanup();
+  }
+});
+
+test("20/19 hardware telemetry preserves zero user authorization until explicit save", async () => {
+  const f = await fixture({ authorize: false, limits: { A: 20, B: 19 } });
+  try {
+    assert.deepEqual(f.controller.snapshot().device.limits, { A: 20, B: 19 });
+    assert.equal(f.controller.config.A.limit, 0);
+    assert.equal(f.controller.config.B.limit, 0);
+    await assert.rejects(
+      f.controller.startPlayback(
+        f.playback({ singleTargets: { A: 5 } }),
+        randomUUID(),
+      ),
+      /尚未设置用户上限/,
+    );
+    await assert.rejects(
+      f.controller.updateChannels({ channels: { A: { target: 1 } } }),
+      /超过上限/,
+    );
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    assert.equal(f.controller.run, null);
+    await f.controller.updateChannels({
+      channels: { A: { limit: 20 }, B: { limit: 19 } },
+    });
+    assert.deepEqual(
+      f.device.state.intensities,
+      { A: 0, B: 0 },
+      "saving authorization never emits output",
+    );
+    await f.controller.startPlayback(
+      f.playback({ singleTargets: { A: 5 } }),
+      randomUUID(),
+    );
+    await until(() => f.device.state.intensities.A === 5, 4000);
+    assert.equal(f.device.state.intensities.B, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("editing a running single channel never adds the other enabled channel", async () => {
+  const f = await fixture();
+  try {
+    assert.equal(f.controller.config.B.target, 7);
+    await f.controller.startPlayback(f.playback(), randomUUID());
+    await until(() => f.device.state.intensities.A === 4);
+    await f.controller.updateChannels({ channels: { A: { target: 2 } } });
+    await f.controller.updateChannels({ channels: { B: { target: 6 } } });
+    await until(() => f.device.state.intensities.A === 2);
+    assert.deepEqual(f.controller.run!.playback!.stages[0].channels, ["A"]);
+    assert.equal(f.device.state.intensities.B, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("synchronized selected channels survive disable and enable without restoring output", async () => {
+  const f = await fixture();
+  try {
+    await f.controller.updateChannels({
+      synced: true,
+      channels: { A: { target: 3 }, B: { target: 3 } },
+    });
+    await f.controller.startPlayback(
+      f.playback({ stages: [f.stage({ channels: ["A", "B"] })] }),
+      randomUUID(),
+    );
+    await until(
+      () =>
+        f.device.state.intensities.A === 3 &&
+        f.device.state.intensities.B === 3,
+    );
+    await f.controller.updateChannels({ channels: { B: { enabled: false } } });
+    await until(
+      () =>
+        f.device.state.intensities.A === 0 &&
+        f.device.state.intensities.B === 0,
+    );
+    assert.equal(f.controller.run!.status, "running");
+    assert.deepEqual(f.controller.run!.playback!.stages[0].channels, [
+      "A",
+      "B",
+    ]);
+    await f.controller.updateChannels({ channels: { B: { enabled: true } } });
+    executeTick(f.controller);
+    await sleep(120);
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    assert.deepEqual(
+      [f.controller.config.A.target, f.controller.config.B.target],
+      [0, 0],
+    );
+    await f.controller.updateChannels({ channels: { A: { target: 3 } } });
+    await until(
+      () =>
+        f.device.state.intensities.A === 3 &&
+        f.device.state.intensities.B === 3,
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a single selected channel survives disable and enable and still excludes the other channel", async () => {
+  const f = await fixture();
+  try {
+    await f.controller.startPlayback(f.playback(), randomUUID());
+    await until(() => f.device.state.intensities.A === 4);
+    await f.controller.updateChannels({ channels: { A: { enabled: false } } });
+    await until(() => f.device.state.intensities.A === 0);
+    assert.equal(f.controller.run!.status, "running");
+    assert.deepEqual(f.controller.run!.playback!.stages[0].channels, ["A"]);
+    await f.controller.updateChannels({ channels: { A: { enabled: true } } });
+    executeTick(f.controller);
+    await sleep(120);
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    assert.equal(f.controller.config.A.target, 0);
+    await f.controller.updateChannels({ channels: { A: { target: 3 } } });
+    await until(() => f.device.state.intensities.A === 3);
+    assert.equal(f.device.state.intensities.B, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("explicitly saving a lower user ceiling only lowers idle targets and never starts output", async () => {
+  const f = await fixture();
+  try {
+    await f.controller.updateChannels({
+      synced: true,
+      channels: { A: { target: 12 }, B: { target: 12 } },
+    });
+    await f.controller.updateChannels({ channels: { A: { limit: 6 } } });
+    assert.deepEqual(
+      [f.controller.config.A.limit, f.controller.config.B.limit],
+      [6, 20],
+    );
+    assert.deepEqual(
+      [f.controller.config.A.target, f.controller.config.B.target],
+      [6, 6],
+    );
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    assert.equal(f.controller.run, null);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("dual and synchronized playback respect the lower selected ceiling and enabled channels", async () => {
+  const f = await fixture({ limits: { A: 20, B: 19 } });
+  const both = () =>
+    f.playback({
+      stages: [f.stage({ channels: ["A", "B"] })],
+      singleTargets: { A: 20, B: 20 },
+    });
+  try {
+    await assert.rejects(
+      f.controller.startPlayback(both(), randomUUID()),
+      /B 通道播放强度超过上限/,
+    );
+    await f.controller.updateChannels({
+      synced: true,
+      channels: { A: { target: 0 }, B: { target: 0 } },
+    });
+    await assert.rejects(
+      f.controller.startPlayback(f.playback(), randomUUID()),
+      /同时选择 A\/B/,
+    );
+    await assert.rejects(
+      f.controller.startPlayback(both(), randomUUID()),
+      /播放强度超过上限/,
+    );
+    await assert.rejects(
+      f.controller.updateChannels({ channels: { A: { target: 20 } } }),
+      /有效上限/,
+    );
+    await f.controller.updateChannels({
+      channels: { A: { limit: 8 }, B: { limit: 6 } },
+    });
+    await f.controller.startPlayback(
+      { ...both(), singleTargets: { A: 6, B: 6 } },
+      randomUUID(),
+    );
+    await until(
+      () =>
+        f.device.state.intensities.A === 6 &&
+        f.device.state.intensities.B === 6,
+    );
+    await f.controller.stop();
+    await f.controller.updateChannels({
+      synced: false,
+      channels: { B: { enabled: false } },
+    });
+    await assert.rejects(
+      f.controller.startPlayback(
+        { ...both(), singleTargets: { A: 6, B: 6 } },
+        randomUUID(),
+      ),
+      /B 通道未启用/,
+    );
+    await f.controller.startPlayback(
+      f.playback({ singleTargets: { A: 6 } }),
+      randomUUID(),
+    );
+    await until(() => f.device.state.intensities.A === 6);
+    assert.equal(f.device.state.intensities.B, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("limits and ramp rates remain immutable while running, paused or task locked", async () => {
+  const f = await fixture();
+  try {
+    await f.controller.startPlayback(f.playback(), randomUUID());
+    for (const pause of [false, true]) {
+      if (pause) await f.controller.pause();
+      await assert.rejects(
+        f.controller.updateChannels({ channels: { A: { limit: 19 } } }),
+        /播放期间不能修改上限或变化速率/,
+      );
+      await assert.rejects(
+        f.controller.updateChannels({ channels: { B: { rampPerSecond: 1 } } }),
+        /播放期间不能修改上限或变化速率/,
+      );
+      assert.equal(f.controller.config.A.limit, 20);
+      assert.equal(f.controller.config.B.rampPerSecond, 20);
+    }
+    await f.controller.stop();
+    const plan = f.plan();
+    await f.controller.startTask(plan.id, randomUUID());
+    await assert.rejects(
+      f.controller.updateChannels({ channels: { A: { limit: 19 } } }),
+      /上锁任务/,
+    );
+    await assert.rejects(
+      f.controller.updateChannels({ channels: { B: { rampPerSecond: 1 } } }),
+      /上锁任务/,
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("lower hardware limits clamp live single targets and ramp state without restoring them on increase", async () => {
+  const f = await fixture({ limits: { A: 20, B: 19 } });
+  try {
+    await f.controller.startPlayback(
+      f.playback({ singleTargets: { A: 15 } }),
+      randomUUID(),
+    );
+    await until(() => f.device.state.intensities.A >= 5);
+    f.device.state.limits.A = 4;
+    f.device.state.intensities.A = 4;
+    f.device.emit("state", f.device.state);
+    assert.equal(f.controller.config.A.target, 4);
+    assert.equal(
+      f.controller.config.A.limit,
+      20,
+      "saved authorization is unchanged",
+    );
+    assert.equal(f.controller.run!.playback!.singleTargets!.A, 4);
+    const internals = f.controller as unknown as {
+      levels: Record<Channel, number>;
+    };
+    assert.ok(internals.levels.A <= 4);
+    executeTick(f.controller);
+    await sleep(120);
+    assert.equal(f.controller.run!.status, "running");
+    assert.equal(f.device.state.intensities.A, 4);
+    f.device.state.limits.A = 20;
+    f.device.emit("state", f.device.state);
+    await sleep(120);
+    assert.equal(f.controller.config.A.target, 4);
+    assert.equal(f.device.state.intensities.A, 4);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a ceiling drop cancels a queued controller increase and continues at the safe target", async () => {
+  const f = await fixture();
+  try {
+    await f.controller.startPlayback(
+      f.playback({ singleTargets: { A: 15 } }),
+      randomUUID(),
+    );
+    const internals = f.controller as unknown as {
+      tickAt: number;
+      intensityBusy: Record<Channel, boolean>;
+    };
+    internals.tickAt = Date.now() - 500;
+    executeTick(f.controller);
+    assert.equal(internals.intensityBusy.A, true);
+    f.device.state.limits.A = 3;
+    f.device.emit("state", f.device.state);
+    await until(() => !internals.intensityBusy.A);
+    assert.equal(f.controller.run!.status, "running");
+    assert.equal(f.controller.config.A.target, 3);
+    await until(() => f.device.state.intensities.A === 3);
+    assert.equal(f.controller.run!.status, "running");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("hardware decreases clamp programmed stages and both synchronized targets", async () => {
+  const f = await fixture({ limits: { A: 20, B: 19 } });
+  try {
+    await f.controller.startPlayback(
+      f.playback({ mode: "stages", stages: [f.stage({ intensity: 12 })] }),
+      randomUUID(),
+    );
+    await until(() => f.device.state.intensities.A >= 3);
+    f.device.state.limits.A = 4;
+    f.device.state.intensities.A = Math.min(4, f.device.state.intensities.A);
+    f.device.emit("state", f.device.state);
+    await until(() => f.device.state.intensities.A === 4);
+    assert.equal(
+      f.controller.run!.status,
+      "running",
+      "preauthorized stage is safely limited instead of faulting",
+    );
+    await f.controller.stop();
+    f.device.state.limits.A = 20;
+    await f.controller.updateChannels({ synced: true });
+    await f.controller.startPlayback(
+      f.playback({
+        stages: [f.stage({ channels: ["A", "B"] })],
+        singleTargets: { A: 12, B: 12 },
+      }),
+      randomUUID(),
+    );
+    await until(
+      () =>
+        f.device.state.intensities.A >= 4 && f.device.state.intensities.B >= 4,
+    );
+    f.device.state.limits.B = 3;
+    f.device.state.intensities = { A: 3, B: 3 };
+    f.device.emit("state", f.device.state);
+    assert.deepEqual(
+      [f.controller.config.A.target, f.controller.config.B.target],
+      [3, 3],
+    );
+    executeTick(f.controller);
+    await sleep(120);
+    assert.equal(f.controller.run!.status, "running");
+    assert.deepEqual(f.device.state.intensities, { A: 3, B: 3 });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("physical telemetry above a lowered boundary still faults and confirms zero", async () => {
+  const f = await fixture();
+  try {
+    await f.controller.startPlayback(f.playback(), randomUUID());
+    await until(() => f.device.state.intensities.A === 4);
+    f.device.state.limits.A = 2;
+    f.device.emit("state", f.device.state);
+    await until(
+      () => f.controller.run!.status === "faulted" && !f.controller.stopping,
+    );
+    assert.match(f.controller.run!.reason!, /回传强度超出确认边界/);
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("start rechecks a lower ceiling reported during initial reset", async () => {
+  const f = await fixture();
+  const stop = f.device.stop.bind(f.device);
+  try {
+    f.device.stop = async () => {
+      const confirmed = await stop();
+      f.device.state.limits.A = 2;
+      f.device.emit("state", f.device.state);
+      return confirmed;
+    };
+    await assert.rejects(
+      f.controller.startPlayback(
+        f.playback({ singleTargets: { A: 10 } }),
+        randomUUID(),
+      ),
+      /播放强度超过上限/,
+    );
+    assert.equal(f.controller.run, null);
+    assert.equal(f.controller.stopping, false);
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+  } finally {
+    f.device.stop = stop;
     await f.cleanup();
   }
 });

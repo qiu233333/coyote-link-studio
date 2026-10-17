@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { randomUUID, randomInt } from "node:crypto";
 import { z } from "zod";
+import { channelLimit, outputLimit } from "../shared/limits.js";
 import type {
   AiProfile,
   AiDecision,
@@ -138,6 +139,9 @@ export class Controller extends EventEmitter {
       this.log("warning", "系统", this.run!.reason);
     }
     device.on("state", (state) => {
+      // Hardware ceilings may fall between ticks. Preserve the user's saved
+      // authorization, but immediately lower live targets and ramp state.
+      if (state.connected) this.clampToDeviceLimits();
       for (const channel of channels)
         if (state.intensities[channel] !== this.lastReported[channel]) {
           this.lastReported[channel] = state.intensities[channel];
@@ -154,14 +158,32 @@ export class Controller extends EventEmitter {
         (!state.connected || state.relayStatus === "fault")
       )
         void this.finish("faulted", state.error || "设备或 APP 连接中断");
-      if (active(this.run) && !this.stopping)
+      if (active(this.run) && !this.stopping) {
+        // Disabling changes the next output target to zero. While the two zero
+        // commands are confirmed independently, telemetry must still be checked
+        // against saved authorization and hardware ceilings rather than treating
+        // the other channel's previous value as a newly unauthorized increase.
+        const reportedConfig = {
+          A: { ...this.config.A, enabled: true },
+          B: { ...this.config.B, enabled: true },
+        };
         for (const channel of channels) {
-          const limit = this.effectiveLimit(channel);
+          const limit = outputLimit(
+            reportedConfig,
+            state.limits,
+            channel,
+            this.synced &&
+              this.config.A.enabled &&
+              this.config.B.enabled &&
+              this.run?.owner === "manual",
+            this.run?.bounds,
+          );
           if (state.intensities[channel] > limit) {
             void this.finish("faulted", `${channel} 通道回传强度超出确认边界`);
             break;
           }
         }
+      }
       this.broadcast();
     });
     this.timer = setInterval(() => this.tick(), 100);
@@ -211,15 +233,43 @@ export class Controller extends EventEmitter {
     );
   }
   private effectiveLimit(channel: Channel) {
-    return Math.min(
-      this.config[channel].limit,
-      this.device.state.limits[channel],
-      active(this.run) && this.run?.bounds
-        ? this.run.bounds.channels.includes(channel)
-          ? this.run.bounds.maxIntensity
-          : 0
-        : 200,
+    return outputLimit(
+      this.config,
+      this.device.state.limits,
+      channel,
+      this.synced && (!active(this.run) || this.run?.owner === "manual"),
+      active(this.run) ? this.run?.bounds : undefined,
     );
+  }
+  private clampToDeviceLimits() {
+    let changed = false;
+    for (const channel of channels) {
+      const maximum = outputLimit(
+        this.config,
+        this.device.state.limits,
+        channel,
+        this.synced,
+      );
+      if (this.config[channel].target > maximum) {
+        this.config[channel].target = maximum;
+        if (this.run?.playback?.singleTargets?.[channel] !== undefined)
+          this.run.playback.singleTargets[channel] = maximum;
+        changed = true;
+      }
+      this.levels[channel] = Math.min(
+        this.levels[channel],
+        this.effectiveLimit(channel),
+      );
+    }
+    if (changed) {
+      this.store.set("settings", "channels", this.config);
+      this.persist();
+      this.log(
+        "warning",
+        "控制器",
+        "设备有效上限降低，已同步下调目标强度；用户设置上限保持原授权。",
+      );
+    }
   }
   snapshot(): AppSnapshot {
     return {
@@ -460,18 +510,24 @@ export class Controller extends EventEmitter {
             waveformId: z.string(),
           })
           .parse({ ...next[channel], ...item });
+        if (item.limit !== undefined && item.target === undefined)
+          parsed.target = Math.min(parsed.target, parsed.limit);
         assert(
           parsed.target <= parsed.limit,
           `${channel} 通道目标强度不能超过上限。`,
         );
         if (parsed.waveformId) this.requireWave(parsed.waveformId);
+        if (!parsed.enabled) parsed.target = 0;
         next[channel] = parsed;
       }
     const synced = patch.synced ?? this.synced;
     assert(typeof synced === "boolean", "同步模式无效。");
     if (synced) {
       const changed = patch.channels?.A?.target ?? patch.channels?.B?.target;
-      const target = changed ?? Math.min(next.A.target, next.B.target);
+      const target =
+        next.A.enabled && next.B.enabled
+          ? (changed ?? Math.min(next.A.target, next.B.target))
+          : 0;
       assert(
         target <= Math.min(next.A.limit, next.B.limit),
         "同步强度不能超过任一通道上限。",
@@ -479,6 +535,13 @@ export class Controller extends EventEmitter {
       next.A.target = target;
       next.B.target = target;
     }
+    if (this.device.state.connected)
+      for (const channel of channels)
+        assert(
+          next[channel].target <=
+            outputLimit(next, this.device.state.limits, channel, synced),
+          `${channel} 通道目标强度超过设备、用户或同步有效上限。`,
+        );
     if (active(this.run)) {
       assert(
         patch.synced === undefined || synced === this.synced,
@@ -509,8 +572,11 @@ export class Controller extends EventEmitter {
     this.store.set("settings", "synced", this.synced);
     if (active(this.run) && this.run?.playback) {
       const stage = this.run.playback.stages[0];
-      stage.channels = channels.filter((c) => this.config[c].enabled);
-      stage.intensity = next.A.enabled ? next.A.target : next.B.target;
+      // Keep the original selection. Enabling a channel never adds one, and a
+      // temporary disable only zeros its target rather than deleting selection.
+      stage.intensity = stage.channels.length
+        ? next[stage.channels[0]].target
+        : 0;
       stage.waveformId = next.A.waveformId;
       stage.waveformBId = next.B.waveformId;
       this.run.waveformSnapshots = Object.fromEntries(
@@ -526,11 +592,14 @@ export class Controller extends EventEmitter {
     }
     for (const channel of stage.channels) {
       assert(this.config[channel].enabled, `${channel} 通道未启用。`);
-      const maximum = Math.min(
-        this.config[channel].limit,
-        this.device.state.limits[channel],
-        bounds?.maxIntensity ?? 200,
-      );
+      const maximum = bounds
+        ? channelLimit(this.config, this.device.state.limits, channel, bounds)
+        : outputLimit(
+            this.config,
+            this.device.state.limits,
+            channel,
+            this.synced,
+          );
       assert(
         stage.behavior === "rest" ||
           Math.max(stage.intensity, stage.startIntensity) <= maximum,
@@ -661,10 +730,18 @@ export class Controller extends EventEmitter {
       thinking: false,
     };
   }
-  async startPlayback(input: unknown, requestId: string) {
-    if (this.seenRequest(requestId)) return;
-    this.assertUnlocked();
-    const config = parsePlayback(input);
+  private checkPlayback(config: PlaybackConfig) {
+    const selections =
+      config.mode === "random"
+        ? [config.random!.channels]
+        : config.stages.map((stage) => stage.channels);
+    if (this.synced)
+      assert(
+        selections.every((selected) =>
+          channels.every((c) => selected.includes(c)),
+        ),
+        "同步模式需要同时选择 A/B 通道；单通道播放请先关闭同步。",
+      );
     if (config.mode === "random") {
       const r = config.random!;
       for (const id of r.waveformIds) this.requireWave(id);
@@ -672,7 +749,12 @@ export class Controller extends EventEmitter {
         assert(
           this.config[c].enabled &&
             r.maxIntensity <=
-              Math.min(this.config[c].limit, this.device.state.limits[c]),
+              outputLimit(
+                this.config,
+                this.device.state.limits,
+                c,
+                this.synced,
+              ),
           `${c} 通道随机范围超过上限。`,
         );
     } else if (config.mode === "single") {
@@ -684,8 +766,11 @@ export class Controller extends EventEmitter {
       for (const c of stage.channels) {
         const target = config.singleTargets?.[c] ?? this.config[c].target;
         assert(
-          target <= Math.min(this.config[c].limit, this.device.state.limits[c]),
-          `${c} 通道播放强度超过上限。`,
+          target <=
+            outputLimit(this.config, this.device.state.limits, c, this.synced),
+          this.config[c].limit === 0 && target > 0
+            ? `${c} 通道尚未设置用户上限，请先明确保存上限。`
+            : `${c} 通道播放强度超过上限（设备、用户或同步有效上限）。`,
         );
       }
       if (this.synced && stage.channels.length === 2)
@@ -695,7 +780,15 @@ export class Controller extends EventEmitter {
           "同步模式下 A/B 播放强度必须相同。",
         );
     } else for (const stage of config.stages) this.checkStage(stage);
+  }
+  async startPlayback(input: unknown, requestId: string) {
+    if (this.seenRequest(requestId)) return;
+    this.assertUnlocked();
+    const config = parsePlayback(input);
+    this.checkPlayback(config);
     await this.prepare(requestId);
+    // Reset confirmation can take time and report a lower hardware ceiling.
+    this.checkPlayback(config);
     if (config.mode === "single") {
       const stage = config.stages[0];
       for (const c of stage.channels) {
@@ -749,6 +842,7 @@ export class Controller extends EventEmitter {
     this.checkBounds(bounds);
     this.requireAi();
     await this.prepare(requestId);
+    this.checkBounds(bounds);
     this.profile = this.store.profile();
     this.run = this.makeRun(
       "ai-control",
@@ -833,6 +927,8 @@ export class Controller extends EventEmitter {
       "阶段总时长超过任务最长时间。",
     );
     await this.prepare(requestId);
+    this.checkBounds(plan.bounds);
+    for (const stage of plan.stages) this.checkStage(stage, plan.bounds);
     this.profile = this.store.profile();
     this.run = this.makeRun(
       "locked-task",
@@ -1485,10 +1581,23 @@ export class Controller extends EventEmitter {
       const output = desired[channel],
         maximum = this.effectiveLimit(channel);
       if (!this.config[channel].enabled) output.target = 0;
-      if (output.target > maximum + 0.001 || output.target < 0) {
+      const authorized = outputLimit(
+        this.config,
+        { A: 200, B: 200 },
+        channel,
+        this.synced && run.owner === "manual",
+        run.bounds,
+      );
+      if (
+        !Number.isFinite(output.target) ||
+        output.target > authorized + 0.001 ||
+        output.target < 0
+      ) {
         void this.finish("faulted", `${channel} 通道执行目标越界`);
         return;
       }
+      output.target = Math.min(output.target, maximum);
+      this.levels[channel] = Math.min(this.levels[channel], maximum);
       const rate = Math.min(
         this.config[channel].rampPerSecond,
         run.bounds?.rampPerSecond ?? 20,
@@ -1511,7 +1620,11 @@ export class Controller extends EventEmitter {
         void this.device
           .setIntensity(channel, target)
           .catch((error) => {
-            if (this.epoch === epoch && run.status === "running")
+            if (
+              this.epoch === epoch &&
+              run.status === "running" &&
+              target <= this.effectiveLimit(channel)
+            )
               void this.finish("faulted", `强度指令失败：${error.message}`);
           })
           .finally(() => {
