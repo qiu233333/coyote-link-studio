@@ -7,7 +7,13 @@ import {
   type ReactNode,
 } from "react";
 import { Check, ChevronDown, LoaderCircle, Sparkles, X } from "lucide-react";
-import type { Channel, ControlBounds, Stage, Waveform } from "../shared/types";
+import type {
+  Channel,
+  ChannelValues,
+  ControlBounds,
+  Stage,
+  Waveform,
+} from "../shared/types";
 
 export function IconButton({
   children,
@@ -380,9 +386,9 @@ export function ChannelChips({
 export const defaultBounds = (waves: Waveform[]): ControlBounds => ({
   channels: ["A", "B"],
   waveformIds: waves.slice(0, 3).map((w) => w.id),
-  minIntensity: 0,
-  maxIntensity: 10,
-  rampPerSecond: 2,
+  minIntensity: { A: 0, B: 0 },
+  maxIntensity: { A: 10, B: 10 },
+  rampPerSecond: { A: 2, B: 2 },
   allowSync: true,
   allowRandom: false,
   allowRamp: true,
@@ -399,8 +405,8 @@ export const defaultStage = (waveformId: string, index = 0): Stage => ({
   gapSec: 0,
   channels: ["A", "B"],
   waveformId,
-  intensity: 5,
-  startIntensity: 0,
+  intensity: { A: 5, B: 5 },
+  startIntensity: { A: 0, B: 0 },
   behavior: "hold",
 });
 
@@ -409,11 +415,13 @@ export function BoundsEditor({
   onChange,
   waves,
   disabled = false,
+  deviceLimits,
 }: {
   bounds: ControlBounds;
   onChange: (b: ControlBounds) => void;
   waves: Waveform[];
   disabled?: boolean;
+  deviceLimits?: ChannelValues;
 }) {
   const patch = (value: Partial<ControlBounds>) =>
     onChange({ ...bounds, ...value });
@@ -460,32 +468,74 @@ export function BoundsEditor({
           ))}
         </div>
       </Field>
-      <div className="form-grid three">
-        <Field label="最低强度">
-          <NumberInput
-            label="AI 最低强度"
-            value={bounds.minIntensity}
-            max={200}
-            onChange={(minIntensity) => patch({ minIntensity })}
-          />
-        </Field>
-        <Field label="最高强度">
-          <NumberInput
-            label="AI 最高强度"
-            value={bounds.maxIntensity}
-            max={200}
-            onChange={(maxIntensity) => patch({ maxIntensity })}
-          />
-        </Field>
-        <Field label="变化速率 / 每秒">
-          <NumberInput
-            label="AI 强度变化速率"
-            value={bounds.rampPerSecond}
-            min={1}
-            max={20}
-            onChange={(rampPerSecond) => patch({ rampPerSecond })}
-          />
-        </Field>
+      <div className="per-channel-settings ai-channel-settings">
+        {(["A", "B"] as Channel[]).map((channel) => (
+          <fieldset
+            key={channel}
+            className={`channel-settings channel-settings-${channel.toLowerCase()}`}
+            disabled={disabled || !bounds.channels.includes(channel)}
+            aria-label={`AI ${channel} 通道强度范围`}
+          >
+            <legend>
+              通道 {channel}
+              {!bounds.channels.includes(channel) ? " · 未授权" : ""}
+            </legend>
+            <div className="form-grid three">
+              <Field label="最低强度">
+                <NumberInput
+                  label={`AI ${channel} 通道最低强度`}
+                  value={bounds.minIntensity[channel]}
+                  max={deviceLimits?.[channel] ?? 200}
+                  onChange={(value) =>
+                    patch({
+                      minIntensity: {
+                        ...bounds.minIntensity,
+                        [channel]: value,
+                      },
+                    })
+                  }
+                />
+              </Field>
+              <Field label="最高强度">
+                <NumberInput
+                  label={`AI ${channel} 通道最高强度`}
+                  value={bounds.maxIntensity[channel]}
+                  max={deviceLimits?.[channel] ?? 200}
+                  onChange={(value) =>
+                    patch({
+                      maxIntensity: {
+                        ...bounds.maxIntensity,
+                        [channel]: value,
+                      },
+                    })
+                  }
+                />
+              </Field>
+              <Field label="变化速率 / 每秒">
+                <NumberInput
+                  label={`AI ${channel} 通道强度变化速率`}
+                  value={bounds.rampPerSecond[channel]}
+                  min={0.1}
+                  step={0.1}
+                  max={20}
+                  onChange={(value) =>
+                    patch({
+                      rampPerSecond: {
+                        ...bounds.rampPerSecond,
+                        [channel]: value,
+                      },
+                    })
+                  }
+                />
+              </Field>
+            </div>
+            {deviceLimits && (
+              <p className="field-hint">
+                设备 {channel} 通道强度上限 {deviceLimits[channel]}
+              </p>
+            )}
+          </fieldset>
+        ))}
       </div>
       <div className="form-grid">
         <Field label="决策间隔 / 秒">
@@ -509,7 +559,7 @@ export function BoundsEditor({
       </div>
       <div className="toggle-grid">
         <Toggle
-          label="允许通道同步"
+          label="允许双通道联动"
           checked={bounds.allowSync}
           onChange={(allowSync) => patch({ allowSync })}
           disabled={disabled}

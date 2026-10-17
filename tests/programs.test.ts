@@ -42,8 +42,8 @@ async function fixture() {
     name: "编排阶段",
     channels: ["A"],
     waveformId: wave.id,
-    intensity: 1,
-    startIntensity: 0,
+    intensity: { A: 1, B: 1 },
+    startIntensity: { A: 0, B: 0 },
     durationSec: 0.5,
     gapSec: 0,
     behavior: "hold",
@@ -78,7 +78,7 @@ test("阶段编排执行保持、归零间隔和渐变，结束后归零", async
           f.stage({ name: "保持", gapSec: 0.3 }),
           f.stage({
             name: "渐变",
-            intensity: 4,
+            intensity: { A: 4, B: 4 },
             behavior: "ramp",
             durationSec: 0.6,
           }),
@@ -108,8 +108,16 @@ test("播放列表跳项先清理旧输出，并从下一项恢复", async () =>
       {
         mode: "playlist",
         stages: [
-          f.stage({ name: "第一项", durationSec: 5, intensity: 2 }),
-          f.stage({ name: "第二项", durationSec: 5, intensity: 4 }),
+          f.stage({
+            name: "第一项",
+            durationSec: 5,
+            intensity: { A: 2, B: 2 },
+          }),
+          f.stage({
+            name: "第二项",
+            durationSec: 5,
+            intensity: { A: 4, B: 4 },
+          }),
         ],
         repeat: 1,
         shuffle: false,

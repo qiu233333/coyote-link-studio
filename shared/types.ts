@@ -1,4 +1,5 @@
 export type Channel = "A" | "B";
+export type ChannelValues = Record<Channel, number>;
 export type Owner = "manual" | "ai-control" | "locked-task";
 export type Protocol = "v4" | "v3" | "simulator";
 export type RunStatus =
@@ -63,15 +64,15 @@ export interface Stage {
   channels: Channel[];
   waveformId: string;
   waveformBId?: string;
-  intensity: number;
-  startIntensity: number;
+  intensity: ChannelValues;
+  startIntensity: ChannelValues;
   behavior: "hold" | "ramp" | "rest";
 }
 export interface RandomConfig {
   channels: Channel[];
   waveformIds: string[];
-  minIntensity: number;
-  maxIntensity: number;
+  minIntensity: ChannelValues;
+  maxIntensity: ChannelValues;
   minIntervalSec: number;
   maxIntervalSec: number;
   minDurationSec: number;
@@ -93,9 +94,9 @@ export interface PlaybackConfig {
 export interface ControlBounds {
   channels: Channel[];
   waveformIds: string[];
-  minIntensity: number;
-  maxIntensity: number;
-  rampPerSecond: number;
+  minIntensity: ChannelValues;
+  maxIntensity: ChannelValues;
+  rampPerSecond: ChannelValues;
   allowSync: boolean;
   allowRandom: boolean;
   allowRamp: boolean;
@@ -109,7 +110,7 @@ export interface AiDecision {
   action: "adjust" | "rest" | "finish";
   channels: Channel[];
   waveformId: string;
-  intensity: number;
+  intensity: ChannelValues;
   durationSec: number;
   reason: string;
   phaseComplete?: boolean;

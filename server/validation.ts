@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
+import { channelValues } from "../shared/intensity.js";
 import type {
   ControlBounds,
   PlaybackConfig,
@@ -9,6 +10,18 @@ import type {
 import { assert } from "./errors.js";
 
 const channel = z.enum(["A", "B"]);
+const intensityValue = z.number().int().min(0).max(200);
+const rateValue = z.number().min(0.1).max(20);
+// Legacy scalars migrate atomically. New maps must always include both channels;
+// never merge a partial map with defaults or another field's previous values.
+export const channelIntensitySchema = z.union([
+  intensityValue.transform(channelValues),
+  z.object({ A: intensityValue, B: intensityValue }).strict(),
+]);
+export const channelRateSchema = z.union([
+  rateValue.transform(channelValues),
+  z.object({ A: rateValue, B: rateValue }).strict(),
+]);
 export const boundsSchema = z
   .object({
     channels: z
@@ -17,9 +30,9 @@ export const boundsSchema = z
       .max(2)
       .refine((v) => new Set(v).size === v.length),
     waveformIds: z.array(z.string()).min(1).max(200),
-    minIntensity: z.number().int().min(0).max(200),
-    maxIntensity: z.number().int().min(0).max(200),
-    rampPerSecond: z.number().min(0.1).max(20),
+    minIntensity: channelIntensitySchema,
+    maxIntensity: channelIntensitySchema,
+    rampPerSecond: channelRateSchema,
     allowSync: z.boolean(),
     allowRandom: z.boolean(),
     allowRamp: z.boolean(),
@@ -29,7 +42,10 @@ export const boundsSchema = z
     decisionIntervalSec: z.number().min(5).max(120),
     preference: z.string().max(4000),
   })
-  .refine((b) => b.maxIntensity >= b.minIntensity, "强度上限不能小于下限");
+  .refine(
+    (b) => b.channels.every((c) => b.maxIntensity[c] >= b.minIntensity[c]),
+    "各通道强度上限不能小于下限",
+  );
 export const stageSchema = z.object({
   id: z.string().max(200),
   name: z.string().min(1).max(200),
@@ -42,8 +58,8 @@ export const stageSchema = z.object({
     .refine((v) => new Set(v).size === v.length),
   waveformId: z.string(),
   waveformBId: z.string().optional(),
-  intensity: z.number().int().min(0).max(200),
-  startIntensity: z.number().int().min(0).max(200),
+  intensity: channelIntensitySchema,
+  startIntensity: channelIntensitySchema,
   behavior: z.enum(["hold", "ramp", "rest"]),
 });
 const randomSchema = z
@@ -54,8 +70,8 @@ const randomSchema = z
       .max(2)
       .refine((v) => new Set(v).size === v.length),
     waveformIds: z.array(z.string()).min(1),
-    minIntensity: z.number().int().min(0).max(200),
-    maxIntensity: z.number().int().min(0).max(200),
+    minIntensity: channelIntensitySchema,
+    maxIntensity: channelIntensitySchema,
     minIntervalSec: z.number().min(1).max(300),
     maxIntervalSec: z.number().min(1).max(300),
     minDurationSec: z.number().min(0.1).max(300),
@@ -67,7 +83,7 @@ const randomSchema = z
   })
   .refine(
     (r) =>
-      r.maxIntensity >= r.minIntensity &&
+      r.channels.every((c) => r.maxIntensity[c] >= r.minIntensity[c]) &&
       r.maxIntervalSec >= r.minIntervalSec &&
       r.maxDurationSec >= r.minDurationSec,
     "随机范围的上限不能小于下限",

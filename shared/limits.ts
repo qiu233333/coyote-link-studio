@@ -20,7 +20,7 @@ export function channelLimit(
     return 0;
   return Math.min(
     safeLimit(deviceLimits[channel]),
-    safeLimit(bounds?.maxIntensity ?? 200),
+    safeLimit(bounds?.maxIntensity[channel] ?? 200),
   );
 }
 

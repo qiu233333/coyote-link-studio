@@ -354,8 +354,9 @@ export default function App() {
                 <span>02</span>
                 <p>
                   <strong>划定边界</strong>
-                  先设置通道强度上限，再选择波形与播放方式。AI
-                  模块需先配置兼容接口。
+                  确认设备回传的 A/B
+                  上限，分别设置各通道的强度、波形与播放方式。AI
+                  模块需先配置兼容接口，再分别确认 A/B 控制范围。
                 </p>
               </div>
               <div>

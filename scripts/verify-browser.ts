@@ -21,6 +21,7 @@ const screenshots: string[] = [];
 const expectedRejections = new Set<string>();
 let providerCalls = 0;
 let browser: Browser | undefined;
+let activePage: Page | undefined;
 let application: Awaited<ReturnType<typeof createApplication>> | undefined;
 let baseUrl = "";
 
@@ -68,12 +69,12 @@ const provider = createServer(async (request, response) => {
       assert.ok(waveformId, "必须使用当前库中真实波形 ID");
       const maxIntensity = Math.min(6, context.device.limits?.A ?? 200);
       const bounds: ControlBounds = {
-        channels: ["A"],
+        channels: ["A", "B"],
         waveformIds: [waveformId],
-        minIntensity: 0,
-        maxIntensity,
-        rampPerSecond: 2,
-        allowSync: false,
+        minIntensity: { A: 0, B: 0 },
+        maxIntensity: { A: maxIntensity, B: 3 },
+        rampPerSecond: { A: 2, B: 3 },
+        allowSync: true,
         allowRandom: false,
         allowRamp: true,
         allowRest: true,
@@ -93,10 +94,10 @@ const provider = createServer(async (request, response) => {
             name: "慢慢适应",
             durationSec: 90,
             gapSec: 0,
-            channels: ["A"],
+            channels: ["A", "B"],
             waveformId,
-            intensity: Math.min(4, maxIntensity),
-            startIntensity: 0,
+            intensity: { A: Math.min(4, maxIntensity), B: 2 },
+            startIntensity: { A: 0, B: 0 },
             behavior: "hold",
           },
           {
@@ -104,10 +105,10 @@ const provider = createServer(async (request, response) => {
             name: "留一点休息",
             durationSec: 30,
             gapSec: 0,
-            channels: ["A"],
+            channels: ["A", "B"],
             waveformId,
-            intensity: 0,
-            startIntensity: 0,
+            intensity: { A: 0, B: 0 },
+            startIntensity: { A: 0, B: 0 },
             behavior: "rest",
           },
         ],
@@ -123,10 +124,21 @@ const provider = createServer(async (request, response) => {
         action: "adjust",
         channels: bounds.allowSync ? bounds.channels : [bounds.channels[0]],
         waveformId: bounds.waveformIds[0],
-        intensity: Math.max(
-          bounds.minIntensity,
-          Math.min(reduced ? 2 : 4, bounds.maxIntensity),
-        ),
+        intensity: {
+          A: bounds.channels.includes("A")
+            ? Math.max(
+                bounds.minIntensity.A,
+                Math.min(reduced ? 2 : 4, bounds.maxIntensity.A),
+              )
+            : 0,
+          B:
+            bounds.allowSync && bounds.channels.includes("B")
+              ? Math.max(
+                  bounds.minIntensity.B,
+                  Math.min(reduced ? 1 : 3, bounds.maxIntensity.B),
+                )
+              : 0,
+        },
         durationSec: Math.min(10, bounds.maxActionSec),
         reason: reduced
           ? "收到反馈，已在确认范围内降低目标强度。"
@@ -213,6 +225,8 @@ async function waitState(
 }
 
 async function navigate(page: Page, name: string) {
+  const menu = page.getByRole("button", { name: "打开导航", exact: true });
+  if (await menu.isVisible()) await menu.click();
   await page
     .getByRole("navigation", { name: "主要模块" })
     .getByRole("button", { name: new RegExp(`^${name}`) })
@@ -295,6 +309,7 @@ try {
     }
   });
   const page = await context.newPage();
+  activePage = page;
   page.setDefaultTimeout(15000);
   watchErrors(page);
   await page.goto(baseUrl, { waitUntil: "networkidle" });
@@ -402,8 +417,135 @@ try {
   );
   steps.push("UI 显式模拟连接，独立双通道实时目标保存，显式开始输出与停止归零");
 
+  // Exercise the editable forms, HTTP payloads, persisted snapshots and actual
+  // simulator telemetry with different A/B values, including A above B's cap.
+  application.device.state.limits = { A: 20, B: 19 };
+  application.device.state.lastSeenAt = Date.now();
+  application.device.emit("state", application.device.state);
+  application.controller.broadcast(true);
+  await waitState(
+    page,
+    "独立设备上限回传",
+    (state) => state.device.limits.A === 20 && state.device.limits.B === 19,
+  );
+  const consoleTab = (name: string) =>
+    page
+      .getByRole("navigation", { name: "控制台功能" })
+      .getByRole("button", { name: new RegExp(`^${name}`) });
+  const savePreset = async (name: string) => {
+    await page.getByRole("button", { name: "保存预设", exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: "保存方案预设" });
+    await dialog
+      .getByRole("textbox", { name: "预设名称", exact: true })
+      .fill(name);
+    await dialog.getByRole("button", { name: "保存预设", exact: true }).click();
+    return waitState(page, `预设${name}持久化`, (state) =>
+      state.presets.some((preset) => preset.name === name),
+    );
+  };
+  const confirmPlayback = async (buttonName: string) => {
+    await page.getByRole("button", { name: buttonName, exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: "确认开始播放" });
+    assert.ok(!(await dialog.innerText()).includes("[object Object]"));
+    await dialog.getByRole("button", { name: "确认开始", exact: true }).click();
+  };
+  const stopPlayback = async () => {
+    await consoleTab("实时控制").click();
+    await page.getByRole("button", { name: "停止", exact: true }).click();
+    await waitState(
+      page,
+      "编排停止确认归零",
+      (state) =>
+        state.run?.status === "stopped" &&
+        !state.stopping &&
+        state.device.intensities.A === 0 &&
+        state.device.intensities.B === 0,
+    );
+  };
+
+  await consoleTab("播放列表").click();
+  const playlistA = page.getByLabel("第 1 项 A 通道目标强度", { exact: true });
+  const playlistB = page.getByLabel("第 1 项 B 通道目标强度", { exact: true });
+  assert.equal(await playlistA.getAttribute("max"), "20");
+  assert.equal(await playlistB.getAttribute("max"), "19");
+  await playlistA.fill("20");
+  await playlistB.fill("5");
+  const listState = await savePreset("A20-B5 独立列表");
+  assert.deepEqual(
+    listState.presets.find((preset) => preset.name === "A20-B5 独立列表")
+      ?.config.stages[0].intensity,
+    { A: 20, B: 5 },
+  );
+  await confirmPlayback("确认并播放");
+  await waitState(
+    page,
+    "列表 A20/B5 独立输出",
+    (state) =>
+      state.run?.mode === "playlist" &&
+      state.device.intensities.A === 20 &&
+      state.device.intensities.B === 5,
+    20000,
+  );
+  await capture(page, "playlist-independent.png");
+  await stopPlayback();
+  steps.push(
+    "播放列表 A20/B5 表单独立上限、预设持久化、确认及实际回传，A 不被 B19 压低",
+  );
+
+  await consoleTab("阶段编排").click();
+  await page
+    .getByLabel("第 1 项执行方式", { exact: true })
+    .selectOption("ramp");
+  await page.getByLabel("第 1 项持续时间", { exact: true }).fill("20");
+  await page.getByLabel("第 1 项 A 通道目标强度", { exact: true }).fill("8");
+  await page.getByLabel("第 1 项 B 通道目标强度", { exact: true }).fill("3");
+  await page.getByLabel("第 1 项 A 通道起始强度", { exact: true }).fill("2");
+  await page.getByLabel("第 1 项 B 通道起始强度", { exact: true }).fill("1");
+  const stageState = await savePreset("A2-8 B1-3 渐变");
+  const savedStage = stageState.presets.find(
+    (preset) => preset.name === "A2-8 B1-3 渐变",
+  )!.config.stages[0];
+  assert.deepEqual(savedStage.startIntensity, { A: 2, B: 1 });
+  assert.deepEqual(savedStage.intensity, { A: 8, B: 3 });
+  await confirmPlayback("确认并播放");
+  await waitState(
+    page,
+    "A/B 不同渐变输出",
+    (state) =>
+      state.run?.mode === "stages" &&
+      state.device.intensities.A >= 3 &&
+      state.device.intensities.B > 0 &&
+      state.device.intensities.A > state.device.intensities.B,
+  );
+  await capture(page, "stages-independent.png");
+  await stopPlayback();
+  steps.push("阶段表单与保存预设分别保留 A2→8 / B1→3，执行产生不同渐变回传");
+
+  await consoleTab("随机控制").click();
+  await page.getByLabel("随机 A 通道最低强度", { exact: true }).fill("7");
+  await page.getByLabel("随机 A 通道最高强度", { exact: true }).fill("7");
+  await page.getByLabel("随机 B 通道最低强度", { exact: true }).fill("2");
+  await page.getByLabel("随机 B 通道最高强度", { exact: true }).fill("2");
+  await page.getByLabel("最短单次持续", { exact: true }).fill("20");
+  await page.getByLabel("最长单次持续", { exact: true }).fill("20");
+  await confirmPlayback("查看并确认");
+  await waitState(
+    page,
+    "随机 A7/B2 逐路范围输出",
+    (state) =>
+      state.run?.mode === "random" &&
+      state.device.intensities.A === 7 &&
+      state.device.intensities.B === 2,
+  );
+  await capture(page, "random-independent.png");
+  await stopPlayback();
+  steps.push(
+    "随机 A7 / B2 独立上下限通过 UI 确认并实际输出，各自范围没有互相覆盖",
+  );
+
   await navigate(page, "AI 控制");
-  await page.getByLabel("AI 最高强度", { exact: true }).fill("6");
+  await page.getByLabel("AI A 通道最高强度", { exact: true }).fill("6");
+  await page.getByLabel("AI B 通道最高强度", { exact: true }).fill("3");
   await page.getByLabel("会话最长时间", { exact: true }).fill("180");
   await page.getByLabel("AI 决策间隔", { exact: true }).fill("5");
   await page.getByLabel("AI 单次动作最长时间", { exact: true }).fill("10");
@@ -421,7 +563,8 @@ try {
       state.run?.owner === "ai-control" &&
       state.run.status === "running" &&
       Boolean(state.run.lastDecision) &&
-      state.device.intensities.A > 0,
+      state.device.intensities.A === 4 &&
+      state.device.intensities.B === 3,
   );
   await page
     .getByLabel("给 AI 的文字反馈", { exact: true })
@@ -431,7 +574,8 @@ try {
     page,
     "反馈触发 AI 调整",
     (state) =>
-      state.run?.lastDecision?.intensity === 2 &&
+      state.run?.lastDecision?.intensity.A === 2 &&
+      state.run.lastDecision.intensity.B === 1 &&
       state.run.feedback.some(
         (item) => item.role === "assistant" && item.text.includes("降低"),
       ),
@@ -447,7 +591,8 @@ try {
       state.device.intensities.A === 0 &&
       state.device.intensities.B === 0,
   );
-  await page.getByLabel("AI 最高强度", { exact: true }).fill("4");
+  await page.getByLabel("AI A 通道最高强度", { exact: true }).fill("4");
+  await page.getByLabel("AI B 通道最高强度", { exact: true }).fill("2");
   await page.getByLabel("会话最长时间", { exact: true }).fill("150");
   await page.getByRole("button", { name: "确认新范围", exact: true }).click();
   await waitState(
@@ -455,7 +600,8 @@ try {
     "新范围版本确认",
     (state) =>
       state.run?.boundsVersion === 2 &&
-      state.run.bounds?.maxIntensity === 4 &&
+      state.run.bounds?.maxIntensity.A === 4 &&
+      state.run.bounds.maxIntensity.B === 2 &&
       state.run.status === "paused",
   );
   await page.getByRole("button", { name: "继续控制", exact: true }).click();
@@ -494,6 +640,12 @@ try {
   await page
     .getByRole("textbox", { name: "任务说明", exact: true })
     .fill("先慢慢适应，再给自己留一点休息。最长三分钟，范围由我确认。");
+  await page.getByLabel("AI A 通道最高强度", { exact: true }).fill("6");
+  await page.getByLabel("AI B 通道最高强度", { exact: true }).fill("2");
+  await page.getByLabel("AI A 通道强度变化速率", { exact: true }).fill("3");
+  await page.getByLabel("AI B 通道强度变化速率", { exact: true }).fill("4");
+  await page.getByLabel("第 1 项 A 通道目标强度", { exact: true }).fill("5");
+  await page.getByLabel("第 1 项 B 通道目标强度", { exact: true }).fill("1");
   await page.getByRole("button", { name: "保存草稿", exact: true }).click();
   await waitState(page, "草稿编辑持久化", (state) =>
     state.plans.some(
@@ -511,9 +663,13 @@ try {
     (state) =>
       state.locked &&
       state.run?.owner === "locked-task" &&
-      state.device.intensities.A > 0,
+      state.device.intensities.A > 0 &&
+      state.device.intensities.B > 0,
   );
   assert.equal(locked.run?.plan?.title, "星涟 · 蓝粉约定");
+  assert.deepEqual(locked.run?.plan?.stages[0].intensity, { A: 5, B: 1 });
+  assert.deepEqual(locked.run?.bounds?.maxIntensity, { A: 6, B: 2 });
+  assert.deepEqual(locked.run?.bounds?.rampPerSecond, { A: 3, B: 4 });
   assert.equal(
     await page.getByRole("button", { name: "暂停控制", exact: true }).count(),
     0,
@@ -600,7 +756,35 @@ try {
     await page.getByRole("button", { name: /^紧急停止/ }).isVisible(),
     true,
   );
-  steps.push("390px 窄屏布局、无横向溢出、急停可见");
+  for (const [tabName, imageName] of [
+    ["播放列表", "playlist-mobile.png"],
+    ["阶段编排", "stages-mobile.png"],
+    ["随机控制", "random-mobile.png"],
+  ]) {
+    await consoleTab(tabName).click();
+    if (tabName === "阶段编排")
+      await page
+        .getByLabel("第 1 项执行方式", { exact: true })
+        .selectOption("ramp");
+    await capture(page, imageName);
+    assert.equal(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth > window.innerWidth + 2,
+      ),
+      false,
+      `${tabName}的A/B配置不应横向溢出`,
+    );
+  }
+  await navigate(page, "AI 控制");
+  await capture(page, "ai-bounds-mobile.png");
+  assert.equal(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth + 2,
+    ),
+    false,
+    "AI A/B独立范围不应横向溢出",
+  );
+  steps.push("390px 实时/列表/渐变/随机/AI 范围均无横向溢出，急停可见");
   assert.deepEqual(fixtureErrors, [], "模型 fixture 请求必须符合业务协议");
   assert.deepEqual(errors, [], "浏览器不得出现未预期页面、控制台或网络错误");
   const result = {
@@ -617,6 +801,8 @@ try {
   );
   console.log(JSON.stringify(result));
 } catch (error) {
+  if (activePage && !activePage.isClosed())
+    await capture(activePage, "browser-failure.png").catch(() => {});
   const result = {
     ok: false,
     completedSteps: steps,

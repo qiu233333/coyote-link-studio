@@ -44,6 +44,7 @@ import {
   defaultBounds,
 } from "./ui";
 import { Monitor, StageEditor } from "./ConsolePage";
+import { controlBoundsIssue, taskPlanIssue } from "./playbackLimits";
 
 type AiProps = { state: AppSnapshot; action: Action; pending: boolean };
 
@@ -64,6 +65,7 @@ export function AiControlPage({ state, action, pending }: AiProps) {
     state.stopUnconfirmed ||
     (isActive(state) && state.owner !== "ai-control");
   const canEdit = !blocked && !pending && (!run || run.status === "paused");
+  const boundsIssue = controlBoundsIssue(state, bounds);
   return (
     <div className="page-content">
       <div className="section-title">
@@ -143,7 +145,15 @@ export function AiControlPage({ state, action, pending }: AiProps) {
             }}
             waves={state.waveforms}
             disabled={!canEdit}
+            deviceLimits={
+              state.device.connected ? state.device.limits : undefined
+            }
           />
+          {boundsIssue && (
+            <p className="playback-issue" role="status">
+              {boundsIssue}
+            </p>
+          )}
           {!run ? (
             <button
               className="button primary full"
@@ -151,7 +161,8 @@ export function AiControlPage({ state, action, pending }: AiProps) {
                 blocked ||
                 pending ||
                 !state.device.connected ||
-                !state.aiRuntime.ready
+                !state.aiRuntime.ready ||
+                !!boundsIssue
               }
               onClick={() => setReview(true)}
             >
@@ -189,7 +200,7 @@ export function AiControlPage({ state, action, pending }: AiProps) {
                     </button>
                     <button
                       className="button secondary"
-                      disabled={blocked || pending || !editing}
+                      disabled={blocked || pending || !editing || !!boundsIssue}
                       onClick={async () => {
                         const result = await action(
                           "/api/ai-control/bounds",
@@ -251,6 +262,11 @@ export function AiControlPage({ state, action, pending }: AiProps) {
       {review && (
         <Modal title="确认 AI 控制范围" onClose={() => setReview(false)}>
           <RangeReview bounds={bounds} state={state} />
+          {boundsIssue && (
+            <p className="playback-issue" role="status">
+              {boundsIssue}
+            </p>
+          )}
           <p className="field-hint">
             这是自由控制会话。开始后仍可暂停、停止、修改范围或接管为手动。
           </p>
@@ -267,7 +283,8 @@ export function AiControlPage({ state, action, pending }: AiProps) {
                 blocked ||
                 pending ||
                 !state.device.connected ||
-                !state.aiRuntime.ready
+                !state.aiRuntime.ready ||
+                !!boundsIssue
               }
               onClick={async () => {
                 const result = await action("/api/ai-control/start", {
@@ -304,6 +321,7 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
   const blocked =
     state.locked || state.stopping || state.stopUnconfirmed || isActive(state);
   const editingDisabled = blocked || pending;
+  const planIssue = plan ? taskPlanIssue(state, plan) : null;
   const generate = async () => {
     const result = await action<TaskPlan>("/api/locked-tasks/draft", {
       prompt,
@@ -398,7 +416,12 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
                         {s.durationSec}s ·{" "}
                         {s.behavior === "rest"
                           ? "归零休息"
-                          : `目标 ${s.intensity}`}{" "}
+                          : s.channels
+                              .map(
+                                (channel) =>
+                                  `${channel} ${s.behavior === "ramp" ? `${s.startIntensity[channel]} → ` : ""}${s.intensity[channel]}`,
+                              )
+                              .join(" · ")}{" "}
                         · {s.channels.join(" / ")}
                       </small>
                     </div>
@@ -539,6 +562,9 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
                       onChange={(bounds) => patchPlan({ bounds })}
                       waves={state.waveforms}
                       disabled={editingDisabled}
+                      deviceLimits={
+                        state.device.connected ? state.device.limits : undefined
+                      }
                     />
                   </details>
                   <div className="subsection-heading">
@@ -549,7 +575,14 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
                     setStages={(stages) => patchPlan({ stages })}
                     waves={state.waveforms}
                     disabled={editingDisabled}
+                    state={state}
+                    bounds={plan.bounds}
                   />
+                  {planIssue && (
+                    <p className="playback-issue" role="status">
+                      {planIssue}
+                    </p>
+                  )}
                   <div className="button-row wrap">
                     <button
                       className="button secondary"
@@ -572,7 +605,8 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
                         editingDisabled ||
                         !state.device.connected ||
                         !state.aiRuntime.ready ||
-                        !plan.stages.length
+                        !plan.stages.length ||
+                        !!planIssue
                       }
                       onClick={() => {
                         setReview(true);
@@ -695,6 +729,27 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
             </div>
           </div>
           <RangeReview bounds={plan.bounds} state={state} />
+          <div className="playback-stage-review" aria-label="锁定阶段强度确认">
+            {plan.stages.map((stage) => (
+              <p key={stage.id}>
+                <strong>{stage.name}</strong>
+                {" · "}
+                {stage.behavior === "rest"
+                  ? "归零休息"
+                  : stage.channels
+                      .map(
+                        (channel) =>
+                          `${channel} ${stage.behavior === "ramp" ? `${stage.startIntensity[channel]} → ` : ""}${stage.intensity[channel]}`,
+                      )
+                      .join(" · ")}
+              </p>
+            ))}
+          </div>
+          {planIssue && (
+            <p className="playback-issue" role="status">
+              {planIssue}
+            </p>
+          )}
           <div className="notice notice-pink">
             <LockKeyhole size={18} />
             <span>
@@ -714,7 +769,9 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
             </button>
             <button
               className="button primary pink-primary"
-              disabled={editingDisabled || !state.device.connected}
+              disabled={
+                editingDisabled || !state.device.connected || !!planIssue
+              }
               onClick={async () => {
                 const saved = await action(
                   `/api/locked-tasks/${plan.id}`,
@@ -753,12 +810,17 @@ function RangeReview({
           <span>授权通道</span>
           <strong>{bounds.channels.join(" / ") || "未选择"}</strong>
         </div>
-        <div>
-          <span>强度范围</span>
-          <strong>
-            {bounds.minIntensity}–{bounds.maxIntensity}
-          </strong>
-        </div>
+        {bounds.channels.map((channel) => (
+          <div key={channel}>
+            <span>{channel} 通道强度范围</span>
+            <strong>
+              {bounds.minIntensity[channel]}–{bounds.maxIntensity[channel]}
+            </strong>
+            <small className="field-hint">
+              变化速率 {bounds.rampPerSecond[channel]} / s
+            </small>
+          </div>
+        ))}
         <div>
           <span>最长运行</span>
           <strong>{duration(bounds.durationSec)}</strong>
@@ -766,10 +828,6 @@ function RangeReview({
         <div>
           <span>决策间隔</span>
           <strong>{bounds.decisionIntervalSec}s</strong>
-        </div>
-        <div>
-          <span>变化速率</span>
-          <strong>{bounds.rampPerSecond} / s</strong>
         </div>
         <div>
           <span>单次动作</span>
@@ -787,7 +845,7 @@ function RangeReview({
       </Field>
       <div className="range-permissions">
         {[
-          { label: "同步", value: bounds.allowSync },
+          { label: "双通道联动", value: bounds.allowSync },
           { label: "随机", value: bounds.allowRandom },
           { label: "渐变", value: bounds.allowRamp },
           { label: "休息", value: bounds.allowRest },
@@ -938,10 +996,27 @@ function RunSummary({
         <strong>{run ? duration(timeLeft(run.deadlineAt)) : "—"}</strong>
       </div>
       {run?.lastDecision && (
-        <div className="decision-note">
-          <Sparkles size={15} />
-          <p>{run.lastDecision.reason}</p>
-        </div>
+        <>
+          <div className="summary-line decision-targets">
+            <span>最近 AI 动作</span>
+            <strong>
+              {run.lastDecision.action === "adjust"
+                ? run.lastDecision.channels
+                    .map(
+                      (channel) =>
+                        `${channel} ${run.lastDecision!.intensity[channel]}`,
+                    )
+                    .join(" · ")
+                : run.lastDecision.action === "rest"
+                  ? "A 0 · B 0 · 休息"
+                  : "A 0 · B 0 · 结束"}
+            </strong>
+          </div>
+          <div className="decision-note">
+            <Sparkles size={15} />
+            <p>{run.lastDecision.reason}</p>
+          </div>
+        </>
       )}
     </Card>
   );

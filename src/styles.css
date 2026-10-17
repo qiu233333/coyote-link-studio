@@ -7526,3 +7526,103 @@ button:disabled {
   line-height: 1.7;
   overflow-wrap: anywhere;
 }
+
+/* Keep independent A/B controls readable in both the console and AI editors. */
+.per-channel-settings {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin: 16px 0;
+}
+.per-channel-settings .channel-settings {
+  min-width: 0;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #dce8f8;
+  border-radius: 13px;
+  background: linear-gradient(135deg, #eff6ff9c, #ffffff78);
+}
+.per-channel-settings .channel-settings-b {
+  border-color: #ecdde9;
+  background: linear-gradient(135deg, #fff0f894, #ffffff78);
+}
+.channel-settings > legend {
+  padding: 0 7px;
+  color: #6589bd;
+  font-size: 12px;
+  font-weight: 650;
+}
+.channel-settings-b > legend {
+  color: #b37da2;
+}
+.channel-settings:disabled {
+  opacity: 0.6;
+}
+.per-channel-settings .form-grid {
+  gap: 10px;
+}
+.per-channel-settings .field,
+.stage-row .per-channel-settings .field {
+  min-width: 0;
+  margin-bottom: 2px;
+}
+.per-channel-settings .field > label {
+  font-size: 11px;
+  white-space: normal;
+}
+.per-channel-settings input {
+  width: 100%;
+  min-width: 0;
+  font-size: 13px;
+}
+.stage-row .stage-grid {
+  grid-template-columns: 1.2fr 0.8fr 1fr;
+}
+.ai-channel-settings {
+  grid-template-columns: minmax(0, 1fr);
+}
+.ai-channel-settings .form-grid.three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.playback-stage-review {
+  max-height: 240px;
+  overflow-y: auto;
+  color: #7189aa;
+  font-size: 12px;
+  line-height: 1.8;
+}
+.playback-stage-review p {
+  padding: 7px 10px;
+  border-radius: 9px;
+  background: #f2f6ff80;
+  overflow-wrap: anywhere;
+}
+.decision-targets {
+  gap: 10px;
+}
+.decision-targets strong {
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+@media (max-width: 680px) {
+  .per-channel-settings {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+  .stage-row .stage-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .stage-row .stage-grid > .field:last-child {
+    grid-column: 1 / -1;
+  }
+  .per-channel-settings .field > label,
+  .bounds-editor .per-channel-settings .field > label,
+  .task-plan-editor .bounds-editor .per-channel-settings .field > label {
+    font-size: 11px;
+  }
+  .per-channel-settings input,
+  .stage-row .per-channel-settings input {
+    font-size: 14px;
+    min-height: 38px;
+  }
+}

@@ -10,9 +10,9 @@ export async function verifyAiRuntime(): Promise<void> {
   const bounds: ControlBounds = {
     channels: ["A"],
     waveformIds: ["fixture-wave"],
-    minIntensity: 0,
-    maxIntensity: 5,
-    rampPerSecond: 1,
+    minIntensity: { A: 0, B: 0 },
+    maxIntensity: { A: 20, B: 19 },
+    rampPerSecond: { A: 2, B: 1 },
     allowSync: false,
     allowRandom: false,
     allowRamp: true,
@@ -35,8 +35,8 @@ export async function verifyAiRuntime(): Promise<void> {
         gapSec: 0,
         channels: ["A"],
         waveformId: "fixture-wave",
-        intensity: 3,
-        startIntensity: 0,
+        intensity: { A: 3, B: 0 },
+        startIntensity: { A: 0, B: 0 },
         behavior: "hold",
       },
     ],
@@ -79,6 +79,13 @@ export async function verifyAiRuntime(): Promise<void> {
       );
       assert.ok(messages.includes("本地测试草稿"), "锁定任务说明必须送达模型");
       assert.ok(messages.includes("保持"), "当前阶段必须送达模型");
+      const intensity = body.tools[0].function.parameters.properties.intensity;
+      assert.equal(intensity.type, "object", "强度工具必须使用完整 A/B 对象");
+      assert.equal(intensity.properties.A.maximum, 20);
+      assert.equal(
+        intensity.properties.B.maximum,
+        body.model.startsWith("dual-") ? 19 : 0,
+      );
     }
     const input =
       name === "connection_probe"
@@ -91,9 +98,28 @@ export async function verifyAiRuntime(): Promise<void> {
           ? plan
           : {
               action: "adjust",
-              channels: ["A"],
+              channels: body.model.startsWith("dual-") ? ["A", "B"] : ["A"],
               waveformId: "fixture-wave",
-              intensity: body.model === "bad-fixture" ? 100 : 3,
+              intensity:
+                body.model === "scalar-fixture"
+                  ? 3
+                  : {
+                      A:
+                        body.model === "bad-fixture" ||
+                        body.model === "dual-a-over-fixture"
+                          ? 100
+                          : body.model.startsWith("dual-")
+                            ? 20
+                            : 3,
+                      B:
+                        body.model === "dual-b-over-fixture"
+                          ? 20
+                          : body.model.startsWith("dual-")
+                            ? 19
+                            : body.model === "unselected-fixture"
+                              ? 1
+                              : 0,
+                    },
               durationSec: 10,
               reason: "按授权范围平稳调整",
             };
@@ -140,7 +166,8 @@ export async function verifyAiRuntime(): Promise<void> {
   };
   const context = {
     bounds,
-    channels: { A: { limit: 5 }, B: { limit: 0 } },
+    channels: { A: { limit: 0 }, B: { limit: 0 } },
+    device: { limits: { A: 20, B: 19 }, connected: true },
     waveforms: [{ id: "fixture-wave", name: "测试波形" }],
     run: {
       owner: "locked-task",
@@ -184,7 +211,24 @@ export async function verifyAiRuntime(): Promise<void> {
     assert.equal(unsupported.chat, true);
     assert.equal(unsupported.tools, false);
     const decision = await service.decide(profile, context);
-    assert.equal(decision.intensity, 3);
+    assert.deepEqual(decision.intensity, { A: 3, B: 0 });
+    const dualContext = {
+      ...context,
+      bounds: { ...bounds, channels: ["A", "B"], allowSync: true },
+    };
+    const dualDecision = await service.decide(
+      { ...profile, model: "dual-fixture" },
+      dualContext,
+    );
+    assert.deepEqual(
+      dualDecision.intensity,
+      { A: 20, B: 19 },
+      "双通道不受共同较低上限影响",
+    );
+    for (const model of ["dual-a-over-fixture", "dual-b-over-fixture"])
+      await assert.rejects(service.decide({ ...profile, model }, dualContext));
+    for (const model of ["scalar-fixture", "unselected-fixture"])
+      await assert.rejects(service.decide({ ...profile, model }, context));
     const draft = await service.draft(profile, "生成一个平稳的任务", context);
     assert.equal(draft.title, plan.title);
     await assert.rejects(
@@ -210,7 +254,7 @@ export async function verifyAiRuntime(): Promise<void> {
     ]);
     assert.ok(calls >= 9);
     console.log(
-      "PASS eve 独立进程：实际聊天、工具调用、草稿、范围拒绝、凭证脱敏、内部鉴权与取消。",
+      "PASS eve 独立进程：实际聊天、A/B 独立工具与草稿、两路范围拒绝、凭证脱敏、内部鉴权与取消。",
     );
   } finally {
     await service.stop();

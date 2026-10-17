@@ -117,9 +117,22 @@ test("HTTP 本机同源保护、密钥加密、WebSocket 和实际模拟器控�
       shuffle: false,
       durationSec: 30,
     };
+    const incomplete = await call("/api/console/play", {
+      config: {
+        ...config,
+        stages: [{ ...config.stages[0], intensity: { A: 3 } }],
+      },
+      requestId: crypto.randomUUID(),
+    });
+    assert.equal(incomplete.status, 400);
+    assert.equal(app.controller.run, null);
     const started = await call("/api/console/play", { config, requestId });
     assert.equal(started.status, 200);
     assert.equal(started.result.data.run.status, "running");
+    assert.deepEqual(started.result.data.run.playback.stages[0].intensity, {
+      A: 3,
+      B: 3,
+    });
     const runId = started.result.data.run.id;
     const repeated = await call("/api/console/play", { config, requestId });
     assert.equal(repeated.result.data.run.id, runId);
@@ -148,6 +161,45 @@ test("HTTP 本机同源保护、密钥加密、WebSocket 和实际模拟器控�
     assert.equal(stopped.result.data.run.status, "stopped");
     assert.equal(stopped.result.data.device.intensities.A, 0);
     assert.equal(stopped.result.data.stopUnconfirmed, false);
+    await call(
+      "/api/console/channels",
+      {
+        channels: { A: { rampPerSecond: 20 }, B: { rampPerSecond: 20 } },
+      },
+      "PATCH",
+    );
+    const independent = await call("/api/console/play", {
+      config: {
+        ...config,
+        mode: "stages",
+        stages: [
+          {
+            ...config.stages[0],
+            channels: ["A", "B"],
+            intensity: { A: 20, B: 5 },
+            startIntensity: { A: 0, B: 0 },
+          },
+        ],
+      },
+      requestId: crypto.randomUUID(),
+    });
+    assert.equal(independent.status, 200);
+    assert.deepEqual(independent.result.data.run.playback.stages[0].intensity, {
+      A: 20,
+      B: 5,
+    });
+    const end = Date.now() + 2500;
+    while (
+      app.device.state.intensities.A !== 20 ||
+      app.device.state.intensities.B !== 5
+    ) {
+      assert.ok(
+        Date.now() < end,
+        "HTTP map targets did not reach independent outputs",
+      );
+      await new Promise((done) => setTimeout(done, 10));
+    }
+    assert.equal((await call("/api/emergency-stop")).status, 200);
     app.controller.synced = true;
     const livePatch = await call(
       "/api/console/live/channels",

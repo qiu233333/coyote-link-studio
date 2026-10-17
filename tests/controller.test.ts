@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { Store } from "../server/store.js";
 import { CoyoteDevice } from "../server/device.js";
 import { Controller, type AiBridge } from "../server/controller.js";
+import { parseBounds, parsePlayback, parsePlan } from "../server/validation.js";
 import type {
   AiDecision,
   Channel,
@@ -53,7 +54,7 @@ async function fixture(
     action: "rest",
     channels: [],
     waveformId: "",
-    intensity: 0,
+    intensity: { A: 0, B: 0 },
     durationSec: 1,
     reason: "Fixture rest",
   });
@@ -87,17 +88,17 @@ async function fixture(
     gapSec: 0,
     channels: ["A"],
     waveformId: wave.id,
-    intensity: 4,
-    startIntensity: 0,
+    intensity: { A: 4, B: 4 },
+    startIntensity: { A: 0, B: 0 },
     behavior: "hold",
     ...overrides,
   });
   const bounds = (overrides: Partial<ControlBounds> = {}): ControlBounds => ({
     channels: ["A"],
     waveformIds: [wave.id],
-    minIntensity: 0,
-    maxIntensity: 10,
-    rampPerSecond: 20,
+    minIntensity: { A: 0, B: 0 },
+    maxIntensity: { A: 10, B: 10 },
+    rampPerSecond: { A: 20, B: 20 },
     allowSync: false,
     allowRandom: false,
     allowRamp: true,
@@ -445,7 +446,10 @@ test("live controls retain device, waveform, ownership and locked-task checks", 
       f.controller.updateLiveChannels({ channels: { A: { target: 21 } } }),
       /设备上限/,
     );
-    await f.controller.startAi(f.bounds({ maxIntensity: 20 }), randomUUID());
+    await f.controller.startAi(
+      f.bounds({ maxIntensity: { A: 20, B: 20 } }),
+      randomUUID(),
+    );
     await assert.rejects(
       f.controller.startLive(randomUUID()),
       /先停止当前控制/,
@@ -492,13 +496,13 @@ test("AI uses current device ceilings and its own bounds when legacy limit field
       assert.equal(context.channels.A.limit, 20);
       assert.equal(context.channels.B.limit, 19);
       assert.equal(context.channels.A.rampPerSecond, undefined);
-      assert.equal(context.bounds.maxIntensity, 10);
+      assert.deepEqual(context.bounds.maxIntensity, { A: 10, B: 10 });
       observed = true;
       return {
         action: "adjust",
         channels: ["A"],
         waveformId: f.wave.id,
-        intensity: 6,
+        intensity: { A: 6, B: 6 },
         durationSec: 5,
         reason: "设备边界内运行",
       };
@@ -817,7 +821,10 @@ test("hardware decreases clamp programmed stages and both synchronized targets",
   const f = await fixture({ limits: { A: 20, B: 19 } });
   try {
     await f.controller.startPlayback(
-      f.playback({ mode: "stages", stages: [f.stage({ intensity: 12 })] }),
+      f.playback({
+        mode: "stages",
+        stages: [f.stage({ intensity: { A: 12, B: 12 } })],
+      }),
       randomUUID(),
     );
     await until(() => f.device.state.intensities.A >= 3);
@@ -1103,7 +1110,7 @@ test("late AI responses cannot restore stopped output or a discarded range", asy
       action: "adjust",
       channels: ["A"],
       waveformId: f.wave.id,
-      intensity: 9,
+      intensity: { A: 9, B: 9 },
       durationSec: 5,
       reason: "late",
     });
@@ -1132,7 +1139,7 @@ test("feedback supersedes earlier AI results; confirmed range changes remain pau
       action: "adjust",
       channels: ["A"],
       waveformId: f.wave.id,
-      intensity: 9,
+      intensity: { A: 9, B: 9 },
       durationSec: 5,
       reason: "stale",
     });
@@ -1140,17 +1147,17 @@ test("feedback supersedes earlier AI results; confirmed range changes remain pau
       action: "adjust",
       channels: ["A"],
       waveformId: f.wave.id,
-      intensity: 2,
+      intensity: { A: 2, B: 2 },
       durationSec: 5,
       reason: "updated",
     });
     await until(() => f.controller.run?.lastDecision?.reason === "updated");
     await f.controller.changeBounds(
-      f.bounds({ maxIntensity: 3, durationSec: 20 }),
+      f.bounds({ maxIntensity: { A: 3, B: 3 }, durationSec: 20 }),
     );
     assert.equal(f.controller.run!.status, "paused");
     assert.equal(f.controller.run!.boundsVersion, 2);
-    assert.equal(f.controller.run!.bounds!.maxIntensity, 3);
+    assert.deepEqual(f.controller.run!.bounds!.maxIntensity, { A: 3, B: 3 });
     assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
   } finally {
     await f.cleanup();
@@ -1189,8 +1196,8 @@ test("random playback repeats a recorded seed and stays inside its authorized ra
       random: {
         channels: ["A"],
         waveformIds: [f.wave.id],
-        minIntensity: 3,
-        maxIntensity: 6,
+        minIntensity: { A: 3, B: 3 },
+        maxIntensity: { A: 6, B: 6 },
         minIntervalSec: 1,
         maxIntervalSec: 1,
         minDurationSec: 1,
@@ -1264,7 +1271,7 @@ test("unapproved AI actions fault the session and cannot send out-of-range outpu
       action: "adjust",
       channels: ["A"],
       waveformId: f.wave.id,
-      intensity: 15,
+      intensity: { A: 15, B: 15 },
       durationSec: 5,
       reason: "Unapproved target",
     }));
@@ -1287,7 +1294,7 @@ test("an unavailable AI runtime immediately ends an active session between decis
       action: "adjust",
       channels: ["A"],
       waveformId: f.wave.id,
-      intensity: 4,
+      intensity: { A: 4, B: 4 },
       durationSec: 10,
       reason: "Continue",
     }));
@@ -1347,6 +1354,360 @@ test("service restart marks persisted execution interrupted and never restarts o
       assert.equal(other.config.B.target, 0);
       await sleep(150);
       assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    } finally {
+      await other.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("programmed A20/B5 targets remain independent under 20/19 hardware and old sync state", async () => {
+  const f = await fixture({ limits: { A: 20, B: 19 } });
+  try {
+    for (const mode of ["playlist", "stages"] as const) {
+      await f.controller.updateChannels({ synced: true });
+      await f.controller.startPlayback(
+        f.playback({
+          mode,
+          stages: [
+            f.stage({ channels: ["A", "B"], intensity: { A: 20, B: 5 } }),
+          ],
+        }),
+        randomUUID(),
+      );
+      assert.equal(f.controller.synced, false);
+      await until(
+        () =>
+          f.device.state.intensities.A === 20 &&
+          f.device.state.intensities.B === 5,
+      );
+      assert.deepEqual(f.controller.run!.playback!.stages[0].intensity, {
+        A: 20,
+        B: 5,
+      });
+      await f.controller.stop();
+      assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("stage ramps interpolate each selected channel and ignore unselected draft ceilings", async () => {
+  const f = await fixture({ limits: { A: 20, B: 19 } });
+  try {
+    await f.controller.startPlayback(
+      f.playback({
+        mode: "stages",
+        stages: [
+          f.stage({
+            channels: ["A", "B"],
+            behavior: "ramp",
+            durationSec: 10,
+            startIntensity: { A: 4, B: 1 },
+            intensity: { A: 20, B: 5 },
+          }),
+        ],
+      }),
+      randomUUID(),
+    );
+    const internals = f.controller as unknown as {
+      progressAt: number;
+      playbackDesired(now: number): Record<Channel, { target: number }>;
+    };
+    const desired = internals.playbackDesired(internals.progressAt + 5000);
+    assert.deepEqual(
+      { A: desired.A.target, B: desired.B.target },
+      { A: 12, B: 3 },
+    );
+    await f.controller.stop();
+    await f.controller.startPlayback(
+      f.playback({
+        mode: "stages",
+        stages: [
+          f.stage({
+            channels: ["A"],
+            intensity: { A: 20, B: 200 },
+            startIntensity: { A: 0, B: 200 },
+          }),
+        ],
+      }),
+      randomUUID(),
+    );
+    const single = internals.playbackDesired(Date.now());
+    assert.equal(single.A.target, 20);
+    assert.equal(single.B.target, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("random generation independently samples and records both channel ranges", async () => {
+  const f = await fixture({ limits: { A: 20, B: 19 } });
+  try {
+    const config = f.playback({
+      mode: "random",
+      stages: [],
+      random: {
+        channels: ["A", "B"],
+        waveformIds: [f.wave.id],
+        minIntensity: { A: 18, B: 1 },
+        maxIntensity: { A: 20, B: 5 },
+        minIntervalSec: 1,
+        maxIntervalSec: 1,
+        minDurationSec: 1,
+        maxDurationSec: 1,
+        randomWaveform: false,
+        randomIntensity: true,
+        randomDuration: false,
+        seed: 5150,
+      },
+    });
+    const sequence = async () => {
+      await f.controller.updateChannels({ synced: true });
+      await f.controller.startPlayback(config, randomUUID());
+      const desired = f.controller as unknown as {
+        playbackDesired(now: number): Record<Channel, { target: number }>;
+      };
+      const values = [];
+      const start = Date.now();
+      for (let index = 0; index < 16; index++) {
+        const result = desired.playbackDesired(start + index * 1001);
+        assert.ok(result.A.target >= 18 && result.A.target <= 20);
+        assert.ok(result.B.target >= 1 && result.B.target <= 5);
+        values.push([result.A.target, result.B.target]);
+      }
+      assert.ok(new Set(values.map(([a]) => a)).size > 1);
+      assert.ok(new Set(values.map(([, b]) => b)).size > 1);
+      assert.match(
+        f.controller
+          .snapshot()
+          .logs.find((entry) => entry.source === "随机控制")!.message,
+        /A 目标.*B 目标/,
+      );
+      await f.controller.stop();
+      return values;
+    };
+    assert.deepEqual(await sequence(), await sequence());
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("AI keeps independent bounds, targets and ramp rates on A/B", async () => {
+  const f = await fixture({ authorize: false, limits: { A: 20, B: 19 } });
+  try {
+    assert.equal(f.controller.config.A.rampPerSecond, 2);
+    assert.equal(f.controller.config.B.rampPerSecond, 2);
+    f.decide(async () => ({
+      action: "adjust",
+      channels: ["A", "B"],
+      waveformId: f.wave.id,
+      intensity: { A: 20, B: 5 },
+      durationSec: 10,
+      reason: "独立强度与变化速率",
+    }));
+    await f.controller.startAi(
+      f.bounds({
+        channels: ["A", "B"],
+        allowSync: true,
+        minIntensity: { A: 10, B: 1 },
+        maxIntensity: { A: 20, B: 5 },
+        rampPerSecond: { A: 20, B: 2 },
+      }),
+      randomUUID(),
+    );
+    executeTick(f.controller);
+    await until(() => Boolean(f.controller.run!.lastDecision));
+    const internals = f.controller as unknown as {
+      tickAt: number;
+      levels: Record<Channel, number>;
+    };
+    internals.levels = { A: 0, B: 0 };
+    internals.tickAt = Date.now() - 500;
+    executeTick(f.controller);
+    assert.deepEqual(internals.levels, { A: 10, B: 1 });
+    await until(
+      () =>
+        f.device.state.intensities.A === 20 &&
+        f.device.state.intensities.B === 5,
+      4000,
+    );
+    assert.deepEqual(f.controller.run!.lastDecision!.intensity, {
+      A: 20,
+      B: 5,
+    });
+    await f.controller.pause("ai-control");
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("each AI channel authorization rejects an out-of-range decision and zeroes both", async () => {
+  const f = await fixture({ limits: { A: 20, B: 19 } });
+  try {
+    for (const intensity of [
+      { A: 21, B: 5 },
+      { A: 20, B: 6 },
+      { A: 9, B: 5 },
+      { A: 20, B: 0 },
+    ]) {
+      f.decide(async () => ({
+        action: "adjust",
+        channels: ["A", "B"],
+        waveformId: f.wave.id,
+        intensity,
+        durationSec: 5,
+        reason: "反例校验",
+      }));
+      await f.controller.startAi(
+        f.bounds({
+          channels: ["A", "B"],
+          allowSync: true,
+          minIntensity: { A: 10, B: 1 },
+          maxIntensity: { A: 20, B: 5 },
+        }),
+        randomUUID(),
+      );
+      executeTick(f.controller);
+      await until(
+        () => f.controller.run!.status === "faulted" && !f.controller.stopping,
+      );
+      assert.match(f.controller.run!.reason!, /授权范围/);
+      assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("locked task freezes independent maps and enforces each channel stage boundary", async () => {
+  const f = await fixture({ limits: { A: 20, B: 19 } });
+  const pending = deferred<AiDecision>();
+  try {
+    f.decide(() => pending.promise);
+    const bounds = f.bounds({
+      channels: ["A", "B"],
+      allowSync: true,
+      maxIntensity: { A: 20, B: 5 },
+      rampPerSecond: { A: 20, B: 3 },
+    });
+    const plan = f.plan(bounds, [
+      f.stage({ channels: ["A", "B"], intensity: { A: 20, B: 5 } }),
+    ]);
+    await f.controller.startTask(plan.id, randomUUID());
+    plan.bounds.maxIntensity.B = 19;
+    plan.stages[0].intensity.B = 19;
+    f.store.set("plans", plan.id, plan);
+    assert.deepEqual(f.controller.run!.bounds!.maxIntensity, { A: 20, B: 5 });
+    assert.deepEqual(f.controller.run!.plan!.stages[0].intensity, {
+      A: 20,
+      B: 5,
+    });
+    await until(
+      () =>
+        f.device.state.intensities.A === 20 &&
+        f.device.state.intensities.B === 5,
+    );
+    await assert.rejects(f.controller.changeBounds(bounds), /上锁任务/);
+    await f.controller.emergency();
+    bounds.maxIntensity.B = 5;
+    const invalid = f.plan(bounds, [
+      f.stage({ channels: ["A", "B"], intensity: { A: 20, B: 6 } }),
+    ]);
+    await assert.rejects(
+      f.controller.startTask(invalid.id, randomUUID()),
+      /B 通道阶段强度超过上限/,
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("strict complete maps reject malformed input while old scalar records migrate atomically", async () => {
+  const f = await fixture();
+  try {
+    const bounds = f.bounds();
+    for (const invalid of [
+      { A: 3 },
+      { B: 3 },
+      { A: 3, B: undefined },
+      { A: 3, B: NaN },
+      { A: 3, B: Infinity },
+      { A: 3, B: -1 },
+      { A: 3, B: 201 },
+      { A: 3, B: 3, C: 0 },
+    ]) {
+      assert.throws(() => parseBounds({ ...bounds, maxIntensity: invalid }));
+      assert.throws(() =>
+        parsePlayback(
+          f.playback({
+            stages: [{ ...f.stage(), intensity: invalid } as Stage],
+          }),
+        ),
+      );
+    }
+    const legacyBounds = {
+      ...bounds,
+      minIntensity: 1,
+      maxIntensity: 10,
+      rampPerSecond: 3,
+    };
+    const normalized = parseBounds(legacyBounds);
+    assert.deepEqual(normalized.minIntensity, { A: 1, B: 1 });
+    assert.deepEqual(normalized.maxIntensity, { A: 10, B: 10 });
+    assert.deepEqual(normalized.rampPerSecond, { A: 3, B: 3 });
+    const legacyStage = { ...f.stage(), intensity: 4, startIntensity: 2 };
+    const legacyPlayback = { ...f.playback(), stages: [legacyStage] };
+    const plan = { ...f.plan(), bounds: legacyBounds, stages: [legacyStage] };
+    assert.deepEqual(parsePlan(plan).stages[0].intensity, { A: 4, B: 4 });
+    f.store.set("plans", plan.id, plan);
+    f.store.set("presets", "scalar", {
+      id: "scalar",
+      name: "旧预设",
+      config: legacyPlayback,
+    });
+    const storedRun = {
+      ...f.controller.run,
+      id: "legacy-run",
+      owner: "manual",
+      status: "running",
+      mode: "stages",
+      bounds: legacyBounds,
+      playback: legacyPlayback,
+      waveformSnapshots: {},
+      feedback: [],
+      startedAt: Date.now(),
+      deadlineAt: Date.now() + 60000,
+      boundsVersion: 1,
+      stageIndex: 0,
+      stageStartedAt: Date.now(),
+      elapsedMs: 0,
+      thinking: false,
+    };
+    await f.controller.close();
+    f.store.set("runtime", "current", storedRun);
+    const other = new Controller(f.store, f.device, f.ai);
+    try {
+      assert.deepEqual(other.snapshot().plans[0].bounds.maxIntensity, {
+        A: 10,
+        B: 10,
+      });
+      assert.deepEqual(
+        other.snapshot().presets[0].config.stages[0].startIntensity,
+        { A: 2, B: 2 },
+      );
+      assert.equal(other.run!.status, "interrupted");
+      assert.deepEqual(other.run!.playback!.stages[0].intensity, {
+        A: 4,
+        B: 4,
+      });
+      assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+      await other.startTask(plan.id, randomUUID());
+      assert.deepEqual(other.run!.plan!.bounds.rampPerSecond, { A: 3, B: 3 });
+      assert.deepEqual(other.run!.plan!.stages[0].intensity, { A: 4, B: 4 });
     } finally {
       await other.close();
     }

@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { randomUUID, randomInt } from "node:crypto";
 import { z } from "zod";
 import { channelLimit, outputLimit } from "../shared/limits.js";
+import { channelValues } from "../shared/intensity.js";
 import type {
   AiProfile,
   AiDecision,
@@ -24,6 +25,7 @@ import { AppError, assert } from "./errors.js";
 import { Store } from "./store.js";
 import {
   normalizeWaveform,
+  channelIntensitySchema,
   parseBounds,
   parsePlan,
   parsePlayback,
@@ -51,7 +53,7 @@ const decisionSchema = z.object({
   action: z.enum(["adjust", "rest", "finish"]),
   channels: z.array(z.enum(["A", "B"])).max(2),
   waveformId: z.string(),
-  intensity: z.number().int().min(0).max(200),
+  intensity: channelIntensitySchema,
   durationSec: z.number().min(0.1).max(300),
   reason: z.string().min(1).max(2000),
   phaseComplete: z.boolean().optional(),
@@ -130,7 +132,29 @@ export class Controller extends EventEmitter {
     for (const channel of channels) this.config[channel].target = 0;
     this.synced = store.get<boolean>("settings", "synced") ?? false;
     this.logs = store.list<LogEntry>("logs").slice(0, 500).reverse();
+    // Normalize saved scalar-era records before any snapshot or frozen run can
+    // expose them. Invalid partial maps fail validation instead of gaining zeroes.
+    for (const saved of store.list<TaskPlan>("plans"))
+      store.set("plans", saved.id, parsePlan(saved));
+    for (const saved of store.list<{
+      id: string;
+      name: string;
+      config: PlaybackConfig;
+    }>("presets"))
+      store.set("presets", saved.id, {
+        ...saved,
+        config: parsePlayback(saved.config),
+      });
     this.run = store.get<ControlSession>("runtime", "current") ?? null;
+    if (this.run) {
+      if (this.run.bounds) this.run.bounds = parseBounds(this.run.bounds);
+      if (this.run.plan) this.run.plan = parsePlan(this.run.plan);
+      if (this.run.playback)
+        this.run.playback = parsePlayback(this.run.playback);
+      if (this.run.lastDecision)
+        this.run.lastDecision = decisionSchema.parse(this.run.lastDecision);
+      store.set("runtime", "current", this.run);
+    }
     if (active(this.run)) {
       this.run!.status = "interrupted";
       this.run!.thinking = false;
@@ -173,7 +197,7 @@ export class Controller extends EventEmitter {
             state.limits,
             channel,
             this.synced &&
-              this.run?.mode !== "live" &&
+              this.run?.mode === "single" &&
               this.config.A.enabled &&
               this.config.B.enabled &&
               this.run?.owner === "manual",
@@ -240,6 +264,7 @@ export class Controller extends EventEmitter {
       channel,
       this.synced &&
         this.run?.mode !== "live" &&
+        (!active(this.run) || this.run?.mode === "single") &&
         (!active(this.run) || this.run?.owner === "manual"),
       active(this.run) ? this.run?.bounds : undefined,
     );
@@ -255,7 +280,7 @@ export class Controller extends EventEmitter {
         configured,
         this.device.state.limits,
         channel,
-        this.synced && this.run?.mode !== "live",
+        this.synced && (!active(this.run) || this.run?.mode === "single"),
       );
       if (this.config[channel].target > maximum) {
         this.config[channel].target = maximum;
@@ -662,9 +687,7 @@ export class Controller extends EventEmitter {
       const stage = this.run.playback.stages[0];
       // Keep the original selection. Enabling a channel never adds one, and a
       // temporary disable only zeros its target rather than deleting selection.
-      stage.intensity = stage.channels.length
-        ? next[stage.channels[0]].target
-        : 0;
+      stage.intensity = { A: next.A.target, B: next.B.target };
       stage.waveformId = next.A.waveformId;
       stage.waveformBId = next.B.waveformId;
       this.run.waveformSnapshots = Object.fromEntries(
@@ -682,15 +705,11 @@ export class Controller extends EventEmitter {
       assert(this.config[channel].enabled, `${channel} 通道未启用。`);
       const maximum = bounds
         ? channelLimit(this.config, this.device.state.limits, channel, bounds)
-        : outputLimit(
-            this.config,
-            this.device.state.limits,
-            channel,
-            this.synced,
-          );
+        : channelLimit(this.config, this.device.state.limits, channel);
       assert(
         stage.behavior === "rest" ||
-          Math.max(stage.intensity, stage.startIntensity) <= maximum,
+          Math.max(stage.intensity[channel], stage.startIntensity[channel]) <=
+            maximum,
         `${channel} 通道阶段强度超过上限。`,
       );
       if (bounds)
@@ -703,12 +722,13 @@ export class Controller extends EventEmitter {
             bounds.waveformIds.includes(stage.waveformBId)),
         "任务阶段使用了未授权波形。",
       );
-      assert(
-        stage.intensity >= bounds.minIntensity &&
-          (stage.behavior !== "ramp" ||
-            stage.startIntensity >= bounds.minIntensity),
-        "阶段强度低于确认范围。",
-      );
+      for (const channel of stage.channels)
+        assert(
+          stage.intensity[channel] >= bounds.minIntensity[channel] &&
+            (stage.behavior !== "ramp" ||
+              stage.startIntensity[channel] >= bounds.minIntensity[channel]),
+          `${channel} 通道阶段强度低于确认范围。`,
+        );
     }
     if (bounds)
       assert(
@@ -726,7 +746,7 @@ export class Controller extends EventEmitter {
         `请先在控制台启用 ${channel} 通道。`,
       );
       assert(
-        bounds.maxIntensity <= this.device.state.limits[channel],
+        bounds.maxIntensity[channel] <= this.device.state.limits[channel],
         `${channel} 通道 AI 范围超过设备上限。`,
       );
     }
@@ -819,7 +839,7 @@ export class Controller extends EventEmitter {
       config.mode === "random"
         ? [config.random!.channels]
         : config.stages.map((stage) => stage.channels);
-    if (this.synced)
+    if (this.synced && config.mode === "single")
       assert(
         selections.every((selected) =>
           channels.every((c) => selected.includes(c)),
@@ -832,13 +852,8 @@ export class Controller extends EventEmitter {
       for (const c of r.channels)
         assert(
           this.config[c].enabled &&
-            r.maxIntensity <=
-              outputLimit(
-                this.config,
-                this.device.state.limits,
-                c,
-                this.synced,
-              ),
+            r.maxIntensity[c] <=
+              channelLimit(this.config, this.device.state.limits, c),
           `${c} 通道随机范围超过上限。`,
         );
     } else if (config.mode === "single") {
@@ -846,7 +861,11 @@ export class Controller extends EventEmitter {
       const stage = config.stages[0];
       // Single mode follows independent channel targets; the stage carries its
       // waveform and duration, while singleTargets explicitly updates sliders.
-      this.checkStage({ ...stage, intensity: 0, startIntensity: 0 });
+      this.checkStage({
+        ...stage,
+        intensity: channelValues(0),
+        startIntensity: channelValues(0),
+      });
       for (const c of stage.channels) {
         const target = config.singleTargets?.[c] ?? this.config[c].target;
         assert(
@@ -870,6 +889,10 @@ export class Controller extends EventEmitter {
     this.checkPlayback(config);
     await this.prepare(requestId);
     // Reset confirmation can take time and report a lower hardware ceiling.
+    if (config.mode !== "single") {
+      this.synced = false;
+      this.store.set("settings", "synced", false);
+    }
     this.checkPlayback(config);
     if (config.mode === "single") {
       const stage = config.stages[0];
@@ -997,9 +1020,9 @@ export class Controller extends EventEmitter {
   async startTask(id: string, requestId: string) {
     if (this.seenRequest(requestId)) return;
     this.assertUnlocked();
-    const plan = this.store.get<TaskPlan>("plans", id);
-    assert(plan, "任务草稿不存在。", "NOT_FOUND", 404);
-    parsePlan(plan);
+    const saved = this.store.get<TaskPlan>("plans", id);
+    assert(saved, "任务草稿不存在。", "NOT_FOUND", 404);
+    const plan = parsePlan(saved);
     this.checkBounds(plan.bounds);
     this.requireAi();
     for (const stage of plan.stages) this.checkStage(stage, plan.bounds);
@@ -1345,11 +1368,6 @@ export class Controller extends EventEmitter {
               ? Math.floor(this.random() * random.waveformIds.length)
               : 0
           ];
-        const intensity = random.randomIntensity
-          ? Math.floor(
-              this.range(random.minIntensity, random.maxIntensity + 0.999),
-            )
-          : random.minIntensity;
         this.randomUntil =
           now +
           (random.randomDuration
@@ -1360,11 +1378,21 @@ export class Controller extends EventEmitter {
           now + this.range(random.minIntervalSec, random.maxIntervalSec) * 1000;
         this.randomDesired = this.zeroDesired();
         for (const c of random.channels)
-          this.randomDesired[c] = { target: intensity, waveformId: wave };
+          this.randomDesired[c] = {
+            target: random.randomIntensity
+              ? Math.floor(
+                  this.range(
+                    random.minIntensity[c],
+                    random.maxIntensity[c] + 0.999,
+                  ),
+                )
+              : random.minIntensity[c],
+            waveformId: wave,
+          };
         this.log(
           "info",
           "随机控制",
-          `选择 ${run.waveformSnapshots[wave]?.name}，目标 ${intensity}，持续 ${((this.randomUntil - now) / 1000).toFixed(1)} 秒`,
+          `选择 ${run.waveformSnapshots[wave]?.name}，${random.channels.map((c) => `${c} 目标 ${this.randomDesired![c].target}`).join(" / ")}，持续 ${((this.randomUntil - now) / 1000).toFixed(1)} 秒`,
         );
       }
       return now < this.randomUntil ? this.randomDesired! : result;
@@ -1393,10 +1421,10 @@ export class Controller extends EventEmitter {
               config.mode === "single"
                 ? this.config[c].target
                 : stage.behavior === "ramp"
-                  ? stage.startIntensity +
-                    ((stage.intensity - stage.startIntensity) * local) /
+                  ? stage.startIntensity[c] +
+                    ((stage.intensity[c] - stage.startIntensity[c]) * local) /
                       duration
-                  : stage.intensity;
+                  : stage.intensity[c];
             result[c] = {
               target,
               waveformId:
@@ -1437,10 +1465,10 @@ export class Controller extends EventEmitter {
       desired[c] = {
         target:
           stage.behavior === "ramp"
-            ? stage.startIntensity +
-              (stage.intensity - stage.startIntensity) *
+            ? stage.startIntensity[c] +
+              (stage.intensity[c] - stage.startIntensity[c]) *
                 Math.min(elapsed / duration, 1)
-            : stage.intensity,
+            : stage.intensity[c],
         waveformId:
           c === "B" && stage.waveformBId ? stage.waveformBId : stage.waveformId,
       };
@@ -1465,7 +1493,7 @@ export class Controller extends EventEmitter {
     if (decision.action === "adjust")
       for (const c of decision.channels)
         result[c] = {
-          target: decision.intensity,
+          target: decision.intensity[c],
           waveformId: decision.waveformId,
         };
     return result;
@@ -1541,6 +1569,11 @@ export class Controller extends EventEmitter {
           return;
         const decision = decisionSchema.parse(raw),
           bounds = this.run.bounds!;
+        // A legacy scalar may populate both channels. Only selected adjust
+        // channels can carry a target, and rest/finish always carry exact zero.
+        for (const c of channels)
+          if (decision.action !== "adjust" || !decision.channels.includes(c))
+            decision.intensity[c] = 0;
         assert(
           decision.durationSec <= bounds.maxActionSec,
           "AI 单次动作时长超出授权。",
@@ -1554,12 +1587,15 @@ export class Controller extends EventEmitter {
           );
           assert(
             decision.channels.length < 2 || bounds.allowSync,
-            "AI 未获得双通道同步权限。",
+            "AI 未获得双通道联动权限。",
           );
           assert(
             bounds.waveformIds.includes(decision.waveformId) &&
-              decision.intensity >= bounds.minIntensity &&
-              decision.intensity <= bounds.maxIntensity,
+              decision.channels.every(
+                (c) =>
+                  decision.intensity[c] >= bounds.minIntensity[c] &&
+                  decision.intensity[c] <= bounds.maxIntensity[c],
+              ),
             "AI 波形或强度超出授权范围。",
           );
         }
@@ -1688,7 +1724,7 @@ export class Controller extends EventEmitter {
         this.config,
         { A: 200, B: 200 },
         channel,
-        this.synced && run.mode !== "live" && run.owner === "manual",
+        this.synced && run.mode === "single" && run.owner === "manual",
         run.bounds,
       );
       if (
@@ -1702,8 +1738,12 @@ export class Controller extends EventEmitter {
       output.target = Math.min(output.target, maximum);
       this.levels[channel] = Math.min(this.levels[channel], maximum);
       const rate = Math.min(
-        run.mode === "live" ? 20 : this.config[channel].rampPerSecond,
-        run.bounds?.rampPerSecond ?? 20,
+        20,
+        run.bounds
+          ? run.bounds.rampPerSecond[channel]
+          : run.mode === "live"
+            ? 20
+            : this.config[channel].rampPerSecond,
       );
       const difference = output.target - this.levels[channel];
       this.levels[channel] =

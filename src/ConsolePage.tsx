@@ -40,6 +40,7 @@ import type {
   AppSnapshot,
   Channel,
   ChannelConfig,
+  ControlBounds,
   PlaybackConfig,
   Protocol,
   RandomConfig,
@@ -437,12 +438,37 @@ export default function ConsolePage({
           </p>
           {confirmConfig.random && (
             <p className="muted">
-              强度 {confirmConfig.random.minIntensity}–
-              {confirmConfig.random.maxIntensity} ·{" "}
-              {confirmConfig.random.waveformIds.length} 个授权波形 · 每{" "}
+              {confirmConfig.random.channels
+                .map(
+                  (channel) =>
+                    `${channel} 强度 ${confirmConfig.random!.minIntensity[channel]}–${confirmConfig.random!.maxIntensity[channel]}`,
+                )
+                .join(" · ")}{" "}
+              · {confirmConfig.random.waveformIds.length} 个授权波形 · 每{" "}
               {confirmConfig.random.minIntervalSec}–
               {confirmConfig.random.maxIntervalSec} 秒变化
             </p>
+          )}
+          {!confirmConfig.random && (
+            <div
+              className="playback-stage-review"
+              aria-label="播放阶段强度确认"
+            >
+              {confirmConfig.stages.map((stage) => (
+                <p key={stage.id}>
+                  <strong>{stage.name}</strong>
+                  {" · "}
+                  {stage.behavior === "rest"
+                    ? "归零休息"
+                    : stage.channels
+                        .map(
+                          (channel) =>
+                            `${channel} ${stage.behavior === "ramp" ? `${stage.startIntensity[channel]} → ` : ""}${stage.intensity[channel]}`,
+                        )
+                        .join(" · ")}
+                </p>
+              ))}
+            </div>
           )}
           {confirmationIssue && (
             <p className="playback-issue" role="status">
@@ -763,10 +789,15 @@ function PlaybackLimitSummary({
   const limits = playbackChannelsLimit(state, channels);
   return (
     <p className="playback-limit-summary" aria-label={label}>
-      所选通道强度上限 <strong>{limits.limit}</strong>
-      {" · "}
-      {channels.length ? channels.join(" / ") : "未选择通道"}
-      {channels.length > 1 && " · 共用强度取低值"}
+      {channels.length
+        ? channels.map((channel) => (
+            <span key={channel}>
+              {channel} 通道强度上限 <strong>{limits.limits[channel]}</strong>
+              {"　"}
+            </span>
+          ))
+        : "未选择通道"}
+      {channels.length > 1 && " · 各通道独立限制"}
     </p>
   );
 }
@@ -1273,6 +1304,7 @@ export function StageEditor({
   disabled,
   mode = "stages",
   state,
+  bounds,
 }: {
   stages: Stage[];
   setStages: (stages: Stage[]) => void;
@@ -1280,6 +1312,7 @@ export function StageEditor({
   disabled: boolean;
   mode?: "stages" | "playlist";
   state?: AppSnapshot;
+  bounds?: ControlBounds;
 }) {
   const dragIndex = useRef<number | null>(null);
   const patch = (index: number, changes: Partial<Stage>) =>
@@ -1377,19 +1410,6 @@ export function StageEditor({
                   onChange={(durationSec) => patch(index, { durationSec })}
                 />
               </Field>
-              <Field label="目标强度">
-                <NumberInput
-                  label={`第 ${index + 1} 项目标强度`}
-                  value={stage.intensity}
-                  max={
-                    state
-                      ? playbackChannelsLimit(state, stage.channels).limit
-                      : 200
-                  }
-                  disabled={stage.behavior === "rest"}
-                  onChange={(intensity) => patch(index, { intensity })}
-                />
-              </Field>
               <Field label={mode === "stages" ? "执行方式" : "间隔 / 秒"}>
                 {mode === "stages" ? (
                   <select
@@ -1398,6 +1418,12 @@ export function StageEditor({
                     onChange={(e) =>
                       patch(index, {
                         behavior: e.target.value as Stage["behavior"],
+                        ...(e.target.value === "rest"
+                          ? {
+                              intensity: { A: 0, B: 0 },
+                              startIntensity: { A: 0, B: 0 },
+                            }
+                          : {}),
                       })
                     }
                   >
@@ -1414,6 +1440,80 @@ export function StageEditor({
                   />
                 )}
               </Field>
+            </div>
+            <div className="per-channel-settings stage-channel-settings">
+              {(["A", "B"] as Channel[]).map((channel) => {
+                const selected = stage.channels.includes(channel);
+                const maximum = Math.min(
+                  state?.device.limits[channel] ?? 200,
+                  bounds?.maxIntensity[channel] ?? 200,
+                );
+                return (
+                  <fieldset
+                    key={channel}
+                    className={`channel-settings channel-settings-${channel.toLowerCase()}`}
+                    disabled={
+                      disabled || !selected || stage.behavior === "rest"
+                    }
+                    aria-label={`第 ${index + 1} 项 ${channel} 通道强度`}
+                  >
+                    <legend>
+                      通道 {channel}
+                      {!selected
+                        ? " · 未选择"
+                        : stage.behavior === "rest"
+                          ? " · 归零休息"
+                          : ""}
+                    </legend>
+                    <div className="form-grid">
+                      {stage.behavior === "ramp" && (
+                        <Field label="起始强度">
+                          <NumberInput
+                            label={`第 ${index + 1} 项 ${channel} 通道起始强度`}
+                            value={stage.startIntensity[channel]}
+                            max={maximum}
+                            onChange={(value) =>
+                              patch(index, {
+                                startIntensity: {
+                                  ...stage.startIntensity,
+                                  [channel]: value,
+                                },
+                              })
+                            }
+                          />
+                        </Field>
+                      )}
+                      <Field label="目标强度">
+                        <NumberInput
+                          label={`第 ${index + 1} 项 ${channel} 通道目标强度`}
+                          value={
+                            stage.behavior === "rest"
+                              ? 0
+                              : stage.intensity[channel]
+                          }
+                          max={maximum}
+                          onChange={(value) =>
+                            patch(index, {
+                              intensity: {
+                                ...stage.intensity,
+                                [channel]: value,
+                              },
+                            })
+                          }
+                        />
+                      </Field>
+                    </div>
+                    {selected && (
+                      <p className="field-hint">
+                        {bounds
+                          ? `授权 ${bounds.minIntensity[channel]}–${bounds.maxIntensity[channel]} · `
+                          : ""}
+                        强度上限 {maximum}
+                      </p>
+                    )}
+                  </fieldset>
+                );
+              })}
             </div>
             <div className="form-grid stage-waves">
               <Field label="A / 默认波形">
@@ -1433,22 +1533,6 @@ export function StageEditor({
                   disabled={disabled || stage.behavior === "rest"}
                 />
               </Field>
-              {stage.behavior === "ramp" && (
-                <Field label="起始强度">
-                  <NumberInput
-                    label={`第 ${index + 1} 项起始强度`}
-                    value={stage.startIntensity}
-                    max={
-                      state
-                        ? playbackChannelsLimit(state, stage.channels).limit
-                        : 200
-                    }
-                    onChange={(startIntensity) =>
-                      patch(index, { startIntensity })
-                    }
-                  />
-                </Field>
-              )}
             </div>
           </fieldset>
           {state && stage.behavior !== "rest" && (
@@ -1696,8 +1780,8 @@ function RandomPanel({
   const [config, setConfig] = useState<RandomConfig>({
     channels: ["A", "B"],
     waveformIds: state.waveforms.slice(0, 3).map((w) => w.id),
-    minIntensity: 0,
-    maxIntensity: 10,
+    minIntensity: { A: 0, B: 0 },
+    maxIntensity: { A: 10, B: 10 },
     minIntervalSec: 5,
     maxIntervalSec: 15,
     minDurationSec: 2,
@@ -1707,7 +1791,8 @@ function RandomPanel({
     randomDuration: false,
   });
   const [total, setTotal] = useState(300);
-  const patch = (p: Partial<RandomConfig>) => setConfig({ ...config, ...p });
+  const patch = (p: Partial<RandomConfig>) =>
+    setConfig((current) => ({ ...current, ...p }));
   const limits = playbackChannelsLimit(state, config.channels);
   const playback: PlaybackConfig = {
     mode: "random",
@@ -1762,24 +1847,58 @@ function RandomPanel({
               ))}
             </div>
           </Field>
+          <div className="per-channel-settings random-channel-settings">
+            {(["A", "B"] as Channel[]).map((channel) => (
+              <fieldset
+                key={channel}
+                className={`channel-settings channel-settings-${channel.toLowerCase()}`}
+                disabled={disabled || !config.channels.includes(channel)}
+                aria-label={`随机 ${channel} 通道强度范围`}
+              >
+                <legend>
+                  通道 {channel}
+                  {!config.channels.includes(channel) ? " · 未选择" : ""}
+                </legend>
+                <div className="form-grid">
+                  <Field label="最低强度">
+                    <NumberInput
+                      label={`随机 ${channel} 通道最低强度`}
+                      value={config.minIntensity[channel]}
+                      max={Math.min(
+                        config.maxIntensity[channel],
+                        limits.limits[channel],
+                      )}
+                      onChange={(value) =>
+                        patch({
+                          minIntensity: {
+                            ...config.minIntensity,
+                            [channel]: value,
+                          },
+                        })
+                      }
+                    />
+                  </Field>
+                  <Field label="最高强度">
+                    <NumberInput
+                      label={`随机 ${channel} 通道最高强度`}
+                      value={config.maxIntensity[channel]}
+                      min={config.minIntensity[channel]}
+                      max={limits.limits[channel]}
+                      onChange={(value) =>
+                        patch({
+                          maxIntensity: {
+                            ...config.maxIntensity,
+                            [channel]: value,
+                          },
+                        })
+                      }
+                    />
+                  </Field>
+                </div>
+              </fieldset>
+            ))}
+          </div>
           <div className="form-grid">
-            <Field label="强度下限">
-              <NumberInput
-                label="随机强度下限"
-                value={config.minIntensity}
-                max={Math.min(config.maxIntensity, limits.limit)}
-                onChange={(minIntensity) => patch({ minIntensity })}
-              />
-            </Field>
-            <Field label="强度上限">
-              <NumberInput
-                label="随机强度上限"
-                value={config.maxIntensity}
-                min={config.minIntensity}
-                max={limits.limit}
-                onChange={(maxIntensity) => patch({ maxIntensity })}
-              />
-            </Field>
             <Field label="最短变化间隔 / 秒">
               <NumberInput
                 label="最短变化间隔"
@@ -1849,12 +1968,14 @@ function RandomPanel({
           <i />
           <i />
         </div>
-        <div className="summary-line">
-          <span>强度范围</span>
-          <strong>
-            {config.minIntensity}–{config.maxIntensity}
-          </strong>
-        </div>
+        {config.channels.map((channel) => (
+          <div className="summary-line" key={channel}>
+            <span>{channel} 通道强度范围</span>
+            <strong>
+              {config.minIntensity[channel]}–{config.maxIntensity[channel]}
+            </strong>
+          </div>
+        ))}
         <div className="summary-line">
           <span>授权波形</span>
           <strong>{config.waveformIds.length} 个</strong>
