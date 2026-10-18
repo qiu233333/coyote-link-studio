@@ -25,7 +25,8 @@ import ConsolePage from "./ConsolePage";
 import { AiControlPage, LockedTaskPage } from "./AiPages";
 import SettingsPage from "./SettingsPage";
 import { duration, isActive, ownerNames, timeLeft, useAppState } from "./api";
-import { Avatar, Badge, IconButton } from "./ui";
+import { Avatar, Badge, IconButton, Modal } from "./ui";
+import { version as appVersion } from "../package.json";
 
 type Page = "console" | "ai-control" | "locked-task" | "settings";
 const pages = [
@@ -54,6 +55,7 @@ export default function App() {
   const [page, setPage] = useState<Page>("console");
   const [mobileNav, setMobileNav] = useState(false);
   const [help, setHelp] = useState(false);
+  const [systemInfo, setSystemInfo] = useState(false);
   const [, tick] = useState(0);
   const [emergencyPending, setEmergencyPending] = useState(false);
   useEffect(() => {
@@ -151,8 +153,13 @@ export default function App() {
             本地运行 · 数据留在身边
           </span>
           <div>
-            <small>COYOTE LINK · v0.1.0</small>
-            <button aria-label="使用帮助" onClick={() => setHelp(true)}>
+            <small>COYOTE LINK · v{appVersion}</small>
+            <button
+              className="system-info-trigger"
+              aria-label="系统信息"
+              title="系统信息"
+              onClick={() => setSystemInfo(true)}
+            >
               <CircleHelp size={17} />
             </button>
           </div>
@@ -326,6 +333,54 @@ export default function App() {
             <X size={15} />
           </IconButton>
         </div>
+      )}
+      {systemInfo && (
+        <Modal title="系统信息" onClose={() => setSystemInfo(false)}>
+          <div className="system-info">
+            <div className="system-info-summary">
+              <span className="system-info-mark">
+                <AudioLines size={28} />
+              </span>
+              <div>
+                <h3>星涟联动</h3>
+                <p>COYOTE LINK STUDIO</p>
+              </div>
+              <Badge color="pink">v{appVersion}</Badge>
+            </div>
+            <p className="system-info-description">
+              本地运行的设备联动控制台，支持波形编排、AI 控制和 AI 上锁任务。
+            </p>
+            <dl className="system-info-details">
+              <dt>作者</dt>
+              <dd>秋玌</dd>
+              <dt>QQ 群</dt>
+              <dd>828484276</dd>
+              <dt>GitHub 仓库</dt>
+              <dd>
+                <a
+                  href="https://github.com/qiu233333/coyote-link-studio"
+                  aria-label="GitHub 仓库（在新窗口打开）"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <span>github.com/qiu233333/coyote-link-studio</span>
+                  <ArrowUpRight size={15} aria-hidden="true" />
+                </a>
+              </dd>
+              <dt>运行方式</dt>
+              <dd>本地运行 · 数据留在身边</dd>
+            </dl>
+            <p className="system-info-note">
+              欢迎加入 QQ 群交流，或前往 GitHub 仓库查看更新、反馈问题。
+            </p>
+          </div>
+          <button
+            className="button primary full"
+            onClick={() => setSystemInfo(false)}
+          >
+            知道了
+          </button>
+        </Modal>
       )}
       {help && (
         <div className="modal-backdrop" onClick={() => setHelp(false)}>

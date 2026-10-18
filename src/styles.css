@@ -3343,6 +3343,82 @@ main {
   color: #829abc;
   margin-bottom: 6px;
 }
+.sidebar-bottom .system-info-trigger {
+  min-width: 32px;
+  min-height: 32px;
+  align-items: center;
+  justify-content: center;
+}
+.system-info {
+  margin: 24px 0;
+  color: #7c94b7;
+  font-size: 12px;
+  line-height: 1.8;
+}
+.system-info-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+.system-info-mark {
+  display: grid;
+  place-items: center;
+  width: 54px;
+  height: 54px;
+  border-radius: 16px;
+  color: white;
+  background: linear-gradient(135deg, #91baff, #d4a5d4);
+}
+.system-info-summary h3 {
+  font-size: 21px;
+  color: #6785af;
+}
+.system-info-summary p {
+  font-size: 8px;
+  letter-spacing: 1.1px;
+  color: #9aacc7;
+}
+.system-info-summary > .badge {
+  margin-left: auto;
+}
+.system-info-description {
+  margin: 20px 0;
+}
+.system-info-details {
+  display: grid;
+  grid-template-columns: 80px minmax(0, 1fr);
+  gap: 17px 12px;
+  padding: 20px 16px;
+  border: 1px solid #e1e9f7;
+  border-radius: 13px;
+  background: linear-gradient(135deg, #edf4ff70, #faf0f860);
+}
+.system-info-details dt {
+  color: #92a5c2;
+}
+.system-info-details dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.system-info-details a {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 4px;
+  color: #678cbe;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.system-info-details a > svg {
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+.system-info-note {
+  margin-top: 18px;
+  color: #94a7c3;
+  font-size: 11px;
+}
 .sr-only {
   position: absolute;
   width: 1px;
