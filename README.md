@@ -1,9 +1,9 @@
 <div align="center">
 
 <p>
-  <img src="docs/assets/dglab-logo.webp" alt="DG-LAB 图标" width="112" height="112" />
-  &nbsp;&nbsp;&nbsp;&nbsp;
   <img src="public/assistant-avatar.jpg" alt="星涟助手头像" width="112" height="112" />
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="docs/assets/dglab-logo.webp" alt="DG-LAB 图标" width="112" height="112" />
 </p>
 
 <h1>星涟联动 · Coyote Link</h1>
