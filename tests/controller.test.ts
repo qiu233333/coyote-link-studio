@@ -1107,6 +1107,92 @@ test("emergency during connection blocks starts until cancelled connection clean
   }
 });
 
+test("emergency rechecks the device after a cancelled connection finishes cleanup", async () => {
+  const f = await fixture();
+  const gate = deferred<void>();
+  const connect = f.device.connect.bind(f.device);
+  const disconnect = f.device.disconnect.bind(f.device);
+  const stop = f.device.stop.bind(f.device);
+  let stopCalls = 0;
+  try {
+    f.device.connect = async () => {
+      await gate.promise;
+    };
+    // The first stop confirms the old idle connection. The transition then
+    // exposes a device whose cancellation cleanup cannot confirm physical zero.
+    f.device.stop = async () => ++stopCalls === 1;
+    f.device.disconnect = async () => {
+      f.device.state.error = "Fixture cancelled connection lost zero ACK";
+      f.device.state.connected = false;
+      f.device.state.canConfirmZero = false;
+    };
+    const connecting = f.controller.connect({ protocol: "simulator" });
+    const rejected = assert.rejects(connecting, /取消/);
+    const emergency = f.controller.emergency();
+    await until(() => stopCalls === 1);
+    gate.resolve();
+    await Promise.all([rejected, emergency]);
+    assert.equal(
+      stopCalls,
+      2,
+      "final transition state needs its own stop evidence",
+    );
+    assert.equal(f.controller.stopping, false);
+    assert.equal(f.controller.stopUnconfirmed, true);
+    assert.match(f.controller.snapshot().stopReason!, /lost zero ACK/);
+  } finally {
+    gate.resolve();
+    f.device.connect = connect;
+    f.device.disconnect = disconnect;
+    f.device.stop = stop;
+    await f.cleanup();
+  }
+});
+
+test("concurrent and repeated emergencies share confirmation and preserve a faulted run", async () => {
+  const f = await fixture();
+  const gate = deferred<boolean>();
+  const stop = f.device.stop.bind(f.device);
+  let stopCalls = 0;
+  try {
+    await f.controller.startAi(f.bounds(), randomUUID());
+    f.device.stop = () => {
+      stopCalls++;
+      return gate.promise;
+    };
+    const first = f.controller.emergency();
+    const second = f.controller.emergency();
+    const third = f.controller.stop("ai-control");
+    await until(() => stopCalls === 1);
+    assert.equal(f.controller.stopping, true);
+    assert.equal(f.controller.run!.status, "stopped");
+    f.device.state.error = "Fixture missing B zero acknowledgement";
+    gate.resolve(false);
+    await Promise.all([first, second, third]);
+    assert.equal(stopCalls, 1);
+    assert.equal(f.controller.stopUnconfirmed, true);
+    assert.match(f.controller.snapshot().stopReason!, /missing B zero/);
+    assert.equal(f.controller.run!.status, "faulted");
+    f.device.stop = stop;
+    await f.controller.emergency();
+    assert.equal(f.controller.stopUnconfirmed, false);
+    assert.equal(f.controller.snapshot().stopReason, undefined);
+    assert.equal(
+      f.controller.run!.status,
+      "faulted",
+      "confirmed cleanup cannot revive a faulted task",
+    );
+    executeTick(f.controller);
+    await flush();
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    await assert.rejects(f.controller.resume(), /没有可恢复/);
+  } finally {
+    gate.resolve(false);
+    f.device.stop = stop;
+    await f.cleanup();
+  }
+});
+
 test("late AI responses cannot restore stopped output or a discarded range", async () => {
   const f = await fixture();
   const request = deferred<AiDecision>();
@@ -1366,6 +1452,7 @@ test("service restart marks persisted execution interrupted and never restarts o
     const other = new Controller(f.store, f.device, f.ai);
     try {
       assert.equal(other.run!.status, "interrupted");
+      assert.equal(other.stopUnconfirmed, true);
       assert.equal(other.config.A.target, 0);
       assert.equal(other.config.B.target, 0);
       await sleep(150);
@@ -1374,6 +1461,159 @@ test("service restart marks persisted execution interrupted and never restarts o
       await other.close();
     }
   } finally {
+    await f.cleanup();
+  }
+});
+
+for (const legacyStatus of ["running", "faulted"] as const) {
+  test(`historical ${legacyStatus} output uncertainty survives fresh drivers and simulator selection`, async () => {
+    const f = await fixture();
+    const fresh = new CoyoteDevice();
+    let other: Controller | undefined;
+    try {
+      await f.controller.startPlayback(f.playback(), randomUUID());
+      const saved = structuredClone(f.controller.run!);
+      saved.status = legacyStatus;
+      saved.termination = undefined;
+      await f.controller.close();
+      f.store.set("runtime", "current", saved);
+      // Old versions did not persist stop confirmation separately. An active
+      // historical run therefore carries physical uncertainty across restarts.
+      f.store.delete("runtime", "stop");
+      fresh.stop = async () => true; // This fresh driver's safe local idle only.
+      other = new Controller(f.store, fresh, f.ai);
+      assert.equal(
+        other.run!.status,
+        legacyStatus === "running" ? "interrupted" : "faulted",
+      );
+      assert.equal(other.stopUnconfirmed, true);
+      await other.emergency();
+      assert.equal(other.stopUnconfirmed, true);
+      await other.connect({ protocol: "simulator" });
+      assert.equal(other.stopUnconfirmed, true);
+      await other.emergency();
+      assert.equal(other.stopUnconfirmed, true);
+      assert.match(other.snapshot().stopReason!, /实体设备/);
+      await assert.rejects(
+        other.startPlayback(f.playback(), randomUUID()),
+        /停止尚未确认/,
+      );
+      // Even current physical zero cannot prove which device the old version
+      // controlled when its persisted record has no identity. No real I/O occurs.
+      fresh.state.protocol = "v4";
+      fresh.state.connected = true;
+      fresh.state.canConfirmZero = true;
+      await other.emergency();
+      assert.equal(other.stopUnconfirmed, true);
+      assert.match(other.snapshot().stopReason!, /缺少原设备标识/);
+      assert.equal(other.run!.status, "faulted");
+      await other.close();
+      other = new Controller(f.store, fresh, f.ai);
+      assert.equal(
+        other.stopUnconfirmed,
+        true,
+        "missing historical device identity remains unresolved across restarts",
+      );
+    } finally {
+      await other?.close();
+      // Avoid using the mocked V4 state when disposing the simulator socket.
+      fresh.state.protocol = "simulator";
+      await fresh.dispose();
+      await f.cleanup();
+    }
+  });
+}
+
+test("unconfirmed physical output belongs to its original APP and device identity", async () => {
+  const f = await fixture();
+  const stop = f.device.stop.bind(f.device);
+  let other: Controller | undefined;
+  try {
+    await f.controller.startPlayback(f.playback(), randomUUID());
+    // Only mock state and stop() are used; no real relay or device is contacted.
+    f.device.state.protocol = "v4";
+    f.device.state.clientId = "original-app";
+    f.device.state.slotId = "original-device";
+    f.device.stop = async () => false;
+    await f.controller.emergency();
+    assert.equal(f.controller.stopUnconfirmed, true);
+    await f.controller.close();
+    other = new Controller(f.store, f.device, f.ai);
+    assert.equal(other.stopUnconfirmed, true);
+    f.device.stop = async () => true;
+    for (const [clientId, slotId] of [
+      ["original-app", "other-device"],
+      ["other-app", "original-device"],
+    ]) {
+      f.device.state.clientId = clientId;
+      f.device.state.slotId = slotId;
+      await other.emergency();
+      assert.equal(other.stopUnconfirmed, true);
+      assert.match(other.snapshot().stopReason!, /标识/);
+    }
+    f.device.state.clientId = "original-app";
+    f.device.state.slotId = "original-device";
+    await other.emergency();
+    assert.equal(other.stopUnconfirmed, false);
+    assert.equal(other.run!.status, "faulted");
+    await other.close();
+    other = new Controller(f.store, f.device, f.ai);
+    assert.equal(
+      other.stopUnconfirmed,
+      false,
+      "a faulted task record must not recreate a resolved stop latch",
+    );
+  } finally {
+    await other?.close();
+    f.device.state.protocol = "simulator";
+    f.device.state.clientId = "simulator";
+    f.device.state.slotId = "coyote-sim";
+    f.device.stop = stop;
+    await f.cleanup();
+  }
+});
+
+test("a crash while finish awaits device confirmation cannot persist a clean stopped run", async () => {
+  const f = await fixture();
+  const gate = deferred<boolean>();
+  const stop = f.device.stop.bind(f.device);
+  const fresh = new CoyoteDevice();
+  let other: Controller | undefined;
+  try {
+    await f.controller.startPlayback(f.playback(), randomUUID());
+    f.device.stop = () => gate.promise;
+    const finishing = f.controller.emergency();
+    assert.equal(f.controller.run!.status, "stopped");
+    assert.equal(
+      f.store.get<{ unconfirmed: boolean }>("runtime", "stop")!.unconfirmed,
+      true,
+    );
+    f.device.state.connected = false;
+    const repeated = f.controller.emergency();
+    assert.equal(
+      f.store.get<{ unconfirmed: boolean }>("runtime", "stop")!.unconfirmed,
+      true,
+      "a duplicate stop after disconnect must retain the original pending stop evidence",
+    );
+    fresh.stop = async () => true;
+    other = new Controller(f.store, fresh, f.ai);
+    assert.equal(other.stopUnconfirmed, true);
+    await other.emergency();
+    assert.equal(
+      other.stopUnconfirmed,
+      true,
+      "a new driver's local idle cannot acknowledge the interrupted stop",
+    );
+    await other.close();
+    other = undefined;
+    gate.resolve(true);
+    await Promise.all([finishing, repeated]);
+    assert.equal(f.controller.stopUnconfirmed, false);
+  } finally {
+    gate.resolve(false);
+    await other?.close();
+    await fresh.dispose();
+    f.device.stop = stop;
     await f.cleanup();
   }
 });
@@ -1922,11 +2162,11 @@ test("model finish, explicit phase completion, device stale and disconnect have 
       await until(
         () => f.controller.run!.status === "faulted" && !f.controller.stopping,
       );
-      // The simulator can only confirm zero while connected; a real disconnection
-      // may therefore replace the trigger source with stop-unconfirmed.
+      // The initial reset was confirmed and no output was sent afterwards, so
+      // its certificate also proves this disconnected simulator stayed stopped.
       assert.equal(
         f.controller.run!.termination?.source,
-        disconnected ? "stop-unconfirmed" : "device-stale",
+        disconnected ? "device-disconnected" : "device-stale",
       );
     }
   } finally {
@@ -1965,6 +2205,50 @@ test("the hard deadline marks completion while recovery still awaits physical ze
   } finally {
     stopped.resolve(false);
     await f.cleanup();
+  }
+});
+
+test("emergency joins a pending AI recovery stop without allowing the retry to resume", async () => {
+  for (const confirmed of [true, false]) {
+    const f = await fixture();
+    const gate = deferred<boolean>();
+    const stop = f.device.stop.bind(f.device);
+    let aiCalls = 0;
+    let stopCalls = 0;
+    try {
+      f.decide(async () => {
+        aiCalls++;
+        throw new AiServiceError("AI_TIMEOUT", "Fixture timeout");
+      });
+      await f.controller.startAi(f.bounds(), randomUUID());
+      f.device.stop = () => {
+        stopCalls++;
+        return gate.promise;
+      };
+      executeTick(f.controller);
+      await until(
+        () => stopCalls === 1 && Boolean(f.controller.run!.inferenceRecovery),
+      );
+      const emergency = f.controller.emergency();
+      assert.equal(f.controller.run!.inferenceRecovery, undefined);
+      assert.equal(f.controller.stopping, true);
+      gate.resolve(confirmed);
+      await emergency;
+      await flush();
+      assert.equal(stopCalls, 1);
+      assert.equal(f.controller.stopping, false);
+      assert.equal(f.controller.stopUnconfirmed, !confirmed);
+      assert.equal(f.controller.run!.status, confirmed ? "stopped" : "faulted");
+      executeTick(f.controller);
+      await flush();
+      assert.equal(aiCalls, 1);
+      assert.equal(f.controller.run!.inferenceRecovery, undefined);
+      await assert.rejects(f.controller.resume(), /没有可恢复/);
+    } finally {
+      gate.resolve(false);
+      f.device.stop = stop;
+      await f.cleanup();
+    }
   }
 });
 
@@ -2115,6 +2399,7 @@ test("strict complete maps reject malformed input while old scalar records migra
         B: 4,
       });
       assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+      await other.emergency();
       await other.startTask(plan.id, randomUUID());
       assert.deepEqual(other.run!.plan!.bounds.rampPerSecond, { A: 3, B: 3 });
       assert.deepEqual(other.run!.plan!.stages[0].intensity, { A: 4, B: 4 });

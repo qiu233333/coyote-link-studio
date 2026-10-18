@@ -16,6 +16,7 @@ import type {
   LogEntry,
   Owner,
   PlaybackConfig,
+  Protocol,
   RunStatus,
   RunTerminationSource,
   Stage,
@@ -67,6 +68,7 @@ export class Controller extends EventEmitter {
   public config: Record<Channel, ChannelConfig>;
   public synced = false;
   public stopUnconfirmed = false;
+  public stopReason?: string;
   public stopping = false;
   private logs: LogEntry[];
   private history: AppSnapshot["history"] = [];
@@ -102,6 +104,8 @@ export class Controller extends EventEmitter {
   private stopFlight?: Promise<boolean>;
   private finishFlight?: Promise<void>;
   private deviceTransition?: Promise<void>;
+  private unresolvedStopProtocol?: Protocol | "unknown";
+  private unresolvedStopIdentity?: { clientId?: string; slotId?: string };
 
   constructor(
     public store: Store,
@@ -158,7 +162,29 @@ export class Controller extends EventEmitter {
         this.run.lastDecision = decisionSchema.parse(this.run.lastDecision);
       store.set("runtime", "current", this.run);
     }
-    if (active(this.run)) {
+    const savedStop = store.get<{
+      unconfirmed: boolean;
+      reason?: string;
+      protocol: Protocol | "unknown";
+      identity?: { clientId?: string; slotId?: string };
+    }>("runtime", "stop");
+    const interrupted = active(this.run);
+    if (
+      interrupted ||
+      savedStop?.unconfirmed ||
+      (!savedStop &&
+        (this.run?.termination?.source === "stop-unconfirmed" ||
+          (this.run?.status === "faulted" && !this.run.termination)))
+    ) {
+      this.stopUnconfirmed = true;
+      this.unresolvedStopProtocol = savedStop?.protocol ?? "unknown";
+      this.unresolvedStopIdentity = savedStop?.identity;
+      this.stopReason =
+        savedStop?.reason ??
+        "上次设备停止尚未确认；请重新连接原设备和官方 APP，再次停止并确认双通道归零。";
+      this.saveStopConfirmation();
+    }
+    if (interrupted) {
       this.run!.status = "interrupted";
       this.run!.thinking = false;
       this.run!.reason = "服务重启，原运行已中断，设备输出不会自动恢复。";
@@ -321,6 +347,7 @@ export class Controller extends EventEmitter {
       run: this.run,
       locked: this.isLocked(),
       stopUnconfirmed: this.stopUnconfirmed,
+      stopReason: this.stopReason,
       stopping: this.stopping,
       waveforms: this.store
         .list<Waveform>("waveforms")
@@ -468,7 +495,11 @@ export class Controller extends EventEmitter {
         }
         // A real relay connection alone says nothing about physical outputs. Only
         // selecting a device and confirming its reset may clear this latch.
-        if (options.protocol === "simulator") this.stopUnconfirmed = false;
+        if (
+          options.protocol === "simulator" &&
+          this.acceptStopConfirmation(true)
+        )
+          this.recordStopConfirmation(true);
         this.log(
           "info",
           "设备",
@@ -495,13 +526,14 @@ export class Controller extends EventEmitter {
           "START_CANCELLED",
           409,
         );
-        this.stopUnconfirmed = !(await this.stopDevice());
+        const confirmed = await this.stopDevice();
         assert(
           epoch === this.epoch,
           "设备选择已被停止操作取消。",
           "START_CANCELLED",
           409,
         );
+        this.recordStopConfirmation(confirmed);
         assert(
           !this.stopUnconfirmed,
           "无法确认设备归零，请检查 APP。",
@@ -789,7 +821,7 @@ export class Controller extends EventEmitter {
         "START_CANCELLED",
         409,
       );
-      this.stopUnconfirmed = !stopped;
+      this.recordStopConfirmation(stopped);
       assert(
         stopped,
         "无法确认设备初始归零，禁止启动。",
@@ -1098,7 +1130,7 @@ export class Controller extends EventEmitter {
     try {
       const confirmed = await this.stopDevice();
       if (epoch !== this.epoch || this.run !== run) return;
-      this.stopUnconfirmed = !confirmed;
+      this.recordStopConfirmation(confirmed);
       this.levels = { A: 0, B: 0 };
       this.aiAction = undefined;
       if (!confirmed) {
@@ -1116,7 +1148,7 @@ export class Controller extends EventEmitter {
       );
     } catch (error) {
       if (epoch === this.epoch) {
-        this.stopUnconfirmed = true;
+        this.recordStopConfirmation(false, error);
         run.status = "faulted";
         run.reason = "暂停时停止未确认";
         run.termination = { source: "stop-unconfirmed", at: Date.now() };
@@ -1253,10 +1285,87 @@ export class Controller extends EventEmitter {
   async emergency() {
     await this.finish("stopped", "用户触发紧急停止", "emergency");
   }
+  private acceptStopConfirmation(confirmed: boolean) {
+    if (!confirmed || !this.unresolvedStopProtocol) return confirmed;
+    // A fresh driver can prove only that this process never emitted output.
+    // Historical uncertainty requires a connected device's reset confirmation;
+    // selecting a simulator cannot acknowledge a previous physical device.
+    const state = this.device.state;
+    return (
+      state.connected && state.canConfirmZero && this.matchesUnconfirmedDevice()
+    );
+  }
+  private matchesUnconfirmedDevice() {
+    const protocol = this.unresolvedStopProtocol;
+    if (!protocol || protocol === "simulator") return true;
+    const state = this.device.state;
+    if (state.protocol === "simulator") return false;
+    if (protocol === "unknown") return false;
+    if (protocol !== state.protocol) return false;
+    // A slot identifies a device inside its APP. Neither protocol exposes a
+    // hardware ID that can prove identity after the APP pairing ID changes.
+    const identity = this.unresolvedStopIdentity;
+    return protocol === "v4"
+      ? (!identity?.slotId || identity.slotId === state.slotId) &&
+          (!identity?.clientId || identity.clientId === state.clientId)
+      : !identity?.clientId || identity.clientId === state.clientId;
+  }
+  private saveStopConfirmation(pending = false) {
+    this.store.set("runtime", "stop", {
+      unconfirmed: this.stopUnconfirmed || pending,
+      reason: this.stopReason,
+      protocol: this.unresolvedStopProtocol ?? this.device.state.protocol,
+      identity: this.unresolvedStopIdentity ?? {
+        clientId: this.device.state.clientId,
+        slotId: this.device.state.slotId,
+      },
+    });
+  }
+  private recordStopConfirmation(confirmed: boolean, error?: unknown) {
+    this.stopUnconfirmed = !confirmed;
+    if (confirmed) {
+      this.unresolvedStopProtocol = undefined;
+      this.unresolvedStopIdentity = undefined;
+      this.stopReason = undefined;
+    } else {
+      if (!this.unresolvedStopProtocol) {
+        this.unresolvedStopProtocol = this.device.state.protocol;
+        this.unresolvedStopIdentity = {
+          clientId: this.device.state.clientId,
+          slotId: this.device.state.slotId,
+        };
+      }
+      const detail =
+        error instanceof Error ? error.message : this.device.state.error;
+      this.stopReason = this.store.redact(
+        detail
+          ? `${detail}；请在官方 APP 检查输出，重新连接原设备后再次停止。`
+          : !this.device.state.connected
+            ? "设备或 APP 未连接，无法确认上次输出已停止；请重新连接原设备和官方 APP 后再次停止。"
+            : "未取得清队列及双通道归零确认；请检查官方 APP 和设备连接后再次停止。",
+      );
+      if (
+        this.unresolvedStopProtocol !== "simulator" &&
+        this.device.state.protocol === "simulator"
+      )
+        this.stopReason =
+          "原实体设备的停止仍未确认；模拟设备不能代替实体设备确认，请重新连接原设备后再次停止。";
+      else if (this.unresolvedStopProtocol === "unknown")
+        this.stopReason =
+          "旧版运行记录缺少原设备标识，无法核实当前设备是否为原设备；请在原官方 APP 和实体设备检查停止状态，后台将继续保留。";
+      else if (!this.matchesUnconfirmedDevice())
+        this.stopReason =
+          this.unresolvedStopProtocol === "v3"
+            ? "V3 APP 配对已改变，协议无法核实是否为原设备，原输出停止仍未确认；请在原 APP 和实体设备检查停止状态。"
+            : "当前 APP 或设备标识与上次未确认的设备不同；若 APP 配对已改变，协议无法核实原实体设备，后台将继续保留；请检查原 APP 和设备。";
+    }
+    this.saveStopConfirmation();
+  }
   private stopDevice(): Promise<boolean> {
     if (this.stopFlight) return this.stopFlight;
     this.stopFlight = Promise.resolve()
       .then(() => this.device.stop())
+      .then((confirmed) => this.acceptStopConfirmation(confirmed))
       .finally(() => {
         this.stopFlight = undefined;
       });
@@ -1272,9 +1381,19 @@ export class Controller extends EventEmitter {
     // Always invalidate pending starts, pauses and model results immediately.
     // An in-flight physical stop is shared and awaited, never mistaken for an
     // already completed stop merely because another operation set `stopping`.
+    const stopPending =
+      this.stopping || Boolean(this.finishFlight || this.stopFlight);
     ++this.epoch;
     this.cancelAi();
     this.stopping = true;
+    // Persist uncertainty before changing a running session to a terminal state.
+    // A crash during this stop must not turn the saved `stopped` run into proof.
+    this.saveStopConfirmation(
+      stopPending ||
+        this.stopUnconfirmed ||
+        active(this.run) ||
+        this.device.state.connected,
+    );
     if (this.run && active(this.run)) {
       this.run.status = status;
       this.run.reason = this.store.redact(reason);
@@ -1302,11 +1421,16 @@ export class Controller extends EventEmitter {
     stopConfirmed?: boolean,
   ) {
     try {
-      const confirmed = stopConfirmed ?? (await this.stopDevice());
+      let confirmed = stopConfirmed ?? (await this.stopDevice());
       // An emergency during connection/selection must keep new starts blocked
       // until the cancelled transition has finished cleaning up its socket.
-      if (this.deviceTransition) await this.deviceTransition.catch(() => {});
-      this.stopUnconfirmed = !confirmed;
+      if (this.deviceTransition) {
+        await this.deviceTransition.catch(() => {});
+        // The transition may have selected a device after the first stop, or
+        // failed to stop it while cancelling. Confirm its final state afresh.
+        confirmed = await this.stopDevice();
+      }
+      this.recordStopConfirmation(confirmed);
       if (!confirmed && this.run) {
         this.run.status = "faulted";
         this.run.reason = this.store.redact(`${reason}；设备停止未确认`);
@@ -1328,7 +1452,7 @@ export class Controller extends EventEmitter {
           : `${reason}；停止未确认，请检查官方 APP 或设备`,
       );
     } catch (error) {
-      this.stopUnconfirmed = true;
+      this.recordStopConfirmation(false, error);
       if (this.run) {
         this.run.status = "faulted";
         this.run.reason = this.store.redact(reason + "；停止未确认");
@@ -1795,7 +1919,7 @@ export class Controller extends EventEmitter {
       const confirmed = await this.stopDevice();
       if (this.run !== run || this.epoch !== epoch || run.status !== "running")
         return;
-      this.stopUnconfirmed = !confirmed;
+      this.recordStopConfirmation(confirmed);
       this.levels = { A: 0, B: 0 };
       if (!confirmed) {
         await this.finish(
@@ -1811,7 +1935,7 @@ export class Controller extends EventEmitter {
       this.persist();
     } catch (stopError) {
       if (this.run === run && this.epoch === epoch) {
-        this.stopUnconfirmed = true;
+        this.recordStopConfirmation(false, stopError);
         await this.finish(
           "faulted",
           `AI 推理等待期间设备停止未确认：${stopError instanceof Error ? stopError.message : "未知停止错误"}`,

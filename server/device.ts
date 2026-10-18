@@ -79,6 +79,16 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
   private pollGeneration = 0;
   private stopping = false;
   private stopPromise?: Promise<boolean>;
+  private hadDeviceSession = false;
+  private stopCertified = false;
+  private stopFailed = false;
+  private failedReports: Record<Channel, number> = { A: 0, B: 0 };
+  private outputRevision = 0;
+  private outputsInFlight = 0;
+  private reportSequence = 0;
+  private reported: Record<Channel, number> = { A: 0, B: 0 };
+  private reportedAt: Record<Channel, number> = { A: 0, B: 0 };
+  private reportedOutput: Record<Channel, number> = { A: -1, B: -1 };
   private lane: Record<Channel, Promise<unknown>> = {
     A: Promise.resolve(),
     B: Promise.resolve(),
@@ -93,6 +103,37 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
     this.state.error = message;
     this.publish();
   }
+  private reportIntensities(props: Record<string, unknown>) {
+    for (const channel of CHANNELS) {
+      const value = props[`intensity${channel}`];
+      if (!number(value)) continue;
+      this.reported[channel] = ++this.reportSequence;
+      this.reportedAt[channel] = Date.now();
+      this.reportedOutput[channel] = this.outputRevision;
+      if (value !== 0) this.stopCertified = false;
+    }
+    // Slot metadata and one-channel patches cannot refresh the other channel.
+    this.state.lastSeenAt = Math.min(this.reportedAt.A, this.reportedAt.B);
+  }
+  private beginOutput() {
+    ++this.outputRevision;
+    this.stopCertified = false;
+  }
+  private invalidateTelemetry() {
+    this.stopCertified = false;
+    this.reportedAt = { A: 0, B: 0 };
+    this.reportedOutput = { A: -1, B: -1 };
+    this.state.lastSeenAt = 0;
+    this.state.connected = false;
+    this.state.canConfirmZero = false;
+  }
+  private identifyV3Session(clientId: string) {
+    // Pairing already establishes a real session; initial UI zeros are not proof.
+    this.hadDeviceSession = true;
+    this.state.clientId = clientId;
+    this.state.slotId = "v3-coyote";
+    this.state.error = "等待设备强度回传";
+  }
 
   async connect(options: {
     protocol: Protocol;
@@ -101,6 +142,14 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
     if (!["v4", "v3", "simulator"].includes(options.protocol))
       throw new Error("不支持的设备协议");
     await this.disconnect();
+    if (this.stopCertified) {
+      this.hadDeviceSession = false;
+      this.stopFailed = false;
+    }
+    this.stopCertified = false;
+    this.reported = { A: 0, B: 0 };
+    this.reportedAt = { A: 0, B: 0 };
+    this.reportedOutput = { A: -1, B: -1 };
     const connectionEpoch = ++this.epoch;
     this.state = initial(options.protocol);
     this.state.relayStatus = "connecting";
@@ -174,9 +223,22 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
         state === DGLAB_SOCKET_STATE.WaitingForPeer ||
         state === DGLAB_SOCKET_STATE.Paired
       ) {
-        this.state.relayStatus = "connected";
-        this.state.appStatus =
+        const appStatus =
           state === DGLAB_SOCKET_STATE.Paired ? "paired" : "waiting";
+        if (
+          state === DGLAB_SOCKET_STATE.Paired &&
+          this.state.appStatus !== appStatus
+        )
+          this.invalidateTelemetry();
+        this.state.relayStatus = "connected";
+        this.state.appStatus = appStatus;
+        if (
+          state === DGLAB_SOCKET_STATE.Paired &&
+          this.state.protocol === "v3"
+        ) {
+          const clientId = (socket as DglabSocketV3Client).pairedClientId;
+          if (clientId) this.identifyV3Session(clientId);
+        }
       } else if (
         state === DGLAB_SOCKET_STATE.Disconnected ||
         state === DGLAB_SOCKET_STATE.Idle
@@ -203,7 +265,13 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
     });
     socket.on("client-attached", (clientId) => {
       if (!active()) return;
+      this.invalidateTelemetry();
       this.state.appStatus = "paired";
+      if (this.state.protocol === "v3") {
+        this.identifyV3Session(
+          (socket as DglabSocketV3Client).pairedClientId ?? clientId,
+        );
+      }
       this.publish();
       if (this.state.protocol === "v4")
         void this.refresh(clientId).catch((error) => this.fault(String(error)));
@@ -236,8 +304,10 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
         if (
           this.state.clientId === clientId &&
           this.state.slotId === event.slotId
-        )
+        ) {
+          this.stopCertified = false;
           this.fault("所选设备已被移除");
+        }
         return;
       }
       const previous = this.devices.get(k);
@@ -252,7 +322,7 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
         this.state.clientId === clientId &&
         this.state.slotId === event.slotId
       )
-        this.applyDevice(next, true);
+        this.applyDevice(next, record(event.props));
     });
     socket.on("data", (data, clientId) => {
       if (!active()) return;
@@ -324,11 +394,17 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
     for (const device of devices)
       this.devices.set(key(clientId, device.slotId), device);
     this.updateDeviceList();
-    if (selected) this.applyDevice(selected, fresh);
-    else if (this.state.clientId === clientId && this.state.slotId)
+    if (selected)
+      this.applyDevice(selected, fresh ? record(selected.props) : undefined);
+    else if (this.state.clientId === clientId && this.state.slotId) {
+      this.stopCertified = false;
       this.fault("所选设备不在 APP 当前设备列表中");
+    }
   }
-  private applyDevice(device: V4DeviceInfo, fresh: boolean) {
+  private applyDevice(
+    device: V4DeviceInfo,
+    reportedProps?: Record<string, unknown>,
+  ) {
     const props = record(device.props);
     const slot = record(device.slotState);
     this.state.name = device.name;
@@ -341,12 +417,13 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
       if (number(value)) this.state.intensities[channel] = Math.floor(value);
     }
     const telemetry = number(props.intensityA) && number(props.intensityB);
-    if (fresh && telemetry) this.state.lastSeenAt = Date.now();
+    if (reportedProps) this.reportIntensities(reportedProps);
     const fault =
       slot.hasDevice !== true ||
       props.connectState === "disconnected" ||
       props.channelAStatus === 3 ||
       props.channelBStatus === 3;
+    if (fault) this.stopCertified = false;
     this.state.connected =
       !fault &&
       telemetry &&
@@ -364,6 +441,7 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
   private acceptV3(message: string, clientId?: string) {
     const match = /^strength-(\d+)\+(\d+)\+(\d+)\+(\d+)$/.exec(message);
     if (!match || !clientId) return;
+    this.hadDeviceSession = true;
     this.state.clientId = clientId;
     this.state.slotId = "v3-coyote";
     this.state.devices = [
@@ -380,7 +458,10 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
       A: Math.min(200, Number(match[3])),
       B: Math.min(200, Number(match[4])),
     };
-    this.state.lastSeenAt = Date.now();
+    this.reportIntensities({
+      intensityA: this.state.intensities.A,
+      intensityB: this.state.intensities.B,
+    });
     this.state.connected =
       this.state.relayStatus === "connected" &&
       this.state.appStatus === "paired";
@@ -392,12 +473,12 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
     const socket = this.socket as DglabSocketV4Client | undefined;
     if (!socket) return;
     const start = Date.now();
-    await socket.send<{ t: string; m: string }, V4DevicesGetResult>(
-      clientId,
-      { t: "req", m: "devices.get" },
-      { timeout: RPC_TIMEOUT },
-    );
+    const result = await socket.send<
+      { t: string; m: string },
+      V4DevicesGetResult
+    >(clientId, { t: "req", m: "devices.get" }, { timeout: RPC_TIMEOUT });
     if (this.socket === socket) this.state.latencyMs = Date.now() - start;
+    return result;
   }
   private async heartbeat() {
     if (this.polling || !this.socket) return;
@@ -448,8 +529,12 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
       throw new Error("本版本波形仅兼容 COYOTE_030 郊狼 3");
     this.state.clientId = clientId;
     this.state.slotId = slotId;
+    this.hadDeviceSession = true;
+    this.stopCertified = false;
+    this.reportedAt = { A: 0, B: 0 };
+    this.reportedOutput = { A: -1, B: -1 };
     this.state.lastSeenAt = 0;
-    this.applyDevice(device, false);
+    this.applyDevice(device);
     await this.refresh(clientId);
   }
   private assertReady() {
@@ -459,14 +544,19 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
   }
   private waitReported(
     predicate: () => boolean,
-    since: number,
+    after: Partial<Record<Channel, number>>,
     timeout = RPC_TIMEOUT,
   ): Promise<boolean> {
-    if (this.state.lastSeenAt >= since && predicate())
-      return Promise.resolve(true);
+    const confirmed = () =>
+      CHANNELS.every(
+        (channel) =>
+          after[channel] === undefined ||
+          this.reported[channel] > after[channel]!,
+      ) && predicate();
+    if (confirmed()) return Promise.resolve(true);
     return new Promise((resolve) => {
       const listener = () => {
-        if (this.state.lastSeenAt >= since && predicate()) finish(true);
+        if (confirmed()) finish(true);
       };
       const timer = setTimeout(() => finish(false), timeout);
       const finish = (result: boolean) => {
@@ -502,37 +592,44 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
           return;
         }
         if (target === this.state.intensities[channel]) return;
-        const since = Date.now();
-        if (this.state.protocol === "v4") {
-          const socket = this.socket as DglabSocketV4Client;
-          const c = channel === "A" ? V4Channel.A : V4Channel.B;
-          const { clientId, slotId } = this.state;
-          if (target === 0)
-            await socket.resetIntensity(clientId!, slotId!, c, {
-              timeout: RPC_TIMEOUT,
-            });
-          else
-            await socket.addIntensity(
-              clientId!,
-              slotId!,
-              c,
-              target - this.state.intensities[channel],
-              { timeout: RPC_TIMEOUT },
+        const after = { [channel]: this.reported[channel] };
+        this.beginOutput();
+        ++this.outputsInFlight;
+        try {
+          if (this.state.protocol === "v4") {
+            const socket = this.socket as DglabSocketV4Client;
+            const c = channel === "A" ? V4Channel.A : V4Channel.B;
+            const { clientId, slotId } = this.state;
+            if (target === 0)
+              await socket.resetIntensity(clientId!, slotId!, c, {
+                timeout: RPC_TIMEOUT,
+              });
+            else
+              await socket.addIntensity(
+                clientId!,
+                slotId!,
+                c,
+                target - this.state.intensities[channel],
+                { timeout: RPC_TIMEOUT },
+              );
+            if (epoch !== this.epoch) throw new Error("动作已被停止操作废弃");
+            await this.refresh(clientId!);
+          } else
+            (this.socket as DglabSocketV3Client).setStrength(
+              channel === "A" ? V3Channel.A : V3Channel.B,
+              target,
             );
-          if (epoch !== this.epoch) throw new Error("动作已被停止操作废弃");
-          await this.refresh(clientId!);
-        } else
-          (this.socket as DglabSocketV3Client).setStrength(
-            channel === "A" ? V3Channel.A : V3Channel.B,
-            target,
+          const confirmed = await this.waitReported(
+            () =>
+              this.state.connected &&
+              this.state.intensities[channel] === target,
+            after,
           );
-        const confirmed = await this.waitReported(
-          () =>
-            this.state.connected && this.state.intensities[channel] === target,
-          since,
-        );
-        if (epoch !== this.epoch) throw new Error("动作已被停止操作废弃");
-        if (!confirmed) throw new Error("强度回传未确认，指令未自动重试");
+          if (epoch !== this.epoch) throw new Error("动作已被停止操作废弃");
+          if (!confirmed) throw new Error("强度回传未确认，指令未自动重试");
+        } finally {
+          --this.outputsInFlight;
+        }
       });
     this.lane[channel] = job;
     return job;
@@ -548,6 +645,8 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
     )
       throw new Error("单次仅允许 1–5 个郊狼 3 帧（最多 500ms）");
     if (this.state.protocol === "simulator") return;
+    // Pulses do not raise strength, but queued frames still require clearing.
+    this.stopCertified = false;
     if (this.state.protocol === "v4") {
       await (this.socket as DglabSocketV4Client).sendPulse(
         this.state.clientId!,
@@ -580,17 +679,43 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
       this.state.intensities = { A: 0, B: 0 };
       this.state.lastSeenAt = Date.now();
       this.publish();
+      this.stopCertified = true;
+      this.stopFailed = false;
       return true;
     }
+    // This certificate comes only from a completed stop, and every subsequent
+    // output command or nonzero device report invalidates it. It survives a
+    // later disconnect without inventing new physical readings.
+    if (this.stopCertified) return true;
+    if (!this.hadDeviceSession && !this.state.clientId && !this.state.slotId)
+      return true;
     const socket = this.socket;
     if (
       !socket ||
       this.state.appStatus !== "paired" ||
       !this.state.clientId ||
       !this.state.slotId
-    )
+    ) {
+      this.stopFailed = true;
+      this.failedReports = { ...this.reported };
+      this.state.canConfirmZero = false;
+      this.state.error = `停止未确认：${!socket || this.state.relayStatus !== "connected" ? "中继已断开" : this.state.appStatus !== "paired" ? "APP 未配对或已断开" : "所选设备身份缺失"}；请在官方 APP 确认 A/B 均为 0 后重新连接并重试停止`;
+      this.publish();
       return false;
-    const since = Date.now();
+    }
+    const after = { ...this.reported };
+    let v4Confirmed: boolean | undefined;
+    const reusableV3Zero =
+      this.state.connected &&
+      this.state.canConfirmZero &&
+      Date.now() - this.state.lastSeenAt < FRESH_MS &&
+      this.state.intensities.A === 0 &&
+      this.state.intensities.B === 0 &&
+      CHANNELS.every((c) => this.reportedOutput[c] === this.outputRevision) &&
+      this.outputsInFlight === 0 &&
+      (!this.stopFailed ||
+        CHANNELS.every((c) => this.reported[c] > this.failedReports[c]));
+    let stage = "清队列确认";
     try {
       if (this.state.protocol === "v4") {
         const v4 = socket as DglabSocketV4Client;
@@ -601,38 +726,71 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
           { t: "req", m: "device.op.clear", data: { s: slotId } },
           { timeout: RPC_TIMEOUT },
         );
+        stage = "A 通道归零确认";
         await v4.resetIntensity(clientId!, slotId!, V4Channel.A, {
           timeout: RPC_TIMEOUT,
         });
+        stage = "B 通道归零确认";
         await v4.resetIntensity(clientId!, slotId!, V4Channel.B, {
           timeout: RPC_TIMEOUT,
         });
-        await this.refresh(clientId!);
+        stage = "归零状态查询";
+        const result = await this.refresh(clientId!);
+        const selected = result?.devices?.find(
+          (device) => device.slotId === slotId,
+        );
+        const props = record(record(selected).props);
+        // Correlate evidence with this query, issued only after both reset
+        // ACKs. A delayed heartbeat response or unrelated patch is not proof.
+        v4Confirmed =
+          this.socket === socket &&
+          this.state.clientId === clientId &&
+          this.state.slotId === slotId &&
+          this.state.connected &&
+          props.intensityA === 0 &&
+          props.intensityB === 0 &&
+          this.state.intensities.A === 0 &&
+          this.state.intensities.B === 0;
       } else {
+        stage = "发送 V3 清队列与归零命令";
         const v3 = socket as DglabSocketV3Client;
-        // Legacy V3 has no clear RPC ACK. Fresh strength-zero telemetry is mandatory below.
+        // Legacy V3 has no clear RPC ACK or telemetry query. An unchanged zero
+        // may produce no new strength event. Only reuse actual fresh dual-zero
+        // telemetry when no strength command has been issued since that report.
         v3.clearPulse(V3Channel.A);
         v3.clearPulse(V3Channel.B);
         v3.setStrength(V3Channel.A, 0);
         v3.setStrength(V3Channel.B, 0);
       }
-      const confirmed = await this.waitReported(
-        () =>
-          this.socket === socket &&
-          this.state.connected &&
-          this.state.intensities.A === 0 &&
-          this.state.intensities.B === 0,
-        since,
-      );
+      const confirmed =
+        v4Confirmed ??
+        (reusableV3Zero ||
+          (await this.waitReported(
+            () =>
+              this.socket === socket &&
+              this.state.connected &&
+              this.state.intensities.A === 0 &&
+              this.state.intensities.B === 0,
+            after,
+          )));
+      this.stopCertified = confirmed;
+      this.stopFailed = !confirmed;
       if (!confirmed) {
+        this.failedReports = { ...this.reported };
         this.state.canConfirmZero = false;
-        this.state.error = "停止未确认：未收到设备双通道归零回传";
+        this.state.error =
+          this.state.protocol === "v4"
+            ? "停止未确认：停止后的设备查询未回传所选设备双通道归零状态"
+            : "停止未确认：未收到设备双通道归零回传；V3 无查询和清队列确认接口，请在官方 APP 检查 A/B 并重新连接后重试";
         this.publish();
       }
       return confirmed;
     } catch (error) {
+      this.stopCertified = false;
+      this.stopFailed = true;
+      this.failedReports = { ...this.reported };
       this.state.canConfirmZero = false;
-      this.state.error = `停止未确认：${error instanceof Error ? error.message : "APP 无响应"}`;
+      this.state.error = `停止未确认：${stage}失败（${error instanceof Error ? error.message : "APP 无响应"}）；请在官方 APP 检查 A/B 强度后重试停止`;
       this.publish();
       return false;
     }
