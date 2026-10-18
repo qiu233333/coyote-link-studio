@@ -8,9 +8,34 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AiDecision, AiProfile, TaskPlan } from "../shared/types.ts";
 
-type AiStatus = { ready: boolean; error?: string };
+type AiStatus = { ready: boolean; error?: string; errorCode?: string };
 type TestResult = { chat: boolean; tools: boolean; message: string };
-type Envelope<T> = { ok: boolean; data?: T; error?: string };
+type Envelope<T> = {
+  ok: boolean;
+  data?: T;
+  error?: string;
+  errorCode?: string;
+};
+const recoverableErrors = new Set([
+  "AI_TIMEOUT",
+  "AI_TRANSPORT",
+  "AI_RATE_LIMIT",
+  "AI_PROVIDER_UNAVAILABLE",
+]);
+
+/** Stable, redacted categories; recovery policy belongs to the controller. */
+export class AiServiceError extends Error {
+  readonly name = "AiServiceError";
+  readonly retryable: boolean;
+
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.retryable = recoverableErrors.has(code);
+  }
+}
 const root = fileURLToPath(new URL("../", import.meta.url));
 const cli = join(
   dirname(createRequire(import.meta.url).resolve("eve/package.json")),
@@ -45,9 +70,18 @@ export class AiService extends EventEmitter {
   private starting?: Promise<void>;
   private healthTimer?: ReturnType<typeof setInterval>;
   private stopping = false;
-  private healthPending = false;
+  private generation = 0;
+  private healthPending?: number;
+  private healthFailures = 0;
   private requests = new Set<AbortController>();
   private exitRegistered = false;
+  private readonly runtimeDirectory?: string;
+
+  constructor(options: { runtimeDirectory?: string } = {}) {
+    super();
+    this.runtimeDirectory = options.runtimeDirectory;
+  }
+
   private exitCleanup = () => {
     const pid = this.child?.pid;
     if (!pid) return;
@@ -73,7 +107,8 @@ export class AiService extends EventEmitter {
   private setStatus(status: AiStatus) {
     if (
       status.ready !== this.status.ready ||
-      status.error !== this.status.error
+      status.error !== this.status.error ||
+      status.errorCode !== this.status.errorCode
     ) {
       this.status = status;
       this.emit("status", this.status);
@@ -84,19 +119,37 @@ export class AiService extends EventEmitter {
     if (this.status.ready) return;
     if (this.starting) return this.starting;
     this.stopping = false;
+    const generation = ++this.generation;
+    this.clearHealth();
     if (!this.exitRegistered) {
       process.once("exit", this.exitCleanup);
       this.exitRegistered = true;
     }
-    this.starting = this.launch().finally(() => {
-      this.starting = undefined;
+    this.starting = this.launch(generation).finally(() => {
+      if (this.generation === generation) this.starting = undefined;
     });
     return this.starting;
   }
 
-  private async launch() {
+  private current(generation: number) {
+    return !this.stopping && this.generation === generation;
+  }
+
+  private clearHealth() {
+    if (this.healthTimer) clearInterval(this.healthTimer);
+    this.healthTimer = undefined;
+    this.healthPending = undefined;
+    this.healthFailures = 0;
+  }
+
+  private async launch(generation: number) {
     try {
+      // A failed health check can leave the worker alive. Replace that exact
+      // process before opening another worker, rather than leaking a second one.
+      await this.killChild();
+      if (!this.current(generation)) return;
       const port = await availablePort();
+      if (!this.current(generation)) return;
       this.endpoint = `http://127.0.0.1:${port}`;
       this.token = randomBytes(32).toString("hex");
       const development =
@@ -106,9 +159,9 @@ export class AiService extends EventEmitter {
         !existsSync(join(root, ".output", "server", "index.mjs"))
       ) {
         this.setStatus({ ready: false, error: "正在首次构建 eve AI 运行时…" });
-        await this.build();
+        await this.build(generation);
       }
-      if (this.stopping) return;
+      if (!this.current(generation)) return;
       const args = development
         ? [
             cli,
@@ -120,11 +173,23 @@ export class AiService extends EventEmitter {
             "--port",
             String(port),
           ]
-        : [cli, "start", "--host", "127.0.0.1", "--port", String(port)];
+        : this.runtimeDirectory
+          ? // The built Nitro entry supports an isolated working directory. eve
+            // otherwise pins its workflow data to <cwd>/.eve/.workflow-data.
+            [join(root, ".output", "server", "index.mjs")]
+          : [cli, "start", "--host", "127.0.0.1", "--port", String(port)];
       const env = {
         ...process.env,
         COYOTE_EVE_TOKEN: this.token,
         EVE_TELEMETRY_DISABLED: "1",
+        ...(!development && this.runtimeDirectory
+          ? {
+              HOST: "127.0.0.1",
+              NITRO_HOST: "127.0.0.1",
+              PORT: String(port),
+              NITRO_PORT: String(port),
+            }
+          : {}),
       };
       // The selected provider credentials arrive only in authenticated requests.
       for (const name of [
@@ -133,28 +198,41 @@ export class AiService extends EventEmitter {
         "ANTHROPIC_API_KEY",
       ])
         delete (env as Record<string, string | undefined>)[name];
-      this.child = spawn(process.execPath, args, {
-        cwd: root,
+      const child = spawn(process.execPath, args, {
+        cwd: !development ? (this.runtimeDirectory ?? root) : root,
         env,
         windowsHide: true,
         detached: process.platform !== "win32",
         stdio: ["ignore", "pipe", "pipe"],
       });
+      this.child = child;
       // Consume pipes without exposing eve internals in product logs. Explicit
       // `node scripts/build-agent.mjs` retains complete build diagnostics.
-      this.child.stdout?.resume();
-      this.child.stderr?.resume();
-      this.child.once("error", () =>
-        this.runtimeFailed("eve AI 运行时无法启动，请检查 Node.js 与依赖。"),
-      );
-      this.child.once("exit", () => {
-        this.child = undefined;
-        if (!this.stopping)
+      child.stdout?.resume();
+      child.stderr?.resume();
+      child.once("error", () => {
+        if (this.current(generation) && this.child === child)
+          this.runtimeFailed("eve AI 运行时无法启动，请检查 Node.js 与依赖。");
+      });
+      child.once("exit", () => {
+        if (this.current(generation) && this.child === child) {
+          this.child = undefined;
           this.runtimeFailed("eve AI 运行时已退出，请重新启动应用。");
+        }
       });
       const startAt = Date.now();
-      while (!this.stopping && this.child && Date.now() - startAt < 120000) {
-        if (await this.healthy()) {
+      const endpoint = this.endpoint,
+        token = this.token;
+      while (
+        this.current(generation) &&
+        this.child === child &&
+        Date.now() - startAt < 120000
+      ) {
+        const healthy = await this.healthy(endpoint, token);
+        if (!this.current(generation)) return;
+        if (this.child !== child)
+          throw new Error(this.status.error ?? "eve AI 运行时在启动时退出。");
+        if (healthy) {
           this.setStatus({ ready: true });
           this.healthTimer = setInterval(() => {
             void this.checkHealth();
@@ -164,24 +242,25 @@ export class AiService extends EventEmitter {
         }
         await delay(500);
       }
-      if (!this.stopping)
+      if (this.current(generation))
         throw new Error(
           "eve AI 运行时未就绪，请运行 node scripts/build-agent.mjs 查看构建诊断。",
         );
     } catch (error) {
-      if (this.stopping) {
-        await this.killChild();
-        return;
-      }
+      if (!this.current(generation)) return;
       const message =
         error instanceof Error ? error.message : "eve AI 运行时启动失败。";
-      this.setStatus({ ready: false, error: message });
+      this.setStatus({
+        ready: false,
+        error: message,
+        errorCode: "AI_RUNTIME_UNAVAILABLE",
+      });
       await this.killChild();
-      throw new Error(message);
+      throw new AiServiceError("AI_RUNTIME_UNAVAILABLE", message);
     }
   }
 
-  private async build() {
+  private async build(generation: number) {
     const child = spawn(process.execPath, [cli, "build"], {
       cwd: root,
       windowsHide: true,
@@ -191,7 +270,7 @@ export class AiService extends EventEmitter {
     this.child = child;
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        void this.killChild();
+        void this.killChild(child);
         reject(
           new Error("eve 构建超时，请手动运行 node scripts/build-agent.mjs。"),
         );
@@ -202,7 +281,8 @@ export class AiService extends EventEmitter {
       });
       child.once("exit", (code) => {
         clearTimeout(timeout);
-        this.child = undefined;
+        if (this.generation === generation && this.child === child)
+          this.child = undefined;
         code === 0
           ? resolve()
           : reject(
@@ -214,10 +294,10 @@ export class AiService extends EventEmitter {
     });
   }
 
-  private async healthy() {
+  private async healthy(endpoint = this.endpoint, token = this.token) {
     try {
-      const response = await fetch(`${this.endpoint}/internal/health`, {
-        headers: { authorization: `Bearer ${this.token}` },
+      const response = await fetch(`${endpoint}/internal/health`, {
+        headers: { authorization: `Bearer ${token}` },
         signal: AbortSignal.timeout(2000),
       });
       const body = (await response.json()) as Envelope<{
@@ -236,19 +316,43 @@ export class AiService extends EventEmitter {
   }
 
   private async checkHealth() {
-    if (this.stopping || this.healthPending) return;
-    this.healthPending = true;
+    const generation = this.generation,
+      child = this.child;
+    if (
+      this.stopping ||
+      !this.status.ready ||
+      this.healthPending === generation
+    )
+      return;
+    this.healthPending = generation;
     try {
-      if (await this.healthy()) this.setStatus({ ready: true });
-      else this.runtimeFailed("eve AI 运行时连接中断。");
+      const healthy = await this.healthy();
+      // An old probe must neither fault nor revive a replacement worker.
+      if (
+        !this.current(generation) ||
+        this.child !== child ||
+        !this.status.ready
+      )
+        return;
+      if (healthy) {
+        this.healthFailures = 0;
+      } else if (++this.healthFailures >= 3) {
+        this.runtimeFailed("eve AI 运行时连续三次健康检查失败，连接已中断。");
+      }
     } finally {
-      this.healthPending = false;
+      if (this.healthPending === generation) this.healthPending = undefined;
     }
   }
 
   private runtimeFailed(error: string) {
-    this.setStatus({ ready: false, error });
-    for (const request of this.requests) request.abort(new Error(error));
+    this.clearHealth();
+    this.setStatus({
+      ready: false,
+      error,
+      errorCode: "AI_RUNTIME_UNAVAILABLE",
+    });
+    for (const request of this.requests)
+      request.abort(new AiServiceError("AI_RUNTIME_UNAVAILABLE", error));
   }
 
   private async invoke<T>(
@@ -258,58 +362,115 @@ export class AiService extends EventEmitter {
     signal?: AbortSignal,
   ): Promise<T> {
     if (!this.status.ready)
-      throw new Error(this.status.error ?? "AI 运行时尚未就绪，请稍后重试。");
+      throw new AiServiceError(
+        "AI_RUNTIME_UNAVAILABLE",
+        this.status.error ?? "AI 运行时尚未就绪，请稍后重试。",
+      );
+    if (signal?.aborted)
+      throw new AiServiceError("AI_CANCELLED", "AI 请求已取消。");
     const requestId = randomUUID();
+    // Capture credentials and the address together. A late cancellation from a
+    // previous generation must never be sent to a replacement worker.
+    const endpoint = this.endpoint,
+      token = this.token,
+      generation = this.generation;
     const controller = new AbortController();
     this.requests.add(controller);
+    let cancellation: Promise<boolean> | undefined;
+    let failure: AiServiceError | undefined;
     const cancelRemote = () => {
-      controller.abort(
-        signal?.reason ?? new DOMException("Cancelled", "AbortError"),
-      );
-      void fetch(`${this.endpoint}/internal/cancel`, {
+      cancellation ??= fetch(`${endpoint}/internal/cancel`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          authorization: `Bearer ${this.token}`,
+          authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({ requestId }),
         signal: AbortSignal.timeout(2000),
-      }).catch(() => undefined);
+      })
+        .then(async (response) => {
+          if (!response.ok) return false;
+          const result = (await response.json()) as Envelope<unknown>;
+          return result?.ok === true;
+        })
+        .catch(() => false);
+      return cancellation;
     };
-    signal?.addEventListener("abort", cancelRemote, { once: true });
-    if (signal?.aborted) cancelRemote();
+    const cancel = () => {
+      controller.abort(new AiServiceError("AI_CANCELLED", "AI 请求已取消。"));
+      void cancelRemote();
+    };
+    signal?.addEventListener("abort", cancel, { once: true });
+    if (signal?.aborted) cancel();
     const timeout = setTimeout(
-      cancelRemote,
+      () => {
+        controller.abort(new AiServiceError("AI_TIMEOUT", "AI 请求超时。"));
+        void cancelRemote();
+      },
       Math.max(2, Math.min(180, profile.timeoutSec)) * 1000 + 1000,
     );
     try {
-      const response = await fetch(`${this.endpoint}/internal/${operation}`, {
+      const response = await fetch(`${endpoint}/internal/${operation}`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          authorization: `Bearer ${this.token}`,
+          authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({ requestId, profile, ...payload }),
         signal: controller.signal,
       });
-      const body = (await response.json()) as Envelope<T>;
+      let body: Envelope<T>;
+      try {
+        body = (await response.json()) as Envelope<T>;
+      } catch {
+        throw new AiServiceError("AI_INVALID_RESPONSE", "AI 返回无效响应。");
+      }
+      if (controller.signal.aborted) throw controller.signal.reason;
+      if (!body || typeof body !== "object" || typeof body.ok !== "boolean")
+        throw new AiServiceError("AI_INVALID_RESPONSE", "AI 返回无效响应。");
       if (!response.ok || !body.ok || body.data === undefined)
-        throw new Error(body.error ?? "AI 返回无效响应。");
+        throw new AiServiceError(
+          typeof body.errorCode === "string" &&
+            /^AI_[A-Z_]+$/.test(body.errorCode)
+            ? body.errorCode
+            : "AI_REQUEST_FAILED",
+          typeof body.error === "string" ? body.error : "AI 返回无效响应。",
+        );
       return body.data;
     } catch (error) {
-      if (controller.signal.aborted)
-        throw new Error(
-          signal?.aborted ? "AI 请求已取消。" : "AI 请求超时或运行时中断。",
-        );
-      // The only remote error string is already redacted by our internal route.
-      const text = error instanceof Error ? error.message : "AI 请求失败。";
-      throw new Error(
-        profile.apiKey ? text.split(profile.apiKey).join("[已隐藏]") : text,
+      const reason = controller.signal.aborted
+        ? controller.signal.reason
+        : error;
+      // Never forward native fetch errors, causes or stacks. The only remote
+      // error strings are sanitized by our internal route, then redacted again.
+      const classified =
+        reason instanceof AiServiceError
+          ? reason
+          : new AiServiceError("AI_TRANSPORT", "AI 本地运行时请求连接失败。");
+      failure = new AiServiceError(
+        classified.code,
+        profile.apiKey
+          ? classified.message.split(profile.apiKey).join("[已隐藏]")
+          : classified.message,
       );
+      throw failure;
     } finally {
       clearTimeout(timeout);
-      signal?.removeEventListener("abort", cancelRemote);
-      this.requests.delete(controller);
+      signal?.removeEventListener("abort", cancel);
+      // Keep the controller's single-flight promise pending through the bounded
+      // remote cancellation, so replacement feedback cannot race its old call.
+      try {
+        if (controller.signal.aborted || failure?.code === "AI_TRANSPORT") {
+          const confirmed = await cancelRemote();
+          if (!confirmed && this.current(generation) && this.status.ready) {
+            const message = "AI 旧请求取消未获确认，已停止后续推理。";
+            this.runtimeFailed(message);
+            throw new AiServiceError("AI_CANCELLATION_UNCONFIRMED", message);
+          }
+        }
+      } finally {
+        this.requests.delete(controller);
+      }
     }
   }
 
@@ -334,22 +495,23 @@ export class AiService extends EventEmitter {
 
   async stop(): Promise<void> {
     this.stopping = true;
-    if (this.healthTimer) clearInterval(this.healthTimer);
-    this.healthTimer = undefined;
+    const generation = ++this.generation;
+    this.starting = undefined;
+    this.clearHealth();
+    this.setStatus({ ready: false });
     for (const request of this.requests)
-      request.abort(new DOMException("Stopped", "AbortError"));
+      request.abort(new AiServiceError("AI_CANCELLED", "AI 运行时已停止。"));
     this.requests.clear();
     await this.killChild();
+    if (this.generation !== generation) return;
     if (this.exitRegistered) {
       process.removeListener("exit", this.exitCleanup);
       this.exitRegistered = false;
     }
-    this.setStatus({ ready: false });
   }
 
-  private async killChild() {
-    const child = this.child;
-    this.child = undefined;
+  private async killChild(child = this.child) {
+    if (this.child === child) this.child = undefined;
     if (!child?.pid) return;
     if (process.platform === "win32") {
       // eve starts child workers; kill the process tree so hot reloads and exits

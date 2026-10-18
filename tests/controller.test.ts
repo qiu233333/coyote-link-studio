@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { Store } from "../server/store.js";
 import { CoyoteDevice } from "../server/device.js";
 import { Controller, type AiBridge } from "../server/controller.js";
+import { AiServiceError } from "../server/ai.js";
 import { parseBounds, parsePlayback, parsePlan } from "../server/validation.js";
 import type {
   AiDecision,
@@ -36,6 +37,15 @@ const deferred = <T>() => {
 };
 const executeTick = (controller: Controller) =>
   (controller as unknown as { tick(): void }).tick();
+const flush = async () => {
+  for (let index = 0; index < 8; index++)
+    await new Promise<void>((resolve) => setImmediate(resolve));
+};
+const retryNow = (controller: Controller) => {
+  controller.run!.inferenceRecovery!.retryAt = 0;
+  (controller as unknown as { nextAiAt: number }).nextAiAt = 0;
+  executeTick(controller);
+};
 
 async function fixture(
   options: {
@@ -1134,7 +1144,11 @@ test("feedback supersedes earlier AI results; confirmed range changes remain pau
     executeTick(f.controller);
     await f.controller.feedback("请减弱", "ai-control");
     executeTick(f.controller);
-    assert.equal(calls, 2);
+    assert.equal(
+      calls,
+      1,
+      "replacement waits for the cancelled inference to settle",
+    );
     old.resolve({
       action: "adjust",
       channels: ["A"],
@@ -1143,6 +1157,8 @@ test("feedback supersedes earlier AI results; confirmed range changes remain pau
       durationSec: 5,
       reason: "stale",
     });
+    await until(() => calls === 2);
+    assert.notEqual(f.controller.run!.lastDecision?.reason, "stale");
     next.resolve({
       action: "adjust",
       channels: ["A"],
@@ -1626,6 +1642,400 @@ test("locked task freezes independent maps and enforces each channel stage bound
   }
 });
 
+for (const owner of ["ai-control", "locked-task"] as const) {
+  test(`${owner}: a transient timeout zeroes output, retries once, and keeps original authorization`, async () => {
+    const f = await fixture();
+    let calls = 0;
+    const pending = deferred<AiDecision>();
+    try {
+      f.decide(async () => {
+        if (++calls === 1)
+          throw new AiServiceError("AI_TIMEOUT", "Fixture timeout");
+        return pending.promise;
+      });
+      if (owner === "ai-control")
+        await f.controller.startAi(f.bounds(), randomUUID());
+      else await f.controller.startTask(f.plan().id, randomUUID());
+      const deadline = f.controller.run!.deadlineAt;
+      executeTick(f.controller);
+      await until(
+        () =>
+          Boolean(f.controller.run!.inferenceRecovery) &&
+          !f.controller.stopping,
+      );
+      assert.equal(f.controller.run!.status, "running");
+      assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+      executeTick(f.controller);
+      await flush();
+      assert.equal(
+        calls,
+        1,
+        "the backoff cannot be bypassed by scheduler ticks",
+      );
+      await f.controller.feedback("新偏好", owner);
+      executeTick(f.controller);
+      await flush();
+      assert.equal(
+        calls,
+        1,
+        "feedback cannot reset the recovery delay or retry budget",
+      );
+      retryNow(f.controller);
+      await until(() => calls === 2);
+      executeTick(f.controller);
+      assert.deepEqual(
+        f.device.state.intensities,
+        { A: 0, B: 0 },
+        "locked stage fallback must stay zero during retry",
+      );
+      pending.resolve({
+        action: "adjust",
+        channels: ["A"],
+        waveformId: f.wave.id,
+        intensity: { A: 3, B: 0 },
+        durationSec: 5,
+        reason: "Recovered",
+      });
+      await until(() => f.controller.run!.lastDecision?.reason === "Recovered");
+      assert.equal(f.controller.run!.inferenceRecovery, undefined);
+      assert.equal(f.controller.run!.deadlineAt, deadline);
+      assert.equal(f.controller.run!.boundsVersion, 1);
+      if (owner === "locked-task") assert.equal(f.controller.isLocked(), true);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test(`${owner}: persistent transient failures exhaust one retry and never restart`, async () => {
+    const f = await fixture();
+    let calls = 0;
+    try {
+      f.decide(async () => {
+        calls++;
+        throw new AiServiceError(
+          "AI_PROVIDER_UNAVAILABLE",
+          "Fixture unavailable",
+        );
+      });
+      if (owner === "ai-control")
+        await f.controller.startAi(f.bounds(), randomUUID());
+      else await f.controller.startTask(f.plan().id, randomUUID());
+      executeTick(f.controller);
+      await until(
+        () =>
+          Boolean(f.controller.run!.inferenceRecovery) &&
+          !f.controller.stopping,
+      );
+      retryNow(f.controller);
+      await until(
+        () => f.controller.run!.status === "faulted" && !f.controller.stopping,
+      );
+      assert.equal(calls, 2);
+      assert.equal(f.controller.run!.termination?.source, "ai-inference");
+      assert.equal(
+        f.controller.run!.termination?.code,
+        "AI_PROVIDER_UNAVAILABLE",
+      );
+      assert.equal(f.controller.run!.inferenceRecovery, undefined);
+      executeTick(f.controller);
+      await flush();
+      assert.equal(calls, 2);
+      assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test(`${owner}: controlled 50 minute run keeps distinct channel limits and hard deadline`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    const f = await fixture({ limits: { A: 20, B: 19 } });
+    let calls = 0;
+    try {
+      clearInterval(
+        (f.controller as unknown as { timer: ReturnType<typeof setInterval> })
+          .timer,
+      );
+      const bounds = f.bounds({
+        channels: ["A", "B"],
+        allowSync: true,
+        durationSec: 3600,
+        decisionIntervalSec: 5,
+        maxIntensity: { A: 20, B: 5 },
+        rampPerSecond: { A: 20, B: 3 },
+      });
+      f.decide(async () => {
+        calls++;
+        return {
+          action: "adjust",
+          channels: ["A", "B"],
+          waveformId: f.wave.id,
+          intensity: { A: 12, B: 3 },
+          durationSec: 10,
+          reason: "Continue safely",
+        };
+      });
+      if (owner === "ai-control")
+        await f.controller.startAi(bounds, randomUUID());
+      else
+        await f.controller.startTask(
+          f.plan(bounds, [
+            f.stage({
+              durationSec: 1800,
+              channels: ["A", "B"],
+              intensity: { A: 12, B: 3 },
+            }),
+            f.stage({
+              durationSec: 1800,
+              channels: ["A", "B"],
+              intensity: { A: 12, B: 3 },
+            }),
+          ]).id,
+          randomUUID(),
+        );
+      const deadline = f.controller.run!.deadlineAt;
+      for (let index = 0; index < 300; index++) {
+        t.mock.timers.tick(10_000);
+        f.device.state.lastSeenAt = Date.now();
+        executeTick(f.controller);
+        await flush();
+        assert.equal(f.controller.run!.status, "running");
+        assert.equal(f.controller.run!.deadlineAt, deadline);
+        assert.ok(
+          f.device.state.intensities.A <= 20 &&
+            f.device.state.intensities.B <= 5,
+        );
+      }
+      assert.ok(calls >= 250);
+      if (owner === "locked-task")
+        assert.equal(f.controller.run!.stageIndex, 1);
+      t.mock.timers.tick(600_000);
+      f.device.state.lastSeenAt = Date.now();
+      executeTick(f.controller);
+      await flush();
+      assert.equal(f.controller.run!.status, "completed");
+      assert.equal(f.controller.run!.termination?.source, "deadline");
+      assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    } finally {
+      await f.cleanup();
+      t.mock.timers.reset();
+    }
+  });
+}
+
+test("recovery cannot bypass an unconfirmed stop, an emergency or the original deadline", async () => {
+  for (const scenario of [
+    "unconfirmed",
+    "stop-error",
+    "emergency",
+    "deadline",
+  ] as const) {
+    const f = await fixture();
+    const originalStop = f.device.stop.bind(f.device);
+    let calls = 0;
+    let stopCalls = 0;
+    try {
+      f.decide(async () => {
+        calls++;
+        throw new AiServiceError("AI_TIMEOUT", "Fixture timeout");
+      });
+      await f.controller.startAi(f.bounds(), randomUUID());
+      if (scenario === "unconfirmed" || scenario === "stop-error")
+        f.device.stop = async () => {
+          stopCalls++;
+          if (scenario === "stop-error") throw new Error("Fixture stop failed");
+          return false;
+        };
+      executeTick(f.controller);
+      await until(
+        () =>
+          !f.controller.stopping &&
+          Boolean(
+            f.controller.run!.inferenceRecovery ||
+            f.controller.run!.termination,
+          ),
+      );
+      if (scenario === "unconfirmed" || scenario === "stop-error") {
+        assert.equal(f.controller.run!.termination?.source, "stop-unconfirmed");
+        assert.equal(f.controller.stopUnconfirmed, true);
+        assert.equal(
+          stopCalls,
+          1,
+          "a failed physical stop must not be silently retried",
+        );
+      } else if (scenario === "emergency") {
+        await f.controller.emergency();
+        assert.equal(f.controller.run!.termination?.source, "emergency");
+      } else {
+        f.controller.run!.deadlineAt = Date.now() - 1;
+        executeTick(f.controller);
+        await flush();
+        assert.equal(f.controller.run!.termination?.source, "deadline");
+        assert.equal(f.controller.run!.status, "completed");
+      }
+      executeTick(f.controller);
+      await flush();
+      assert.equal(calls, 1);
+    } finally {
+      f.device.stop = originalStop;
+      await f.cleanup();
+    }
+  }
+});
+
+test("model finish, explicit phase completion, device stale and disconnect have separate sources", async () => {
+  const f = await fixture();
+  try {
+    f.decide(async () => ({
+      action: "finish",
+      channels: [],
+      waveformId: "",
+      intensity: { A: 0, B: 0 },
+      durationSec: 1,
+      reason: "Model considers task complete",
+    }));
+    await f.controller.startAi(f.bounds(), randomUUID());
+    executeTick(f.controller);
+    await until(
+      () => f.controller.run!.status === "completed" && !f.controller.stopping,
+    );
+    assert.equal(f.controller.run!.termination?.source, "ai-finish");
+    f.decide(async () => ({
+      action: "rest",
+      channels: [],
+      waveformId: "",
+      intensity: { A: 0, B: 0 },
+      durationSec: 1,
+      reason: "Explicit phase completion",
+      phaseComplete: true,
+    }));
+    await f.controller.startTask(f.plan().id, randomUUID());
+    executeTick(f.controller);
+    await until(
+      () => f.controller.run!.status === "completed" && !f.controller.stopping,
+    );
+    assert.equal(f.controller.run!.termination?.source, "stages-completed");
+    for (const disconnected of [false, true]) {
+      await f.controller.startAi(f.bounds(), randomUUID());
+      if (disconnected) f.device.state.connected = false;
+      else f.device.state.lastSeenAt = Date.now() - 7000;
+      executeTick(f.controller);
+      await until(
+        () => f.controller.run!.status === "faulted" && !f.controller.stopping,
+      );
+      // The simulator can only confirm zero while connected; a real disconnection
+      // may therefore replace the trigger source with stop-unconfirmed.
+      assert.equal(
+        f.controller.run!.termination?.source,
+        disconnected ? "stop-unconfirmed" : "device-stale",
+      );
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("the hard deadline marks completion while recovery still awaits physical zero confirmation", async () => {
+  const f = await fixture();
+  const stopped = deferred<boolean>();
+  try {
+    await f.controller.startAi(f.bounds(), randomUUID());
+    f.decide(async () => {
+      throw new AiServiceError("AI_TIMEOUT", "Fixture timeout");
+    });
+    const originalStop = f.device.stop.bind(f.device);
+    f.device.stop = () => stopped.promise;
+    executeTick(f.controller);
+    await until(
+      () =>
+        Boolean(f.controller.run!.inferenceRecovery) && f.controller.stopping,
+    );
+    f.controller.run!.deadlineAt = Date.now() - 1;
+    executeTick(f.controller);
+    assert.equal(f.controller.run!.status, "completed");
+    assert.equal(f.controller.run!.termination?.source, "deadline");
+    assert.equal(
+      f.controller.stopping,
+      true,
+      "completion must not imply that physical zero was acknowledged",
+    );
+    stopped.resolve(await originalStop());
+    await until(() => !f.controller.stopping);
+    assert.equal(f.controller.run!.inferenceRecovery, undefined);
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+  } finally {
+    stopped.resolve(false);
+    await f.cleanup();
+  }
+});
+
+test("frequent feedback cancels serially and only the latest decision can become effective", async () => {
+  const f = await fixture();
+  let calls = 0,
+    inFlight = 0,
+    maximum = 0;
+  let complete: (decision: AiDecision) => void = () => undefined;
+  let latestContext: { run: { feedback: { text: string }[] } } | undefined;
+  f.ai.decide = (_profile, context, signal) =>
+    new Promise((resolve, reject) => {
+      calls++;
+      maximum = Math.max(maximum, ++inFlight);
+      latestContext = context as typeof latestContext;
+      complete = (decision) => {
+        inFlight--;
+        resolve(decision);
+      };
+      signal!.addEventListener(
+        "abort",
+        () => {
+          inFlight--;
+          reject(
+            new AiServiceError("AI_CANCELLED", "Cancelled by newer feedback"),
+          );
+        },
+        { once: true },
+      );
+    });
+  try {
+    await f.controller.startAi(f.bounds(), randomUUID());
+    executeTick(f.controller);
+    for (let round = 0; round < 10; round++) {
+      for (let update = 0; update < 3; update++) {
+        await f.controller.feedback(
+          `feedback-${round}-${update}`,
+          "ai-control",
+        );
+        executeTick(f.controller);
+      }
+      await flush();
+      executeTick(f.controller);
+      await flush();
+      assert.equal(f.controller.run!.status, "running");
+      assert.equal(
+        latestContext!.run.feedback.at(-1)!.text,
+        `feedback-${round}-2`,
+      );
+    }
+    assert.equal(maximum, 1);
+    assert.equal(calls, 11);
+    complete({
+      action: "adjust",
+      channels: ["A"],
+      waveformId: f.wave.id,
+      intensity: { A: 2, B: 0 },
+      durationSec: 5,
+      reason: "Latest feedback applied",
+    });
+    await flush();
+    assert.equal(
+      f.controller.run!.lastDecision!.reason,
+      "Latest feedback applied",
+    );
+    assert.equal(f.controller.run!.termination, undefined);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("strict complete maps reject malformed input while old scalar records migrate atomically", async () => {
   const f = await fixture();
   try {
@@ -1715,3 +2125,77 @@ test("strict complete maps reject malformed input while old scalar records migra
     await f.cleanup();
   }
 });
+
+for (const owner of ["ai-control", "locked-task"] as const) {
+  for (const command of ["intensity", "frames"] as const) {
+    test(`${owner}: recovery stop discards a late ${command} rejection without faulting the run`, async () => {
+      const f = await fixture();
+      let calls = 0;
+      let rejectCommand: ((error: Error) => void) | undefined;
+      let commands = 0;
+      try {
+        clearInterval(
+          (f.controller as unknown as { timer: ReturnType<typeof setInterval> })
+            .timer,
+        );
+        f.decide(async () => {
+          if (++calls === 2)
+            throw new AiServiceError("AI_TIMEOUT", "Fixture timeout");
+          return {
+            action: "adjust",
+            channels: ["A"],
+            waveformId: f.wave.id,
+            intensity: { A: 3, B: 0 },
+            durationSec: 10,
+            reason: "Continue",
+          };
+        });
+        if (owner === "ai-control")
+          await f.controller.startAi(f.bounds(), randomUUID());
+        else await f.controller.startTask(f.plan().id, randomUUID());
+        executeTick(f.controller);
+        await flush();
+        const pendingCommand = async () => {
+          commands++;
+          return new Promise<void>((_, reject) => {
+            rejectCommand = reject;
+          });
+        };
+        if (command === "intensity") f.device.setIntensity = pendingCommand;
+        else f.device.sendFrames = pendingCommand;
+        const nativeStop = f.device.stop.bind(f.device);
+        f.device.stop = async () => {
+          const confirmed = await nativeStop();
+          rejectCommand?.(new Error("动作已被停止操作废弃"));
+          return confirmed;
+        };
+        // Schedule a model timeout while the old tick has a command in flight.
+        // The stop invalidates that command, just as the real driver epoch does.
+        const runtime = f.controller as unknown as {
+          nextAiAt: number;
+          nextPulse: { A: number; B: number };
+          tickAt: number;
+        };
+        runtime.nextAiAt = 0;
+        runtime.nextPulse = { A: 0, B: 0 };
+        runtime.tickAt = Date.now() - 500;
+        f.device.state.intensities.A = 0;
+        executeTick(f.controller);
+        await flush();
+        assert.ok(
+          commands >= 1,
+          "the test must have an actual pending output command",
+        );
+        assert.equal(calls, 2);
+        assert.equal(f.controller.run!.status, "running");
+        assert.equal(f.controller.run!.termination, undefined);
+        assert.equal(f.controller.run!.inferenceRecovery?.code, "AI_TIMEOUT");
+        assert.equal(f.controller.stopping, false);
+        assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+      } finally {
+        rejectCommand?.(new Error("Fixture cleanup"));
+        await f.cleanup();
+      }
+    });
+  }
+}

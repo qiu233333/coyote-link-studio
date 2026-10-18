@@ -283,7 +283,9 @@ try {
   );
   const providerAddress = provider.address();
   assert.ok(providerAddress && typeof providerAddress !== "string");
-  application = await createApplication({ directory, dev: false });
+  const aiDirectory = resolve(directory, "eve-runtime");
+  await mkdir(aiDirectory);
+  application = await createApplication({ directory, aiDirectory, dev: false });
   baseUrl = await application.listen(0);
   assert.notEqual(new URL(baseUrl).port, "3000");
   browser = await chromium.launch({

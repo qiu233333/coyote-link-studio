@@ -188,7 +188,9 @@ export default function App() {
                 ? "实时同步"
                 : connection === "polling"
                   ? "轮询同步"
-                  : "连接服务中"}
+                  : connection === "stale"
+                    ? "状态同步中断"
+                    : "连接服务中"}
             </span>
             <span className="topbar-divider" />
             <button
@@ -212,6 +214,14 @@ export default function App() {
                 <RefreshCw size={14} />
                 重试
               </button>
+            </div>
+          )}
+          {connection === "stale" && state && (
+            <div className="notice notice-pink" role="status">
+              <Radio size={17} />
+              <span>
+                浏览器状态同步中断，当前显示上次收到的状态。后台会话是否结束以恢复同步后的状态为准。
+              </span>
             </div>
           )}
           {state?.stopUnconfirmed && (

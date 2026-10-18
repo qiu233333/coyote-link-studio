@@ -3,9 +3,14 @@ import { defineChannel, GET, POST } from "eve/channels";
 import { z } from "zod";
 import type { AiProfile } from "../../shared/types.ts";
 import * as inference from "../lib/inference.ts";
+import { safeInferenceError } from "../lib/errors.ts";
 import { profileSchema } from "../lib/schemas.ts";
 
-const active = new Map<string, AbortController>();
+interface ActiveInference {
+  controller: AbortController;
+  settled: Promise<void>;
+}
+const active = new Map<string, ActiveInference>();
 const cancelled = new Map<string, number>();
 const payloadSchema = z.object({
   requestId: z.string().uuid(),
@@ -27,30 +32,6 @@ function authorized(request: Request) {
 const json = (data: unknown, status = 200) =>
   Response.json(data, { status, headers: { "cache-control": "no-store" } });
 
-function safeError(error: unknown): string {
-  const value = error as {
-    name?: string;
-    statusCode?: number;
-    message?: string;
-  };
-  if (value.name === "AbortError" || value.name === "TimeoutError")
-    return "AI 请求已取消或超时。";
-  if (value.statusCode === 401 || value.statusCode === 403)
-    return "AI 接口拒绝认证，请检查 API Key 和访问权限。";
-  if (value.statusCode === 404)
-    return "AI 模型或接口路径不存在，请检查 Base URL 与模型名称。";
-  if (value.statusCode === 429) return "AI 接口达到速率或额度限制。";
-  if (value.message === "CONTEXT_TOO_LARGE")
-    return "上下文超过配置窗口，请增加上下文窗口或减少任务阶段。";
-  if (value.message === "NO_WAVEFORMS")
-    return "没有可用于草稿的波形，请先导入波形。";
-  if (value.message === "INVALID_TOOL_RESULT" || value.name === "ZodError")
-    return "模型未返回符合业务结构的结果，请检查工具调用兼容性。";
-  // Provider exceptions can embed request bodies or credentials. Never return,
-  // log, or persist their raw message, response, cause, headers, or stack.
-  return "AI 请求失败，或返回动作未通过授权范围校验；请检查接口、模型与任务范围。";
-}
-
 async function run(request: Request, operation: "test" | "decide" | "draft") {
   if (!authorized(request))
     return json({ ok: false, error: "Unauthorized" }, 401);
@@ -60,6 +41,8 @@ async function run(request: Request, operation: "test" | "decide" | "draft") {
   let requestId: string | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let abort: (() => void) | undefined;
+  let current: ActiveInference | undefined;
+  let settle: (() => void) | undefined;
   try {
     const raw = await request.text();
     if (raw.length > 524288) return json({ ok: false, error: "请求过大" }, 413);
@@ -70,9 +53,22 @@ async function run(request: Request, operation: "test" | "decide" | "draft") {
     };
     requestId = payload.requestId;
     if (active.has(requestId) || cancelled.has(requestId))
-      return json({ ok: false, error: "请求已取消或重复" }, 409);
+      return json(
+        {
+          ok: false,
+          errorCode: "AI_CANCELLED_OR_DUPLICATE",
+          error: "请求已取消或重复",
+        },
+        409,
+      );
     const controller = new AbortController();
-    active.set(requestId, controller);
+    current = {
+      controller,
+      settled: new Promise<void>((resolve) => {
+        settle = resolve;
+      }),
+    };
+    active.set(requestId, current);
     abort = () => controller.abort(new DOMException("Cancelled", "AbortError"));
     request.signal.addEventListener("abort", abort, { once: true });
     if (request.signal.aborted) abort();
@@ -94,11 +90,28 @@ async function run(request: Request, operation: "test" | "decide" | "draft") {
     if (controller.signal.aborted) throw controller.signal.reason;
     return json({ ok: true, data });
   } catch (error) {
-    return json({ ok: false, error: safeError(error) }, profile ? 502 : 422);
+    if (!profile)
+      return json(
+        {
+          ok: false,
+          errorCode: "AI_INVALID_REQUEST",
+          error: "AI 内部请求结构无效。",
+        },
+        422,
+      );
+    // SDKs may wrap an abort in a provider error; the request's own signal is
+    // authoritative for distinguishing cancellation from a provider failure.
+    const cause = current?.controller.signal.aborted
+      ? current.controller.signal.reason
+      : error;
+    return json({ ok: false, ...safeInferenceError(cause) }, 502);
   } finally {
     if (timer) clearTimeout(timer);
     if (abort) request.signal.removeEventListener("abort", abort);
-    if (requestId) active.delete(requestId);
+    // A rejected duplicate must never delete another request's controller.
+    if (requestId && current && active.get(requestId) === current)
+      active.delete(requestId);
+    settle?.();
     const now = Date.now();
     for (const [id, time] of cancelled)
       if (now - time > 180000) cancelled.delete(id);
@@ -131,9 +144,30 @@ export default defineChannel({
           .object({ requestId: z.string().uuid() })
           .parse(await request.json());
         cancelled.set(requestId, Date.now());
-        active
-          .get(requestId)
-          ?.abort(new DOMException("Cancelled", "AbortError"));
+        const pending = active.get(requestId);
+        pending?.controller.abort(new DOMException("Cancelled", "AbortError"));
+        if (pending) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            const settled = await Promise.race([
+              pending.settled.then(() => true),
+              new Promise<boolean>((resolve) => {
+                timer = setTimeout(() => resolve(false), 1000);
+              }),
+            ]);
+            if (!settled)
+              return json(
+                {
+                  ok: false,
+                  errorCode: "AI_CANCELLATION_PENDING",
+                  error: "AI 推理取消尚未确认。",
+                },
+                503,
+              );
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
+        }
         return json({ ok: true });
       } catch {
         return json({ ok: false, error: "无效请求" }, 422);

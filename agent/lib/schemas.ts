@@ -156,6 +156,18 @@ function boundedCaps(context: unknown, bounds: ControlBounds): ChannelValues {
 export function decisionToolSchema(context: unknown) {
   const bounds = decisionBounds(context);
   const caps = boundedCaps(context, bounds);
+  const run = dictionary(dictionary(context).run);
+  // A stage duration is absolute from its stage start. Keep the provider's
+  // advertised range aligned with the controller's existing hard deadline.
+  const stageLimit =
+    run.owner === "locked-task" &&
+    typeof run.deadlineAt === "number" &&
+    typeof run.stageStartedAt === "number"
+      ? Math.min(
+          bounds.durationSec,
+          (run.deadlineAt - run.stageStartedAt) / 1000,
+        )
+      : bounds.durationSec;
   return decisionSchema.extend({
     channels: z
       .array(z.enum(bounds.channels as [Channel, ...Channel[]]))
@@ -168,6 +180,7 @@ export function decisionToolSchema(context: unknown) {
       intensity.max(bounds.channels.includes("B") ? caps.B : 0),
     ),
     durationSec: z.number().min(1).max(bounds.maxActionSec),
+    stageDurationSec: z.number().min(1).max(Math.max(0, stageLimit)).optional(),
   });
 }
 

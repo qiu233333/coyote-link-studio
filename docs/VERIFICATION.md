@@ -2,6 +2,8 @@
 
 日期：2026-10-18。环境：Windows、Node.js 24.19.0、pnpm 11.25.0、Microsoft Edge（Playwright 驱动）。
 
+AI 会话中途中断专项修复、脱敏证据、135 项回归及隔离浏览器验收见 [AI-INTERRUPTIONS.md](AI-INTERRUPTIONS.md)。下列记录保留此前各功能的独立验收范围。
+
 ## 构建与静态检查
 
 - `pnpm typecheck`：通过。

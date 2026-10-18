@@ -1,15 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ApiEnvelope, AppSnapshot } from "../shared/types";
+import { AppStateStream, type StateConnection } from "./stateStream";
 
 export async function request<T>(
   path: string,
   body?: unknown,
   method = "POST",
+  signal?: AbortSignal,
 ): Promise<T> {
   const response = await fetch(path, {
     method,
     headers: { "Content-Type": "application/json", "X-Coyote-Request": "1" },
     credentials: "same-origin",
+    signal,
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const result = (await response.json()) as ApiEnvelope<T>;
@@ -26,77 +29,36 @@ export type Action = <T = unknown>(
 ) => Promise<T | undefined>;
 export function useAppState() {
   const [state, setState] = useState<AppSnapshot | null>(null);
-  const [connection, setConnection] = useState<
-    "connecting" | "live" | "polling"
-  >("connecting");
+  const [connection, setConnection] = useState<StateConnection>("connecting");
   const [error, setError] = useState("");
   const [toast, setToast] = useState<{ text: string; error: boolean } | null>(
     null,
   );
   const [pending, setPending] = useState(0);
-  const mounted = useRef(true);
-  const refresh = useCallback(async () => {
-    try {
-      const snapshot = await request<AppSnapshot>(
-        "/api/state",
-        undefined,
-        "GET",
-      );
-      if (mounted.current) {
-        setState(snapshot);
-        setError("");
-      }
-    } catch (e) {
-      if (mounted.current) setError((e as Error).message);
-    }
-  }, []);
+  const stream = useRef<AppStateStream | null>(null);
+  const refresh = useCallback(
+    () => stream.current?.refresh() ?? Promise.resolve(),
+    [],
+  );
 
   useEffect(() => {
-    mounted.current = true;
-    let stopped = false;
-    let socket: WebSocket | undefined;
-    let reconnect: ReturnType<typeof setTimeout> | undefined;
-    const connect = () => {
-      if (stopped) return;
-      socket = new WebSocket(
-        `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`,
-      );
-      socket.onopen = () => {
-        setConnection("live");
-        void refresh();
-      };
-      socket.onmessage = (event) => {
-        try {
-          const message = JSON.parse(event.data as string);
-          if (message.type === "state" && message.data) {
-            setState(message.data);
-            setError("");
-          }
-        } catch {
-          /* Ignore unrelated protocol messages. */
-        }
-      };
-      socket.onclose = () => {
-        if (stopped) return;
-        setConnection("polling");
-        reconnect = setTimeout(connect, 4000);
-      };
-      socket.onerror = () => socket?.close();
-    };
-    void refresh().then(() => {
-      if (!stopped) connect();
-    });
-    const poll = setInterval(() => {
-      if (socket?.readyState !== WebSocket.OPEN) void refresh();
-    }, 3000);
+    const current = new AppStateStream(
+      (signal) => request<AppSnapshot>("/api/state", undefined, "GET", signal),
+      () =>
+        new WebSocket(
+          `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`,
+        ),
+      setState,
+      setConnection,
+      setError,
+    );
+    stream.current = current;
+    current.start();
     return () => {
-      stopped = true;
-      mounted.current = false;
-      clearInterval(poll);
-      clearTimeout(reconnect);
-      socket?.close();
+      current.stop();
+      if (stream.current === current) stream.current = null;
     };
-  }, [refresh]);
+  }, []);
 
   useEffect(() => {
     if (!toast) return;

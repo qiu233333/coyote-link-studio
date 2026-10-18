@@ -17,12 +17,14 @@ import type {
   Owner,
   PlaybackConfig,
   RunStatus,
+  RunTerminationSource,
   Stage,
   TaskPlan,
   Waveform,
 } from "../shared/types.js";
 import { AppError, assert } from "./errors.js";
 import { Store } from "./store.js";
+import { AiServiceError } from "./ai.js";
 import {
   normalizeWaveform,
   channelIntensitySchema,
@@ -32,7 +34,7 @@ import {
 } from "./validation.js";
 
 export interface AiBridge {
-  status: { ready: boolean; error?: string };
+  status: { ready: boolean; error?: string; errorCode?: string };
   decide(
     profile: AiProfile,
     context: unknown,
@@ -84,6 +86,7 @@ export class Controller extends EventEmitter {
   private nextAiAt = 0;
   private aiEpoch = 0;
   private aiAbort?: AbortController;
+  private aiFlight?: Promise<void>;
   private profile?: AiProfile;
   private aiAction?: {
     decision: AiDecision;
@@ -159,6 +162,8 @@ export class Controller extends EventEmitter {
       this.run!.status = "interrupted";
       this.run!.thinking = false;
       this.run!.reason = "服务重启，原运行已中断，设备输出不会自动恢复。";
+      this.run!.termination = { source: "service-restart", at: Date.now() };
+      this.run!.inferenceRecovery = undefined;
       store.set("runtime", "current", this.run);
       this.log("warning", "系统", this.run!.reason);
     }
@@ -181,7 +186,11 @@ export class Controller extends EventEmitter {
         !this.stopping &&
         (!state.connected || state.relayStatus === "fault")
       )
-        void this.finish("faulted", state.error || "设备或 APP 连接中断");
+        void this.finish(
+          "faulted",
+          state.error || "设备或 APP 连接中断",
+          "device-disconnected",
+        );
       if (active(this.run) && !this.stopping) {
         // Disabling changes the next output target to zero. While the two zero
         // commands are confirmed independently, telemetry must still be checked
@@ -204,7 +213,11 @@ export class Controller extends EventEmitter {
             this.run?.bounds,
           );
           if (state.intensities[channel] > limit) {
-            void this.finish("faulted", `${channel} 通道回传强度超出确认边界`);
+            void this.finish(
+              "faulted",
+              `${channel} 通道回传强度超出确认边界`,
+              "authorization",
+            );
             break;
           }
         }
@@ -1055,7 +1068,9 @@ export class Controller extends EventEmitter {
     ++this.aiEpoch;
     this.aiAbort?.abort();
     this.aiAbort = undefined;
-    if (this.run) this.run.thinking = false;
+    if (this.run) {
+      this.run.thinking = false;
+    }
   }
   async pause(owner?: Owner) {
     this.assertUnlocked();
@@ -1089,6 +1104,7 @@ export class Controller extends EventEmitter {
       if (!confirmed) {
         run.status = "faulted";
         run.reason = "暂停时停止未确认";
+        run.termination = { source: "stop-unconfirmed", at: Date.now() };
       }
       this.persist();
       this.log(
@@ -1103,6 +1119,7 @@ export class Controller extends EventEmitter {
         this.stopUnconfirmed = true;
         run.status = "faulted";
         run.reason = "暂停时停止未确认";
+        run.termination = { source: "stop-unconfirmed", at: Date.now() };
         this.persist();
       }
       throw error;
@@ -1221,11 +1238,11 @@ export class Controller extends EventEmitter {
         "OWNER_CONFLICT",
         409,
       );
-    await this.finish("stopped", "用户停止运行");
+    await this.finish("stopped", "用户停止运行", "user-stop");
   }
   async takeover() {
     this.assertUnlocked();
-    await this.finish("stopped", "用户接管为手动");
+    await this.finish("stopped", "用户接管为手动", "takeover");
     assert(
       !this.stopUnconfirmed,
       "停止未确认，暂不能手动接管。",
@@ -1234,7 +1251,7 @@ export class Controller extends EventEmitter {
     );
   }
   async emergency() {
-    await this.finish("stopped", "用户触发紧急停止");
+    await this.finish("stopped", "用户触发紧急停止", "emergency");
   }
   private stopDevice(): Promise<boolean> {
     if (this.stopFlight) return this.stopFlight;
@@ -1245,7 +1262,13 @@ export class Controller extends EventEmitter {
       });
     return this.stopFlight;
   }
-  async finish(status: RunStatus, reason: string) {
+  async finish(
+    status: RunStatus,
+    reason: string,
+    source: RunTerminationSource = "user-stop",
+    code?: string,
+    stopConfirmed?: boolean,
+  ) {
     // Always invalidate pending starts, pauses and model results immediately.
     // An in-flight physical stop is shared and awaited, never mistaken for an
     // already completed stop merely because another operation set `stopping`.
@@ -1254,7 +1277,9 @@ export class Controller extends EventEmitter {
     this.stopping = true;
     if (this.run && active(this.run)) {
       this.run.status = status;
-      this.run.reason = reason;
+      this.run.reason = this.store.redact(reason);
+      this.run.termination = { source, at: Date.now(), code };
+      this.run.inferenceRecovery = undefined;
     }
     this.aiAction = undefined;
     this.randomDesired = undefined;
@@ -1262,21 +1287,36 @@ export class Controller extends EventEmitter {
     this.persist();
     this.broadcast(true);
     if (this.finishFlight) return this.finishFlight;
-    this.finishFlight = this.completeStop(status, reason).finally(() => {
+    this.finishFlight = this.completeStop(
+      status,
+      reason,
+      stopConfirmed,
+    ).finally(() => {
       this.finishFlight = undefined;
     });
     return this.finishFlight;
   }
-  private async completeStop(status: RunStatus, reason: string) {
+  private async completeStop(
+    status: RunStatus,
+    reason: string,
+    stopConfirmed?: boolean,
+  ) {
     try {
-      const confirmed = await this.stopDevice();
+      const confirmed = stopConfirmed ?? (await this.stopDevice());
       // An emergency during connection/selection must keep new starts blocked
       // until the cancelled transition has finished cleaning up its socket.
       if (this.deviceTransition) await this.deviceTransition.catch(() => {});
       this.stopUnconfirmed = !confirmed;
       if (!confirmed && this.run) {
         this.run.status = "faulted";
-        this.run.reason = `${reason}；设备停止未确认`;
+        this.run.reason = this.store.redact(`${reason}；设备停止未确认`);
+        this.run.termination = {
+          source: "stop-unconfirmed",
+          triggerSource:
+            this.run.termination?.triggerSource ?? this.run.termination?.source,
+          at: Date.now(),
+          code: this.run.termination?.code,
+        };
       }
       this.levels = { A: 0, B: 0 };
       this.persist();
@@ -1291,7 +1331,14 @@ export class Controller extends EventEmitter {
       this.stopUnconfirmed = true;
       if (this.run) {
         this.run.status = "faulted";
-        this.run.reason = reason + "；停止未确认";
+        this.run.reason = this.store.redact(reason + "；停止未确认");
+        this.run.termination = {
+          source: "stop-unconfirmed",
+          triggerSource:
+            this.run.termination?.triggerSource ?? this.run.termination?.source,
+          at: Date.now(),
+          code: this.run.termination?.code,
+        };
       }
       this.persist();
       this.log(
@@ -1402,7 +1449,7 @@ export class Controller extends EventEmitter {
       config.stages.reduce((sum, s) => sum + s.durationSec + s.gapSec, 0) *
       1000;
     if (config.repeat > 0 && elapsed >= pass * config.repeat) {
-      void this.finish("completed", "播放内容已完成");
+      void this.finish("completed", "播放内容已完成", "stages-completed");
       return result;
     }
     let local = elapsed % pass;
@@ -1444,7 +1491,7 @@ export class Controller extends EventEmitter {
       stage = run.plan!.stages[run.stageIndex],
       desired = this.zeroDesired();
     if (!stage) {
-      void this.finish("completed", "所有任务阶段已结束");
+      void this.finish("completed", "所有任务阶段已结束", "stages-completed");
       return desired;
     }
     const duration =
@@ -1482,7 +1529,8 @@ export class Controller extends EventEmitter {
     this.cancelAi();
     this.nextAiAt = 0;
     const stage = run.plan!.stages[run.stageIndex];
-    if (!stage) void this.finish("completed", "任务阶段已完成");
+    if (!stage)
+      void this.finish("completed", "任务阶段已完成", "stages-completed");
     else {
       this.persist();
       this.log("info", "上锁任务", `进入「${stage.name}」`);
@@ -1506,8 +1554,21 @@ export class Controller extends EventEmitter {
         ? {
             id: run.id,
             owner: run.owner,
+            status: run.status,
+            startedAt: run.startedAt,
+            elapsedMs:
+              run.elapsedMs +
+              (run.status === "running" ? Date.now() - this.progressAt : 0),
             deadlineAt: run.deadlineAt,
             stageIndex: run.stageIndex,
+            stageCount: run.plan?.stages.length,
+            isLastStage: run.plan
+              ? run.stageIndex === run.plan.stages.length - 1
+              : undefined,
+            stageStartedAt: run.stageStartedAt,
+            stageDurationSec:
+              this.stageDurations.get(run.stageIndex) ??
+              run.plan?.stages[run.stageIndex]?.durationSec,
             stage: run.plan?.stages[run.stageIndex],
             task: run.plan
               ? {
@@ -1545,7 +1606,14 @@ export class Controller extends EventEmitter {
   }
   private requestDecision(now: number) {
     const run = this.run!;
-    if (run.thinking || !run.bounds || now < this.nextAiAt) return;
+    if (
+      this.aiFlight ||
+      run.thinking ||
+      !run.bounds ||
+      now < this.nextAiAt ||
+      (run.inferenceRecovery && now < run.inferenceRecovery.retryAt)
+    )
+      return;
     const runId = run.id,
       epoch = this.epoch,
       aiEpoch = ++this.aiEpoch,
@@ -1554,7 +1622,7 @@ export class Controller extends EventEmitter {
     run.thinking = true;
     this.nextAiAt = now + run.bounds.decisionIntervalSec * 1000;
     this.broadcast(true);
-    void this.ai
+    const flight = this.ai
       .decide(this.profile!, this.aiContext(), this.aiAbort.signal)
       .then((raw) => {
         if (
@@ -1603,6 +1671,7 @@ export class Controller extends EventEmitter {
           assert(bounds.allowRest, "AI 未获得休息控制权限。");
         this.run.lastDecision = decision;
         this.run.thinking = false;
+        this.run.inferenceRecovery = undefined;
         this.run.feedback.push({
           id: randomUUID(),
           at: Date.now(),
@@ -1616,7 +1685,11 @@ export class Controller extends EventEmitter {
           decision.reason,
         );
         if (decision.action === "finish") {
-          void this.finish("completed", `AI 判定结束：${decision.reason}`);
+          void this.finish(
+            "completed",
+            `AI 判定结束：${decision.reason}`,
+            "ai-finish",
+          );
           return;
         }
         if (
@@ -1647,24 +1720,110 @@ export class Controller extends EventEmitter {
         this.persist();
         this.broadcast(true);
       })
-      .catch((error) => {
+      .catch(async (error) => {
         if (
           this.run?.id === runId &&
           this.epoch === epoch &&
           this.aiEpoch === aiEpoch &&
           this.run.status === "running"
-        )
-          void this.finish(
-            "faulted",
-            `AI 请求或动作校验失败：${error instanceof Error ? error.message : "未知错误"}`,
-          );
+        ) {
+          if (Date.now() >= this.run.deadlineAt) {
+            await this.finish(
+              "completed",
+              "已到达确认的最晚截止时间",
+              "deadline",
+            );
+          } else if (
+            error instanceof AiServiceError &&
+            error.retryable &&
+            !this.run.inferenceRecovery
+          ) {
+            await this.waitForInferenceRetry(this.run, error);
+          } else {
+            await this.finish(
+              "faulted",
+              `AI 请求或动作校验失败：${error instanceof Error ? error.message : "未知错误"}`,
+              error instanceof AiServiceError
+                ? [
+                    "AI_RUNTIME_UNAVAILABLE",
+                    "AI_CANCELLATION_UNCONFIRMED",
+                  ].includes(error.code)
+                  ? "ai-runtime"
+                  : "ai-inference"
+                : "authorization",
+              error instanceof AiServiceError
+                ? error.code
+                : "AI_ACTION_INVALID",
+            );
+          }
+        }
       })
       .finally(() => {
+        if (this.aiFlight === flight) this.aiFlight = undefined;
         if (this.run?.id === runId && this.aiEpoch === aiEpoch) {
+          this.aiAbort = undefined;
           this.run.thinking = false;
           this.broadcast(true);
         }
       });
+    this.aiFlight = flight;
+  }
+  private async waitForInferenceRetry(
+    run: ControlSession,
+    error: AiServiceError,
+  ) {
+    // Recovery retries only inference. Physical stop is performed once and must
+    // be confirmed before another model request can authorize any output.
+    const epoch = ++this.epoch;
+    this.aiAction = undefined;
+    run.thinking = false;
+    run.inferenceRecovery = {
+      attempt: 1,
+      maxAttempts: 1,
+      retryAt: Date.now() + 1000,
+      code: error.code,
+      message: this.store.redact(error.message),
+    };
+    this.stopping = true;
+    this.persist();
+    this.log(
+      "warning",
+      "AI 推理",
+      `${error.code}：${error.message}；正在清队列并确认归零，最多重试一次，截止时间不变。`,
+    );
+    try {
+      const confirmed = await this.stopDevice();
+      if (this.run !== run || this.epoch !== epoch || run.status !== "running")
+        return;
+      this.stopUnconfirmed = !confirmed;
+      this.levels = { A: 0, B: 0 };
+      if (!confirmed) {
+        await this.finish(
+          "faulted",
+          "AI 推理等待期间设备停止未确认",
+          "stop-unconfirmed",
+          error.code,
+          false,
+        );
+        return;
+      }
+      this.nextAiAt = run.inferenceRecovery!.retryAt = Date.now() + 1000;
+      this.persist();
+    } catch (stopError) {
+      if (this.run === run && this.epoch === epoch) {
+        this.stopUnconfirmed = true;
+        await this.finish(
+          "faulted",
+          `AI 推理等待期间设备停止未确认：${stopError instanceof Error ? stopError.message : "未知停止错误"}`,
+          "stop-unconfirmed",
+          error.code,
+          false,
+        );
+      }
+    } finally {
+      if (this.run === run && this.epoch === epoch) this.stopping = false;
+      this.broadcast(true);
+    }
   }
   private tick() {
     if (this.closed) return;
@@ -1675,25 +1834,35 @@ export class Controller extends EventEmitter {
       this.history.push({ at: now, ...this.device.state.intensities });
       if (this.history.length > 180) this.history.shift();
     }
-    if (!active(this.run) || this.stopping) {
+    if (!active(this.run)) {
       this.broadcast();
       return;
     }
     if (now >= this.run!.deadlineAt) {
-      void this.finish("completed", "已到达确认的最晚截止时间");
+      void this.finish("completed", "已到达确认的最晚截止时间", "deadline");
+      return;
+    }
+    if (this.stopping) {
+      this.broadcast();
       return;
     }
     if (
       !this.device.state.connected ||
       now - this.device.state.lastSeenAt > 6000
     ) {
-      void this.finish("faulted", "设备状态失联或过期");
+      void this.finish(
+        "faulted",
+        "设备状态失联或过期",
+        this.device.state.connected ? "device-stale" : "device-disconnected",
+      );
       return;
     }
     if (this.run!.owner !== "manual" && !this.ai.status.ready) {
       void this.finish(
         "faulted",
         this.ai.status.error || "AI 本地运行时已中断",
+        "ai-runtime",
+        this.ai.status.errorCode ?? "AI_RUNTIME_UNAVAILABLE",
       );
       return;
     }
@@ -1712,6 +1881,7 @@ export class Controller extends EventEmitter {
           : this.aiAction && this.aiAction.expiresAt > now
             ? this.actionDesired(this.aiAction.decision)
             : this.zeroDesired();
+      if (run.inferenceRecovery) desired = this.zeroDesired();
       if (run.status === "running") this.requestDecision(now);
     }
     if (this.stopping || run.status !== "running" || this.epoch !== epoch)
@@ -1732,7 +1902,11 @@ export class Controller extends EventEmitter {
         output.target > authorized + 0.001 ||
         output.target < 0
       ) {
-        void this.finish("faulted", `${channel} 通道执行目标越界`);
+        void this.finish(
+          "faulted",
+          `${channel} 通道执行目标越界`,
+          "authorization",
+        );
         return;
       }
       output.target = Math.min(output.target, maximum);
@@ -1768,7 +1942,11 @@ export class Controller extends EventEmitter {
               run.status === "running" &&
               target <= this.effectiveLimit(channel)
             )
-              void this.finish("faulted", `强度指令失败：${error.message}`);
+              void this.finish(
+                "faulted",
+                `强度指令失败：${error.message}`,
+                "device-command",
+              );
           })
           .finally(() => {
             this.intensityBusy[channel] = false;
@@ -1781,7 +1959,7 @@ export class Controller extends EventEmitter {
       ) {
         const wave = run.waveformSnapshots[output.waveformId];
         if (!wave) {
-          void this.finish("faulted", "运行引用的波形不存在");
+          void this.finish("faulted", "运行引用的波形不存在", "authorization");
           return;
         }
         if (this.cursorWaves[channel] !== wave.id) {
@@ -1805,7 +1983,11 @@ export class Controller extends EventEmitter {
           .sendFrames(channel, frames)
           .catch((error) => {
             if (this.epoch === epoch && run.status === "running")
-              void this.finish("faulted", `波形指令失败：${error.message}`);
+              void this.finish(
+                "faulted",
+                `波形指令失败：${error.message}`,
+                "device-command",
+              );
           })
           .finally(() => {
             this.pulseBusy[channel] = false;
@@ -1820,7 +2002,7 @@ export class Controller extends EventEmitter {
   }
   async close() {
     clearInterval(this.timer);
-    await this.finish("interrupted", "本地服务关闭");
+    await this.finish("interrupted", "本地服务关闭", "service-shutdown");
     this.closed = true;
     this.removeAllListeners();
   }

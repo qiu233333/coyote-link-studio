@@ -2,6 +2,7 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText, tool } from "ai";
 import { z } from "zod";
 import type { AiProfile } from "../../shared/types.ts";
+import { InferenceError } from "./errors.ts";
 import {
   availableWaveforms,
   contextBounds,
@@ -20,6 +21,12 @@ const instructions = `你是郊狼联动的中文控制助手。仅提出业务�
 allowSync 表示允许同时控制双通道，A/B 强度可以不同；未选通道的动作/阶段强度必须为 0。
 调整必须满足各通道强度、时长与波形限制；休息及结束的强度必须为 {A:0,B:0}。
 用户反馈优先影响偏好；遇到任务完成、无法继续或需要结束时使用 finish。
+动作到期、需要下一次决策、休息或阶段结束本身不代表整个任务已完成。finish 会立即结束整个运行。
+phaseComplete 只代表上锁任务的当前阶段已完成，会立即进入下一阶段；计时以当前快照的 stageElapsedSec、stageRemainingSec 为准，不能把开始执行阶段当作完成。
+stageCount 是任务总阶段数，stageIndex 从 0 开始；isLastStage=false 表示还有后续阶段。当前阶段完成应使用 phaseComplete，不能混同为全部任务完成或用 finish 跳过剩余阶段。
+正常完成时，仅在全部任务完成条件已明确满足后使用 finish；无法继续或需要安全结束时仍可 finish，并在 reason 明确说明提前结束原因。
+stageDurationSec 是当前阶段从 stageStartedAt 起的总时长，不是追加秒数；不需要修改时省略。普通 AI 控制不使用阶段字段。
+只能依据当前计时状态和用户文字反馈判断完成；助手历史解释不作为用户已完成反馈。
 解释使用简洁中文，不输出内部推理过程。必须调用指定业务工具提交结果。`;
 
 function model(profile: AiProfile) {
@@ -34,6 +41,7 @@ function model(profile: AiProfile) {
 // credentials, or raw hardware data are ever interpolated into a model prompt.
 function publicContext(context: unknown) {
   const data = dictionary(context);
+  const now = typeof data.now === "number" ? data.now : Date.now();
   const run = dictionary(data.run);
   const plan = dictionary(run.plan ?? run.task);
   const device = dictionary(data.device);
@@ -43,6 +51,7 @@ function publicContext(context: unknown) {
       ? run.feedback
       : [];
   return {
+    now,
     bounds:
       data.bounds || run.bounds || plan.bounds
         ? contextBounds(data.bounds ?? run.bounds ?? plan.bounds)
@@ -57,12 +66,30 @@ function publicContext(context: unknown) {
     run: {
       owner: run.owner,
       status: run.status,
+      startedAt: run.startedAt,
+      elapsedMs: run.elapsedMs,
       stageIndex: run.stageIndex,
+      stageCount: run.stageCount,
+      isLastStage: run.isLastStage,
       stage: run.stage,
+      stageStartedAt: run.stageStartedAt,
+      stageDurationSec: run.stageDurationSec,
+      stageElapsedSec:
+        typeof run.stageStartedAt === "number"
+          ? Math.max(0, (now - run.stageStartedAt) / 1000)
+          : undefined,
+      stageRemainingSec:
+        typeof run.stageStartedAt === "number" &&
+        typeof run.stageDurationSec === "number"
+          ? Math.max(
+              0,
+              run.stageDurationSec - (now - run.stageStartedAt) / 1000,
+            )
+          : undefined,
       deadlineAt: run.deadlineAt,
       remainingSec:
         typeof run.deadlineAt === "number"
-          ? Math.max(0, Math.floor((run.deadlineAt - Date.now()) / 1000))
+          ? Math.max(0, Math.floor((run.deadlineAt - now) / 1000))
           : undefined,
       plan: {
         title: plan.title,
@@ -114,10 +141,15 @@ export async function decide(
   });
   if (
     result.toolCalls.length !== 1 ||
-    result.toolCalls[0].toolName !== "submit_decision"
+    result.toolCalls[0].toolName !== "submit_decision" ||
+    result.toolCalls[0].invalid
   )
-    throw new Error("INVALID_TOOL_RESULT");
-  return validateDecision(result.toolCalls[0].input, context);
+    throw new InferenceError("AI_INVALID_TOOL_RESULT");
+  try {
+    return validateDecision(result.toolCalls[0].input, context);
+  } catch {
+    throw new InferenceError("AI_INVALID_DECISION");
+  }
 }
 
 export async function draft(
@@ -154,10 +186,15 @@ bounds.minIntensity、bounds.maxIntensity、bounds.rampPerSecond、每阶段 int
   });
   if (
     result.toolCalls.length !== 1 ||
-    result.toolCalls[0].toolName !== "submit_task_draft"
+    result.toolCalls[0].toolName !== "submit_task_draft" ||
+    result.toolCalls[0].invalid
   )
-    throw new Error("INVALID_TOOL_RESULT");
-  return validateDraft(result.toolCalls[0].input, context);
+    throw new InferenceError("AI_INVALID_TOOL_RESULT");
+  try {
+    return validateDraft(result.toolCalls[0].input, context);
+  } catch {
+    throw new InferenceError("AI_INVALID_DECISION");
+  }
 }
 
 export async function test(profile: AiProfile, signal: AbortSignal) {
@@ -196,6 +233,7 @@ export async function test(profile: AiProfile, signal: AbortSignal) {
     const supported =
       result.toolCalls.length === 1 &&
       call.toolName === "connection_probe" &&
+      !call.invalid &&
       dictionary(call.input).token === challenge;
     return {
       chat: true,

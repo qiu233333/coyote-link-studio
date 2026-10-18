@@ -132,6 +132,22 @@ export interface Feedback {
   role: "user" | "assistant";
   text: string;
 }
+export type RunTerminationSource =
+  | "deadline"
+  | "ai-finish"
+  | "stages-completed"
+  | "user-stop"
+  | "emergency"
+  | "takeover"
+  | "device-disconnected"
+  | "device-stale"
+  | "device-command"
+  | "authorization"
+  | "ai-inference"
+  | "ai-runtime"
+  | "stop-unconfirmed"
+  | "service-shutdown"
+  | "service-restart";
 export interface ControlSession {
   id: string;
   owner: Owner;
@@ -147,6 +163,19 @@ export interface ControlSession {
   stageStartedAt: number;
   elapsedMs: number;
   reason?: string;
+  termination?: {
+    source: RunTerminationSource;
+    triggerSource?: RunTerminationSource;
+    at: number;
+    code?: string;
+  };
+  inferenceRecovery?: {
+    attempt: number;
+    maxAttempts: number;
+    retryAt: number;
+    code: string;
+    message: string;
+  };
   randomSeed?: number;
   waveformSnapshots: Record<string, Waveform>;
   feedback: Feedback[];

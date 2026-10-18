@@ -23,6 +23,8 @@ import type {
   AppSnapshot,
   ControlBounds,
   ControlSession,
+  RunStatus,
+  RunTerminationSource,
   TaskPlan,
 } from "../shared/types";
 import {
@@ -81,17 +83,22 @@ export function AiControlPage({ state, action, pending }: AiProps) {
           自由控制 · 随时接管
         </Badge>
       </div>
+      {state.run?.owner === "ai-control" && !run && (
+        <RunEndNotice run={state.run} />
+      )}
       <div className="ai-intro glass-card">
         <Avatar size="large" />
         <div>
           <Badge color="pink">星涟 · AI ASSISTANT</Badge>
           <h2>
             {run
-              ? run.thinking
-                ? "正在想下一段节奏…"
-                : run.status === "paused"
-                  ? "休息一下，等你准备好。"
-                  : "我会在你划定的范围里，慢慢探索。"
+              ? run.status === "paused"
+                ? "休息一下，等你准备好。"
+                : run.inferenceRecovery
+                  ? "正在等待 AI 重试…"
+                  : run.thinking
+                    ? "正在想下一段节奏…"
+                    : "我会在你划定的范围里，慢慢探索。"
               : "你定边界，我来编排。"}
           </h2>
           <p>
@@ -132,7 +139,11 @@ export function AiControlPage({ state, action, pending }: AiProps) {
           actions={
             run && (
               <Badge color={run.status === "paused" ? "gray" : "blue"} dot>
-                {run.status === "paused" ? "已暂停" : "运行中"}
+                {run.status === "paused"
+                  ? "已暂停"
+                  : run.inferenceRecovery
+                    ? "等待 AI 重试"
+                    : "运行中"}
               </Badge>
             )
           }
@@ -255,7 +266,10 @@ export function AiControlPage({ state, action, pending }: AiProps) {
             endpoint="/api/ai-control/feedback"
             disabled={!run || blocked || pending}
           />
-          <RunSummary state={state} run={run} />
+          <RunSummary
+            state={state}
+            run={state.run?.owner === "ai-control" ? state.run : null}
+          />
         </div>
       </div>
       <Monitor state={state} />
@@ -349,6 +363,9 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
           确认后锁定
         </Badge>
       </div>
+      {state.run?.owner === "locked-task" && !run && (
+        <RunEndNotice run={state.run} />
+      )}
       <div className="task-stepper">
         {["描述需求", "编辑任务", "确认上锁", "执行与反馈"].map((s, i) => (
           <div key={s} className={(run ? 3 : step) >= i ? "active" : ""}>
@@ -691,28 +708,6 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
           </div>
         </>
       )}
-      {state.run?.owner === "locked-task" && !run && (
-        <div className="notice">
-          <Clock3 size={18} />
-          <span>
-            上次任务已
-            {
-              (
-                {
-                  completed: "完成",
-                  stopped: "停止",
-                  faulted: "因故障终止",
-                  interrupted: "中断",
-                  running: "运行",
-                  paused: "暂停",
-                } as const
-              )[state.run.status]
-            }
-            {state.run.reason ? `：${state.run.reason}` : ""}
-            。再次开启需要重新确认。
-          </span>
-        </div>
-      )}
       {review && plan && (
         <Modal
           title="确认约定并上锁"
@@ -966,6 +961,65 @@ function FeedbackPanel({
   );
 }
 
+const runStatusNames: Record<RunStatus, string> = {
+  running: "运行中",
+  paused: "已暂停",
+  completed: "正常完成",
+  stopped: "已停止",
+  faulted: "故障终止",
+  interrupted: "已中断",
+};
+const terminationNames: Record<RunTerminationSource, string> = {
+  deadline: "已到最晚截止时间",
+  "ai-finish": "AI 主动判定完成",
+  "stages-completed": "任务阶段完成",
+  "user-stop": "用户结束会话",
+  emergency: "紧急停止",
+  takeover: "手动接管",
+  "device-disconnected": "设备断线",
+  "device-stale": "设备遥测过期",
+  "device-command": "设备指令失败",
+  authorization: "授权范围校验失败",
+  "ai-inference": "AI 推理失败",
+  "ai-runtime": "AI 本地运行时故障",
+  "stop-unconfirmed": "设备停止未确认",
+  "service-shutdown": "本地服务关闭",
+  "service-restart": "本地服务重启",
+};
+
+function RunEndNotice({ run }: { run: ControlSession }) {
+  return (
+    <div
+      className={`notice ${run.status === "faulted" ? "notice-pink" : ""}`}
+      role="status"
+      aria-label="上次会话结束原因"
+    >
+      <Clock3 size={18} />
+      <div>
+        <strong>
+          上次{run.owner === "locked-task" ? "任务" : "会话"}：
+          {runStatusNames[run.status]}
+          {run.termination
+            ? ` · ${terminationNames[run.termination.source]}`
+            : ""}
+        </strong>
+        {run.termination?.triggerSource &&
+          run.termination.triggerSource !== run.termination.source && (
+            <p>起因：{terminationNames[run.termination.triggerSource]}</p>
+          )}
+        {run.reason && <p>{run.reason}</p>}
+        {run.termination && (
+          <small>
+            {clockTime(run.termination.at)}
+            {run.termination.code ? ` · ${run.termination.code}` : ""}
+            {" · "}再次开启需要重新确认。
+          </small>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function RunSummary({
   state,
   run,
@@ -973,12 +1027,20 @@ function RunSummary({
   state: AppSnapshot;
   run: ControlSession | null;
 }) {
+  const active = run && ["running", "paused"].includes(run.status);
+  const recovery = run?.inferenceRecovery;
   return (
     <Card title="会话状态" icon={<ActivityIcon />}>
       <div className="summary-line">
         <span>当前状态</span>
-        <Badge color={run ? "blue" : "gray"} dot>
-          {run ? (run.status === "paused" ? "已暂停" : "运行中") : "尚未启动"}
+        <Badge color={active ? "blue" : "gray"} dot>
+          {run
+            ? run.status === "paused"
+              ? "已暂停"
+              : recovery
+                ? "等待 AI 重试"
+                : runStatusNames[run.status]
+            : "尚未启动"}
         </Badge>
       </div>
       <div className="summary-line">
@@ -993,8 +1055,26 @@ function RunSummary({
       </div>
       <div className="summary-line">
         <span>剩余时间</span>
-        <strong>{run ? duration(timeLeft(run.deadlineAt)) : "—"}</strong>
+        <strong>{active ? duration(timeLeft(run.deadlineAt)) : "—"}</strong>
       </div>
+      {recovery && (
+        <div
+          className="notice notice-pink"
+          role="status"
+          aria-label="AI 推理恢复状态"
+        >
+          <Clock3 size={17} />
+          <div>
+            <strong>
+              {run?.status === "paused"
+                ? "已暂停，恢复控制后重试"
+                : `等待重试 ${recovery.attempt}/${recovery.maxAttempts} · ${timeLeft(recovery.retryAt)} 秒后`}
+            </strong>
+            <p>{recovery.message}</p>
+            <small>{recovery.code} · 最晚截止时间继续流逝</small>
+          </div>
+        </div>
+      )}
       {run?.lastDecision && (
         <>
           <div className="summary-line decision-targets">

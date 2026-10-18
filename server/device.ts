@@ -76,6 +76,7 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
   private timer?: ReturnType<typeof setInterval>;
   private epoch = 0;
   private polling = false;
+  private pollGeneration = 0;
   private stopping = false;
   private stopPromise?: Promise<boolean>;
   private lane: Record<Channel, Promise<unknown>> = {
@@ -400,17 +401,28 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
   }
   private async heartbeat() {
     if (this.polling || !this.socket) return;
+    const socket = this.socket,
+      epoch = this.epoch;
+    const current = () => this.socket === socket && this.epoch === epoch;
     if (this.state.protocol === "v4" && this.state.clientId) {
+      const pollGeneration = ++this.pollGeneration;
       this.polling = true;
       try {
         await this.refresh(this.state.clientId);
       } catch (error) {
-        this.fault(error instanceof Error ? error.message : "APP 状态获取失败");
+        if (current())
+          this.fault(
+            error instanceof Error ? error.message : "APP 状态获取失败",
+          );
       } finally {
-        this.polling = false;
+        if (this.pollGeneration === pollGeneration) this.polling = false;
       }
     }
-    if (this.state.connected && Date.now() - this.state.lastSeenAt > FRESH_MS)
+    if (
+      current() &&
+      this.state.connected &&
+      Date.now() - this.state.lastSeenAt > FRESH_MS
+    )
       this.fault("设备状态已过期，请重新连接");
   }
 
@@ -638,6 +650,7 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
     this.socket = undefined;
     socket?.destroy();
     this.devices.clear();
+    ++this.pollGeneration;
     this.polling = false;
     // Preserve last physical readings, rather than falsely reporting disconnected hardware as zero.
     this.state = {

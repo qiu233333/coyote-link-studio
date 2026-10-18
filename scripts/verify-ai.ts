@@ -1,7 +1,9 @@
 /** Local fixture integration; makes no request to a real provider or device. */
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:http";
-import { resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AiService } from "../server/ai.ts";
 import type { AiProfile, ControlBounds } from "../shared/types.ts";
@@ -181,7 +183,8 @@ export async function verifyAiRuntime(): Promise<void> {
       feedback: [{ role: "user", text: "文字反馈测试标记" }],
     },
   };
-  const service = new AiService();
+  const directory = await mkdtemp(resolve(tmpdir(), "coyote-ai-runtime-"));
+  const service = new AiService({ runtimeDirectory: directory });
   try {
     await service.start();
     assert.equal(service.status.ready, true);
@@ -260,6 +263,12 @@ export async function verifyAiRuntime(): Promise<void> {
     await service.stop();
     provider.closeAllConnections();
     await new Promise<void>((resolve) => provider.close(() => resolve()));
+    const verified = resolve(directory);
+    assert.ok(
+      dirname(verified) === resolve(tmpdir()) &&
+        basename(verified).startsWith("coyote-ai-runtime-"),
+    );
+    await rm(verified, { recursive: true, force: true });
   }
 }
 

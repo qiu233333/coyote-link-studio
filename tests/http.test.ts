@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname, basename } from "node:path";
 import { WebSocket } from "ws";
@@ -8,7 +8,13 @@ import { createApplication } from "../server/app.js";
 
 test("HTTP 本机同源保护、密钥加密、WebSocket 和实际模拟器控制链路", async () => {
   const directory = mkdtempSync(join(tmpdir(), "coyote-http-"));
-  const app = await createApplication({ directory, startAi: false });
+  const aiDirectory = join(directory, "eve-runtime");
+  mkdirSync(aiDirectory);
+  const app = await createApplication({
+    directory,
+    aiDirectory,
+    startAi: false,
+  });
   const url = await app.listen(0);
   let websocket: WebSocket | undefined;
   try {

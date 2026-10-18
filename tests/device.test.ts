@@ -112,6 +112,44 @@ test("simulator is explicit, validates bounds, sends no real frames, and stops b
   await driver.dispose();
 });
 
+test("a late heartbeat failure from the previous connection cannot fault a replacement device", async () => {
+  const mock = await relay();
+  const driver = new CoyoteDevice();
+  try {
+    await driver.connect({ protocol: "v4", relayUrl: mock.url });
+    await until(() => driver.state.devices.length === 1);
+    await driver.selectDevice("app-1", "slot-1");
+    const internals = driver as unknown as {
+      heartbeat(): Promise<void>;
+      refresh(clientId: string): Promise<void>;
+      polling: boolean;
+    };
+    const refresh = internals.refresh.bind(driver);
+    let rejectOldPoll!: (error: Error) => void;
+    let first = true;
+    internals.refresh = (clientId) => {
+      if (!first) return refresh(clientId);
+      first = false;
+      return new Promise((_resolve, reject) => {
+        rejectOldPoll = reject;
+      });
+    };
+    const oldPoll = internals.heartbeat();
+    assert.equal(internals.polling, true);
+    await driver.connect({ protocol: "simulator" });
+    // Release the stale failure only after the replacement is fully connected.
+    rejectOldPoll(new Error("Previous connection heartbeat failed"));
+    await oldPoll;
+    assert.equal(driver.state.protocol, "simulator");
+    assert.equal(driver.state.connected, true);
+    assert.equal(driver.state.error, undefined);
+    assert.equal(internals.polling, false);
+  } finally {
+    await driver.dispose();
+    await mock.close();
+  }
+});
+
 test("V4 discovers devices, uses reported limits and translates absolute targets once", async () => {
   const mock = await relay();
   const driver = new CoyoteDevice();

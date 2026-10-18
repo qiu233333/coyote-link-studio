@@ -25,7 +25,12 @@ const secureEqual = (a: string, b: string) => {
 };
 
 export async function createApplication(
-  options: { directory?: string; dev?: boolean; startAi?: boolean } = {},
+  options: {
+    directory?: string;
+    aiDirectory?: string;
+    dev?: boolean;
+    startAi?: boolean;
+  } = {},
 ) {
   const app = express();
   app.disable("x-powered-by");
@@ -33,7 +38,7 @@ export async function createApplication(
     sockets = new WebSocketServer({ noServer: true, maxPayload: 1024 });
   const store = new Store(options.directory ?? resolve(root, "data"));
   const device = new CoyoteDevice(),
-    ai = new AiService();
+    ai = new AiService({ runtimeDirectory: options.aiDirectory });
   const controller = new Controller(store, device, ai, getBuiltinWaveforms());
   const csrf = randomBytes(32).toString("hex");
   let localPort = 0;
@@ -55,13 +60,11 @@ export async function createApplication(
       !allowedHosts().has(req.headers.host ?? "") ||
       !validOrigin(req.headers.origin)
     ) {
-      res
-        .status(403)
-        .json({
-          ok: false,
-          error: "只允许本机同源访问。",
-          code: "ORIGIN_REJECTED",
-        });
+      res.status(403).json({
+        ok: false,
+        error: "只允许本机同源访问。",
+        code: "ORIGIN_REJECTED",
+      });
       return;
     }
     res.setHeader("X-Content-Type-Options", "nosniff");
@@ -80,13 +83,11 @@ export async function createApplication(
       (req.headers["x-coyote-request"] !== "1" ||
         !validCookie(req.headers.cookie))
     ) {
-      res
-        .status(403)
-        .json({
-          ok: false,
-          error: "会话验证失败，请刷新页面后重试。",
-          code: "SESSION_REQUIRED",
-        });
+      res.status(403).json({
+        ok: false,
+        error: "会话验证失败，请刷新页面后重试。",
+        code: "SESSION_REQUIRED",
+      });
       return;
     }
     next();
