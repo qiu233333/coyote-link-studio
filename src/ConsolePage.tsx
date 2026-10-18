@@ -56,7 +56,13 @@ import {
   requestId,
   timeLeft,
 } from "./api";
-import { playbackChannelsLimit, playbackConfigIssue } from "./playbackLimits";
+import {
+  playbackChannelsLimit,
+  playbackConfigIssue,
+  stageDraftIssue,
+} from "./playbackLimits";
+import { StageIntensityScale } from "./StageIntensityScale";
+import { useStageIntensityScaling } from "./stageIntensityScaling";
 import { useLiveChannels } from "./useLiveChannels";
 import {
   WaveMetadata,
@@ -1318,7 +1324,7 @@ export function StageEditor({
   const patch = (index: number, changes: Partial<Stage>) =>
     setStages(stages.map((s, i) => (i === index ? { ...s, ...changes } : s)));
   const move = (index: number, to: number) => {
-    if (to < 0 || to >= stages.length) return;
+    if (disabled || to < 0 || to >= stages.length) return;
     const next = [...stages];
     const [item] = next.splice(index, 1);
     next.splice(to, 0, item);
@@ -1584,8 +1590,13 @@ function SequenceEditor({
   const [durationSec, setDurationSec] = useState(600);
   const [presetName, setPresetName] = useState("");
   const [showSave, setShowSave] = useState(false);
+  const scaling = useStageIntensityScaling(stages, setStages);
   const config: PlaybackConfig = { mode, stages, repeat, shuffle, durationSec };
-  const issue = playbackConfigIssue(state, config);
+  const draftIssue =
+    mode === "stages"
+      ? scaling.inputIssue || stageDraftIssue(state, stages)
+      : null;
+  const issue = draftIssue || playbackConfigIssue(state, config);
   const presets = state.presets.filter((p) => p.config.mode === mode);
   const total = stages.reduce((sum, s) => sum + s.durationSec + s.gapSec, 0);
   return (
@@ -1609,13 +1620,16 @@ function SequenceEditor({
           </div>
           <button
             className="button secondary small"
-            disabled={disabled || !stages.length}
+            disabled={disabled || !stages.length || !!draftIssue}
             onClick={() => setShowSave(true)}
           >
             <Save size={15} />
             保存预设
           </button>
         </div>
+        {mode === "stages" && (
+          <StageIntensityScale scaling={scaling} disabled={disabled} />
+        )}
         <div className="stage-timeline">
           {stages.map((s, i) => (
             <div
@@ -1631,7 +1645,7 @@ function SequenceEditor({
         </div>
         <StageEditor
           stages={stages}
-          setStages={setStages}
+          setStages={mode === "stages" ? scaling.updateStages : setStages}
           waves={state.waveforms}
           disabled={disabled}
           mode={mode}
@@ -1697,12 +1711,12 @@ function SequenceEditor({
                   <button
                     disabled={disabled}
                     onClick={() => {
-                      setStages(
-                        structuredClone(p.config.stages).map((s) => ({
-                          ...s,
-                          id: crypto.randomUUID(),
-                        })),
+                      const loadedStages = structuredClone(p.config.stages).map(
+                        (s) => ({ ...s, id: crypto.randomUUID() }),
                       );
+                      if (mode === "stages")
+                        scaling.resetBaseline(loadedStages);
+                      else setStages(loadedStages);
                       setRepeat(p.config.repeat);
                       setShuffle(p.config.shuffle);
                       setDurationSec(p.config.durationSec);
@@ -1746,8 +1760,9 @@ function SequenceEditor({
           </Field>
           <button
             className="button primary full"
-            disabled={!presetName.trim() || disabled}
+            disabled={!presetName.trim() || disabled || !!draftIssue}
             onClick={async () => {
+              if (disabled || draftIssue) return;
               const result = await action(
                 "/api/presets",
                 { name: presetName.trim(), config },
@@ -1760,6 +1775,11 @@ function SequenceEditor({
             <Save size={16} />
             保存预设
           </button>
+          {draftIssue && (
+            <p className="playback-issue" role="status">
+              {draftIssue}
+            </p>
+          )}
         </Modal>
       )}
     </div>

@@ -47,6 +47,8 @@ import {
 } from "./ui";
 import { Monitor, StageEditor } from "./ConsolePage";
 import { controlBoundsIssue, taskPlanIssue } from "./playbackLimits";
+import { StageIntensityScale } from "./StageIntensityScale";
+import { useStageIntensityScaling } from "./stageIntensityScaling";
 
 type AiProps = { state: AppSnapshot; action: Action; pending: boolean };
 
@@ -332,16 +334,21 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
   const [plan, setPlan] = useState<TaskPlan | null>(null);
   const [review, setReview] = useState(false);
   const [step, setStep] = useState(0);
+  const scaling = useStageIntensityScaling(plan?.stages ?? [], (stages) =>
+    setPlan((current) => (current ? { ...current, stages } : current)),
+  );
   const blocked =
     state.locked || state.stopping || state.stopUnconfirmed || isActive(state);
   const editingDisabled = blocked || pending;
-  const planIssue = plan ? taskPlanIssue(state, plan) : null;
+  const planIssue =
+    scaling.inputIssue || (plan ? taskPlanIssue(state, plan) : null);
   const generate = async () => {
     const result = await action<TaskPlan>("/api/locked-tasks/draft", {
       prompt,
     });
     if (result?.id) {
       setPlan(result);
+      scaling.resetBaseline(result.stages);
       setStep(1);
     }
   };
@@ -587,9 +594,13 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
                   <div className="subsection-heading">
                     <h3>阶段安排</h3>
                   </div>
+                  <StageIntensityScale
+                    scaling={scaling}
+                    disabled={editingDisabled}
+                  />
                   <StageEditor
                     stages={plan.stages}
-                    setStages={(stages) => patchPlan({ stages })}
+                    setStages={scaling.updateStages}
                     waves={state.waveforms}
                     disabled={editingDisabled}
                     state={state}
@@ -603,7 +614,7 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
                   <div className="button-row wrap">
                     <button
                       className="button secondary"
-                      disabled={editingDisabled}
+                      disabled={editingDisabled || !!planIssue}
                       onClick={() =>
                         void action(
                           `/api/locked-tasks/${plan.id}`,
@@ -686,7 +697,9 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
                           <button
                             disabled={editingDisabled}
                             onClick={() => {
-                              setPlan(structuredClone(p));
+                              const loaded = structuredClone(p);
+                              setPlan(loaded);
+                              scaling.resetBaseline(loaded.stages);
                               setStep(1);
                             }}
                           >

@@ -4,6 +4,7 @@ import type {
   ChannelValues,
   ControlBounds,
   PlaybackConfig,
+  Stage,
   TaskPlan,
 } from "../shared/types";
 import { channelLimit } from "../shared/limits";
@@ -60,6 +61,48 @@ export function playbackChannelsLimit(
       reason = `${unavailable.join(" / ")} 通道强度上限为 0，请检查 APP 的上限设置与回传。`;
   }
   return { channels: selectedChannels, limits, reason };
+}
+
+// Saving an editable stage draft does not require a live/idle device. When a
+// device is connected, however, keep its independent channel ceilings visible
+// before saving. Inactive-channel values still obey the shared API format.
+export function stageDraftIssue(
+  state: AppSnapshot,
+  stages: Stage[],
+): string | null {
+  if (!stages.length) return "请添加播放条目或阶段。";
+  const waves = new Set(state.waveforms.map((wave) => wave.id));
+  for (const stage of stages) {
+    const formatIssue =
+      valuesFormatIssue(stage.intensity, `「${stage.name}」目标强度`) ||
+      valuesFormatIssue(stage.startIntensity, `「${stage.name}」起始强度`);
+    if (formatIssue) return formatIssue;
+    const selected = channels.filter((channel) =>
+      stage.channels.includes(channel),
+    );
+    if (!selected.length) return `「${stage.name}」请至少选择一个输出通道。`;
+    for (const channel of selected) {
+      if (!state.channels[channel].enabled)
+        return `「${stage.name}」${channel} 通道未启用，请启用或取消选择。`;
+    }
+    if (stage.behavior === "rest") continue;
+    if (
+      !waves.has(stage.waveformId) ||
+      (stage.waveformBId && !waves.has(stage.waveformBId))
+    )
+      return `「${stage.name}」请选择有效波形。`;
+    for (const channel of selected) {
+      const maximum = state.device.connected
+        ? channelLimit(state.channels, state.device.limits, channel)
+        : 200;
+      if (
+        Math.max(stage.intensity[channel], stage.startIntensity[channel]) >
+        maximum
+      )
+        return `「${stage.name}」${channel} 通道强度超过强度上限 ${maximum}，请调低倍率或阶段强度后保存。`;
+    }
+  }
+  return null;
 }
 
 // Keep editable plans intact when telemetry changes. The player and confirmation

@@ -7695,3 +7695,104 @@ button:disabled {
     min-height: 38px;
   }
 }
+
+.stage-intensity-scale {
+  min-width: 0;
+  margin: 18px 0;
+  padding: 16px;
+  border: 1px solid #dee5f3;
+  border-radius: 15px;
+  background: linear-gradient(125deg, #eff5ffad, #fff3fa85);
+}
+.stage-intensity-scale-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.stage-intensity-scale-reset {
+  flex-shrink: 0;
+  padding: 6px 10px;
+  border: 1px solid #dce5f4;
+  border-radius: 8px;
+  background: #ffffffa8;
+  color: #6e89b2;
+  font-size: 12px;
+}
+.stage-intensity-scale-help {
+  margin-top: 8px;
+  color: #8491a8;
+  font-size: 11px;
+  line-height: 1.8;
+}
+.stage-intensity-scale-channels {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+.stage-intensity-scale-channel {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid #d8e5f7;
+  border-radius: 11px;
+  background: #f8fbff9e;
+}
+.stage-intensity-scale-channel legend {
+  padding: 0 5px;
+  color: #6a8dbd;
+  font-size: 12px;
+  font-weight: 650;
+}
+.stage-intensity-scale-inputs {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 76px auto;
+  align-items: center;
+  gap: 9px;
+}
+.stage-intensity-scale-inputs input {
+  min-width: 0;
+}
+.stage-intensity-scale-inputs input[type="range"] {
+  height: 34px;
+}
+.stage-intensity-scale-inputs input[type="number"] {
+  padding: 8px;
+}
+.stage-intensity-scale-inputs span,
+.stage-intensity-scale-channel small {
+  color: #8a9ab4;
+  font-size: 11px;
+}
+.stage-intensity-scale-channel small {
+  display: block;
+  margin-top: 4px;
+}
+.stage-intensity-scale-b {
+  border-color: #eaddE9;
+  background: #fff8fc9e;
+}
+.stage-intensity-scale-b legend {
+  color: #b882a7;
+}
+.stage-intensity-scale-b input[type="range"] {
+  accent-color: var(--pink);
+}
+.stage-intensity-scale-channel:disabled {
+  opacity: 0.6;
+}
+.stage-intensity-scale-channel:disabled input {
+  cursor: not-allowed;
+}
+@media (max-width: 680px) {
+  .stage-intensity-scale {
+    padding: 12px;
+  }
+  .stage-intensity-scale-channels {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .stage-intensity-scale-inputs {
+    grid-template-columns: minmax(0, 1fr) 82px auto;
+    gap: 10px;
+  }
+}

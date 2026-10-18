@@ -14,6 +14,7 @@
     "typecheck": "tsc --noEmit",
     "verify:browser": "tsx scripts/verify-browser.ts",
     "verify:ai-interruptions": "tsx scripts/verify-ai-interruptions-browser.ts",
+    "verify:intensity-scaling": "tsx scripts/verify-intensity-scaling-browser.ts",
     "verify:limits": "tsx scripts/verify-limits-browser.ts",
     "verify:live": "tsx scripts/verify-limits-browser.ts"
   },

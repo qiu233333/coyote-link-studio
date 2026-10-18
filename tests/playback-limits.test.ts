@@ -11,6 +11,7 @@ import {
   effectiveChannelLimit,
   playbackChannelsLimit,
   playbackConfigIssue,
+  stageDraftIssue,
   controlBoundsIssue,
   taskPlanIssue,
 } from "../src/playbackLimits.js";
@@ -424,4 +425,122 @@ test("播放器明确说明失联、停止未确认、运行和锁定阻止启�
   assert.match(playbackConfigIssue(snapshot, playback())!, /先停止/);
   snapshot.locked = true;
   assert.match(playbackConfigIssue(snapshot, playback())!, /上锁任务/);
+});
+
+test("阶段保存按选中通道检查独立上限，越界保留比例与完整草稿", () => {
+  const snapshot = state();
+  const stages = playback().stages;
+  const stage = stages[0];
+  stage.behavior = "ramp";
+  stage.intensity = { A: 20, B: 19 };
+  stage.startIntensity = { A: 18, B: 17 };
+  assert.equal(stageDraftIssue(snapshot, stages), null);
+
+  stage.intensity.B = 20;
+  let before = structuredClone(stages);
+  assert.match(stageDraftIssue(snapshot, stages)!, /B 通道.*强度上限 19.*倍率/);
+  assert.deepEqual(stages, before);
+  stage.channels = ["A"];
+  stage.intensity.B = 200;
+  stage.startIntensity.B = 199;
+  assert.equal(stageDraftIssue(snapshot, stages), null);
+  stage.startIntensity.A = 21;
+  before = structuredClone(stages);
+  assert.match(stageDraftIssue(snapshot, stages)!, /A 通道.*强度上限 20/);
+  assert.deepEqual(stages, before);
+
+  stage.startIntensity.A = 20;
+  snapshot.synced = true;
+  assert.equal(stageDraftIssue(snapshot, stages), null);
+  snapshot.device.limits.B = 1;
+  assert.equal(stageDraftIssue(snapshot, stages), null);
+  snapshot.device.limits.A = 18;
+  assert.match(stageDraftIssue(snapshot, stages)!, /A 通道.*强度上限 18/);
+});
+
+test("阶段草稿离线可保存0–200，启动就绪状态不冒充保存校验", () => {
+  const snapshot = state();
+  const stages = playback().stages;
+  snapshot.device.connected = false;
+  stages[0].intensity = { A: 200, B: 200 };
+  stages[0].startIntensity = { A: 200, B: 200 };
+  assert.equal(stageDraftIssue(snapshot, stages), null);
+  snapshot.device.connected = true;
+  snapshot.device.limits = { A: 200, B: 200 };
+  snapshot.device.lastSeenAt = 0;
+  snapshot.stopping = true;
+  snapshot.stopUnconfirmed = true;
+  snapshot.locked = true;
+  assert.equal(stageDraftIssue(snapshot, stages), null);
+  // Editing restrictions and start readiness stay with their existing callers.
+  assert.match(
+    playbackConfigIssue(snapshot, { ...playback(), mode: "stages" })!,
+    /上锁任务/,
+  );
+});
+
+test("阶段保存检查所有存储强度格式，保留休息和未选通道约定", () => {
+  const snapshot = state();
+  const stages = playback(["A"]).stages;
+  stages[0].intensity.B = 200;
+  stages[0].startIntensity.B = 200;
+  assert.equal(stageDraftIssue(snapshot, stages), null);
+  for (const field of ["intensity", "startIntensity"] as const) {
+    for (const invalid of [
+      201,
+      -1,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+    ]) {
+      stages[0][field].B = invalid;
+      assert.match(
+        stageDraftIssue(snapshot, stages)!,
+        /B 通道强度须为 0–200 的整数/,
+      );
+    }
+    stages[0][field].B = 200;
+  }
+  stages[0].behavior = "rest";
+  stages[0].intensity = { A: 0, B: 0 };
+  stages[0].startIntensity = { A: 0, B: 0 };
+  stages[0].waveformId = "";
+  snapshot.device.limits.A = 0;
+  assert.equal(stageDraftIssue(snapshot, stages), null);
+  stages[0].channels = [];
+  assert.match(stageDraftIssue(snapshot, stages)!, /至少选择一个输出通道/);
+  stages[0].channels = ["A"];
+  snapshot.channels.A.enabled = false;
+  assert.match(stageDraftIssue(snapshot, stages)!, /A 通道未启用/);
+  assert.match(stageDraftIssue(snapshot, [])!, /添加/);
+});
+
+test("倍率生成的任务目标或起点越界仍拒绝，不扩大授权或改写草稿", () => {
+  const snapshot = state();
+  const plan: TaskPlan = {
+    id: "scaled-plan",
+    version: 1,
+    title: "fixture",
+    description: "fixture",
+    completionCriteria: "time",
+    createdAt: 0,
+    bounds: bounds(),
+    stages: playback().stages,
+  };
+  plan.bounds.maxIntensity = { A: 10, B: 12 };
+  plan.stages[0].behavior = "ramp";
+  plan.stages[0].intensity = { A: 10, B: 12 };
+  plan.stages[0].startIntensity = { A: 2, B: 4 };
+  assert.equal(taskPlanIssue(snapshot, plan), null);
+  for (const field of ["intensity", "startIntensity"] as const) {
+    plan.stages[0][field].B = 13;
+    const before = structuredClone(plan);
+    assert.match(taskPlanIssue(snapshot, plan)!, /B 通道.*授权范围 4–12/);
+    assert.deepEqual(plan, before);
+    plan.stages[0][field].B = field === "intensity" ? 12 : 4;
+  }
+  snapshot.device.limits.B = 11;
+  const before = structuredClone(plan);
+  assert.match(taskPlanIssue(snapshot, plan)!, /B 通道.*强度上限 11/);
+  assert.deepEqual(plan, before);
 });
