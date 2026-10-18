@@ -2,6 +2,11 @@ import { timingSafeEqual } from "node:crypto";
 import { defineChannel, GET, POST } from "eve/channels";
 import { z } from "zod";
 import type { AiProfile } from "../../shared/types.ts";
+import {
+  aiTimeoutSeconds,
+  aiTimeoutMessage,
+  AI_TIMEOUT_MAX_SEC,
+} from "../../shared/aiTimeouts.ts";
 import * as inference from "../lib/inference.ts";
 import { safeInferenceError } from "../lib/errors.ts";
 import { profileSchema } from "../lib/schemas.ts";
@@ -74,7 +79,7 @@ async function run(request: Request, operation: "test" | "decide" | "draft") {
     if (request.signal.aborted) abort();
     timer = setTimeout(
       () => controller.abort(new DOMException("Timed out", "TimeoutError")),
-      profile.timeoutSec * 1000,
+      aiTimeoutSeconds(profile, operation) * 1000,
     );
     const data =
       operation === "test"
@@ -104,7 +109,17 @@ async function run(request: Request, operation: "test" | "decide" | "draft") {
     const cause = current?.controller.signal.aborted
       ? current.controller.signal.reason
       : error;
-    return json({ ok: false, ...safeInferenceError(cause) }, 502);
+    const classified = safeInferenceError(cause);
+    if (
+      profile &&
+      current?.controller.signal.aborted &&
+      classified.errorCode === "AI_TIMEOUT"
+    )
+      classified.error = aiTimeoutMessage(
+        operation,
+        aiTimeoutSeconds(profile, operation),
+      );
+    return json({ ok: false, ...classified }, 502);
   } finally {
     if (timer) clearTimeout(timer);
     if (abort) request.signal.removeEventListener("abort", abort);
@@ -114,7 +129,7 @@ async function run(request: Request, operation: "test" | "decide" | "draft") {
     settle?.();
     const now = Date.now();
     for (const [id, time] of cancelled)
-      if (now - time > 180000) cancelled.delete(id);
+      if (now - time > (AI_TIMEOUT_MAX_SEC + 60) * 1000) cancelled.delete(id);
     profile = undefined;
   }
 }

@@ -18,6 +18,11 @@ import {
 import type { AppSnapshot } from "../shared/types";
 import { isActive, type Action } from "./api";
 import { Badge, Card, Field, LoadingButton, NumberInput } from "./ui";
+import {
+  AI_TIMEOUT_MIN_SEC,
+  AI_TIMEOUT_MAX_SEC,
+  aiTimeoutSeconds,
+} from "../shared/aiTimeouts";
 
 export default function SettingsPage({
   state,
@@ -45,6 +50,7 @@ export default function SettingsPage({
       state.settings.model,
       state.settings.contextWindow,
       state.settings.timeoutSec,
+      state.settings.draftTimeoutSec,
       state.settings.apiKeySet,
     ],
   );
@@ -56,6 +62,7 @@ export default function SettingsPage({
         model: form.model.trim(),
         contextWindow: form.contextWindow,
         timeoutSec: form.timeoutSec,
+        draftTimeoutSec: aiTimeoutSeconds(form, "draft"),
         ...(form.apiKey.trim() ? { apiKey: form.apiKey.trim() } : {}),
       },
       "PUT",
@@ -218,13 +225,30 @@ export default function SettingsPage({
                     }
                   />
                 </Field>
-                <Field label="请求超时 / 秒">
+                <Field
+                  label="决策与测试超时 / 秒"
+                  hint="模型响应较慢时可提高等待时间；不会延长任务截止时间。"
+                >
                   <NumberInput
                     label="AI 请求超时"
                     value={form.timeoutSec}
-                    min={5}
-                    max={120}
+                    min={AI_TIMEOUT_MIN_SEC}
+                    max={AI_TIMEOUT_MAX_SEC}
                     onChange={(timeoutSec) => setForm({ ...form, timeoutSec })}
+                  />
+                </Field>
+                <Field
+                  label="任务草稿超时 / 秒"
+                  hint="草稿包含多阶段方案，默认等待 180 秒，可单独调整。"
+                >
+                  <NumberInput
+                    label="AI 任务草稿超时"
+                    value={aiTimeoutSeconds(form, "draft")}
+                    min={AI_TIMEOUT_MIN_SEC}
+                    max={AI_TIMEOUT_MAX_SEC}
+                    onChange={(draftTimeoutSec) =>
+                      setForm({ ...form, draftTimeoutSec })
+                    }
                   />
                 </Field>
               </div>
@@ -247,6 +271,7 @@ export default function SettingsPage({
                         model: form.model.trim(),
                         contextWindow: form.contextWindow,
                         timeoutSec: form.timeoutSec,
+                        draftTimeoutSec: aiTimeoutSeconds(form, "draft"),
                         apiKey: "",
                       },
                       "PUT",

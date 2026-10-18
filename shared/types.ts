@@ -196,6 +196,7 @@ export interface AiSettings {
   apiKeySet: boolean;
   contextWindow: number;
   timeoutSec: number;
+  draftTimeoutSec?: number;
 }
 export interface AiProfile extends AiSettings {
   apiKey: string;

@@ -58,7 +58,8 @@ test("HTTP 本机同源保护、密钥加密、WebSocket 和实际模拟器控�
             model: "local-fixture",
             apiKey: secret,
             contextWindow: 32000,
-            timeoutSec: 10,
+            timeoutSec: 600,
+            draftTimeoutSec: 240,
           },
           "PUT",
         )
@@ -67,6 +68,16 @@ test("HTTP 本机同源保护、密钥加密、WebSocket 和实际模拟器控�
     );
     const snapshotText = await (await fetch(url + "/api/state")).text();
     assert.ok(!snapshotText.includes(secret));
+    const configured = JSON.parse(snapshotText).data.settings;
+    assert.equal(configured.timeoutSec, 600);
+    assert.equal(configured.draftTimeoutSec, 240);
+    for (const key of ["timeoutSec", "draftTimeoutSec"])
+      assert.equal(
+        (await call("/api/settings", { [key]: 601 }, "PUT")).status,
+        400,
+      );
+    assert.equal(app.store.settings().timeoutSec, 600);
+    assert.equal(app.store.settings().draftTimeoutSec, 240);
     assert.equal(app.store.profile().apiKey, secret);
     const saved = app.store.get<{ secret: string }>("settings", "ai")!;
     assert.ok(saved.secret && !saved.secret.includes(secret));

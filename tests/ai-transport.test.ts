@@ -208,9 +208,56 @@ test("受控时钟触发本地超时，与用户取消和worker退出严格区�
     service.decide(profile, {}),
     category("AI_TIMEOUT", true),
   );
-  context.mock.timers.tick(3000);
+  context.mock.timers.tick(7000);
   await failure;
   assert.equal(service.status.ready, true);
+});
+
+test("草稿等待采用独立预算，超过旧30秒也不会被短决策限时取消", async (context) => {
+  const { service, internal } = fixture();
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const result = deferred<Response>();
+  let cancelled = false;
+  intercept(context, (_url, init) => {
+    init.signal!.addEventListener("abort", () => {
+      cancelled = true;
+    });
+    return result.promise;
+  });
+  const request = service.draft(
+    { ...profile, draftTimeoutSec: 120 },
+    "fixture",
+    {},
+  );
+  context.mock.timers.tick(31000);
+  assert.equal(cancelled, false);
+  assert.equal(internal.requests.size, 1);
+  result.resolve(json({ ok: true, data: { fixture: true } }));
+  assert.deepEqual(await request, { fixture: true });
+  assert.equal(internal.requests.size, 0);
+});
+
+test("配置超过180秒时传输层不会隐式截短，并保留取消能力", async (context) => {
+  const { service } = fixture();
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let cancelled = false;
+  intercept(context, (url, init) => {
+    if (url.endsWith("/cancel")) return json({ ok: true });
+    init.signal!.addEventListener("abort", () => {
+      cancelled = true;
+    });
+    return aborted(init);
+  });
+  const caller = new AbortController();
+  const rejected = assert.rejects(
+    service.decide({ ...profile, timeoutSec: 240 }, {}, caller.signal),
+    category("AI_CANCELLED", false),
+  );
+  context.mock.timers.tick(181000);
+  assert.equal(cancelled, false);
+  caller.abort();
+  await rejected;
+  assert.equal(cancelled, true);
 });
 
 test("worker退出立即取消请求，无需等待三次健康检查", async (context) => {

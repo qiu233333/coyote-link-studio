@@ -239,7 +239,10 @@ async function capture(page: Page, name: string) {
     name: "关闭提示",
     exact: true,
   });
-  if (await closeToast.count()) await closeToast.click();
+  // Cosmetic screenshot cleanup must not race the toast's automatic dismissal.
+  await closeToast.evaluateAll((buttons) => {
+    for (const button of buttons) (button as HTMLButtonElement).click();
+  });
   await page.evaluate(() => window.scrollTo({ top: 0, behavior: "instant" }));
   const path = resolve(artifacts, name);
   await page.screenshot({ path, fullPage: true, animations: "disabled" });
@@ -332,6 +335,14 @@ try {
   await page
     .getByRole("textbox", { name: "AI 模型名称" })
     .fill("browser-local-fixture");
+  const decisionTimeout = page.getByLabel("AI 请求超时", { exact: true });
+  const draftTimeout = page.getByLabel("AI 任务草稿超时", { exact: true });
+  assert.equal(await decisionTimeout.inputValue(), "120");
+  assert.equal(await draftTimeout.inputValue(), "180");
+  assert.equal(await decisionTimeout.getAttribute("max"), "600");
+  assert.equal(await draftTimeout.getAttribute("max"), "600");
+  await decisionTimeout.fill("240");
+  await draftTimeout.fill("300");
   await page
     .getByRole("button", { name: "保存并测试连接", exact: true })
     .click();
@@ -340,6 +351,8 @@ try {
     .waitFor();
   const configured = await snapshot(page);
   assert.equal(configured.settings.apiKeySet, true);
+  assert.equal(configured.settings.timeoutSec, 240);
+  assert.equal(configured.settings.draftTimeoutSec, 300);
   assert.ok(!JSON.stringify(configured).includes(fixtureKey));
   await page.getByLabel("AI API Key", { exact: true }).fill("");
   assert.ok(

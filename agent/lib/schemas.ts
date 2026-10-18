@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { AI_TIMEOUT_MAX_SEC } from "../../shared/aiTimeouts.ts";
 import type {
   AiDecision,
   Channel,
@@ -16,7 +17,8 @@ export const profileSchema = z.object({
   apiKey: z.string().max(16384),
   apiKeySet: z.boolean().optional(),
   contextWindow: z.number().int().min(1024).max(2_000_000),
-  timeoutSec: z.number().min(2).max(180),
+  timeoutSec: z.number().min(2).max(AI_TIMEOUT_MAX_SEC),
+  draftTimeoutSec: z.number().min(2).max(AI_TIMEOUT_MAX_SEC).optional(),
 });
 
 const channels = ["A", "B"] as const;

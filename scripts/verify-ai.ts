@@ -72,6 +72,8 @@ export async function verifyAiRuntime(): Promise<void> {
       });
       await new Promise((resolve) => setTimeout(resolve, 1500));
     }
+    if (body.model === "slow-draft-fixture")
+      await new Promise((resolve) => setTimeout(resolve, 2500));
     const name = body.tools?.[0]?.function?.name;
     const messages = JSON.stringify(body.messages);
     if (name === "submit_decision") {
@@ -234,6 +236,34 @@ export async function verifyAiRuntime(): Promise<void> {
       await assert.rejects(service.decide({ ...profile, model }, context));
     const draft = await service.draft(profile, "生成一个平稳的任务", context);
     assert.equal(draft.title, plan.title);
+    const slowDraft = await service.draft(
+      {
+        ...profile,
+        model: "slow-draft-fixture",
+        timeoutSec: 2,
+        draftTimeoutSec: 5,
+      },
+      "生成一个平稳的任务",
+      context,
+    );
+    assert.equal(slowDraft.title, plan.title, "草稿不使用较短的控制决策预算");
+    await assert.rejects(
+      service.draft(
+        {
+          ...profile,
+          model: "slow-draft-fixture",
+          timeoutSec: 5,
+          draftTimeoutSec: 2,
+        },
+        "生成一个平稳的任务",
+        context,
+      ),
+      (error: unknown) => {
+        assert.equal((error as { code: string }).code, "AI_TIMEOUT");
+        assert.match(String(error), /任务草稿生成超时：2 秒/);
+        return true;
+      },
+    );
     await assert.rejects(
       service.decide({ ...profile, model: "bad-fixture" }, context),
     );
@@ -257,7 +287,7 @@ export async function verifyAiRuntime(): Promise<void> {
     ]);
     assert.ok(calls >= 9);
     console.log(
-      "PASS eve 独立进程：实际聊天、A/B 独立工具与草稿、两路范围拒绝、凭证脱敏、内部鉴权与取消。",
+      "PASS eve 独立进程：实际聊天、A/B 工具与草稿、独立草稿限时与慢响应、两路范围拒绝、凭证脱敏、内部鉴权与取消。",
     );
   } finally {
     await service.stop();

@@ -7,6 +7,12 @@ import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AiDecision, AiProfile, TaskPlan } from "../shared/types.ts";
+import {
+  aiTimeoutSeconds,
+  aiTimeoutMessage,
+  AI_TRANSPORT_GRACE_MS,
+  type AiOperation,
+} from "../shared/aiTimeouts.js";
 
 type AiStatus = { ready: boolean; error?: string; errorCode?: string };
 type TestResult = { chat: boolean; tools: boolean; message: string };
@@ -356,7 +362,7 @@ export class AiService extends EventEmitter {
   }
 
   private async invoke<T>(
-    operation: string,
+    operation: AiOperation,
     profile: AiProfile,
     payload: Record<string, unknown>,
     signal?: AbortSignal,
@@ -402,12 +408,18 @@ export class AiService extends EventEmitter {
     };
     signal?.addEventListener("abort", cancel, { once: true });
     if (signal?.aborted) cancel();
+    const timeoutSec = aiTimeoutSeconds(profile, operation);
     const timeout = setTimeout(
       () => {
-        controller.abort(new AiServiceError("AI_TIMEOUT", "AI 请求超时。"));
+        controller.abort(
+          new AiServiceError(
+            "AI_TIMEOUT",
+            aiTimeoutMessage(operation, timeoutSec),
+          ),
+        );
         void cancelRemote();
       },
-      Math.max(2, Math.min(180, profile.timeoutSec)) * 1000 + 1000,
+      timeoutSec * 1000 + AI_TRANSPORT_GRACE_MS,
     );
     try {
       const response = await fetch(`${endpoint}/internal/${operation}`, {

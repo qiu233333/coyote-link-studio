@@ -3,6 +3,12 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
 import type { AiProfile, AiSettings } from "../shared/types.js";
+import {
+  AI_TIMEOUT_DEFAULT_SEC,
+  AI_DRAFT_TIMEOUT_DEFAULT_SEC,
+  AI_TIMEOUT_MIN_SEC,
+  AI_TIMEOUT_MAX_SEC,
+} from "../shared/aiTimeouts.js";
 import { assert } from "./errors.js";
 
 export class Store {
@@ -79,7 +85,13 @@ export class Store {
       baseUrl: saved?.baseUrl ?? "",
       model: saved?.model ?? "",
       contextWindow: saved?.contextWindow ?? 32000,
-      timeoutSec: saved?.timeoutSec ?? 30,
+      timeoutSec: saved?.timeoutSec ?? AI_TIMEOUT_DEFAULT_SEC,
+      draftTimeoutSec:
+        saved?.draftTimeoutSec ??
+        Math.max(
+          saved?.timeoutSec ?? AI_TIMEOUT_DEFAULT_SEC,
+          AI_DRAFT_TIMEOUT_DEFAULT_SEC,
+        ),
       apiKeySet: Boolean(saved?.secret),
       apiKey: saved?.secret ? this.unseal(saved.secret) : "",
     };
@@ -110,7 +122,10 @@ export class Store {
     const model = String(input.model ?? previous.model).trim();
     assert(model.length > 0 && model.length <= 200, "请填写模型名称。");
     const contextWindow = Number(input.contextWindow ?? previous.contextWindow),
-      timeoutSec = Number(input.timeoutSec ?? previous.timeoutSec);
+      timeoutSec = Number(input.timeoutSec ?? previous.timeoutSec),
+      draftTimeoutSec = Number(
+        input.draftTimeoutSec ?? previous.draftTimeoutSec,
+      );
     assert(
       Number.isInteger(contextWindow) &&
         contextWindow >= 1024 &&
@@ -118,8 +133,16 @@ export class Store {
       "上下文窗口须在 1024 到 2000000 之间。",
     );
     assert(
-      Number.isFinite(timeoutSec) && timeoutSec >= 5 && timeoutSec <= 120,
-      "超时须为 5 到 120 秒。",
+      Number.isFinite(timeoutSec) &&
+        timeoutSec >= AI_TIMEOUT_MIN_SEC &&
+        timeoutSec <= AI_TIMEOUT_MAX_SEC,
+      `超时须为 ${AI_TIMEOUT_MIN_SEC} 到 ${AI_TIMEOUT_MAX_SEC} 秒。`,
+    );
+    assert(
+      Number.isFinite(draftTimeoutSec) &&
+        draftTimeoutSec >= AI_TIMEOUT_MIN_SEC &&
+        draftTimeoutSec <= AI_TIMEOUT_MAX_SEC,
+      `任务草稿超时须为 ${AI_TIMEOUT_MIN_SEC} 到 ${AI_TIMEOUT_MAX_SEC} 秒。`,
     );
     const apiKey =
       typeof input.apiKey === "string" ? input.apiKey.trim() : previous.apiKey;
@@ -129,6 +152,7 @@ export class Store {
       model,
       contextWindow,
       timeoutSec,
+      draftTimeoutSec,
       secret: apiKey ? this.seal(apiKey) : undefined,
     });
   }
