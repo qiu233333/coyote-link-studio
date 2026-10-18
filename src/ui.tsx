@@ -179,8 +179,8 @@ export function Avatar({
         <Sparkles />
       ) : (
         <img
-          src="/assistant.png"
-          alt="星涟，蓝粉发色的二次元助手"
+          src="/assistant-avatar.jpg"
+          alt="星涟，银白发红眼、佩戴黑色蝴蝶结的二次元助手"
           onError={() => setMissing(true)}
         />
       )}

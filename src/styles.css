@@ -371,14 +371,12 @@ select:disabled {
 .sidebar-companion .assistant-avatar {
   margin: 0 auto -4px;
   width: 154px;
-  height: 155px;
+  height: 154px;
   background: none;
   border: none;
   box-shadow: none;
 }
 .sidebar-companion .assistant-avatar img {
-  object-fit: contain;
-  object-position: center bottom;
   filter: drop-shadow(0 7px 6px #a6badc15);
 }
 .sidebar-companion .badge {
@@ -976,6 +974,7 @@ main {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  object-position: center;
 }
 .assistant-avatar.avatar-small {
   width: 32px;
@@ -2236,17 +2235,14 @@ main {
   min-height: 158px;
 }
 .ai-intro > .assistant-avatar {
-  border-radius: 0;
   height: 143px;
   width: 143px;
   background: none;
   border: 0;
-  align-self: flex-end;
-  margin: -5px 0 -18px -8px;
+  align-self: center;
+  margin: 0;
 }
 .ai-intro > .assistant-avatar img {
-  object-fit: contain;
-  object-position: center bottom;
   filter: drop-shadow(0 3px 8px #afc0de30);
 }
 .ai-intro > div:nth-child(2) {
@@ -3419,7 +3415,7 @@ main {
     padding-top: 10px;
   }
   .sidebar-companion .assistant-avatar {
-    height: 185px;
+    height: 165px;
     width: 165px;
   }
   .main-nav > button.active:before {
@@ -3523,7 +3519,7 @@ main {
   }
   .sidebar-companion .assistant-avatar {
     width: 140px;
-    height: 135px;
+    height: 140px;
   }
   .sidebar-companion .badge {
     font-size: 6px;
@@ -4193,9 +4189,8 @@ main {
     gap: 15px;
   }
   .ai-intro > .assistant-avatar {
-    height: 125px;
+    height: 110px;
     width: 110px;
-    margin-left: -10px;
   }
   .ai-intro h2 {
     font-size: 15px;
@@ -4701,7 +4696,7 @@ main {
     gap: 16px;
   }
   .ai-intro > .assistant-avatar {
-    height: 135px;
+    height: 120px;
     width: 120px;
   }
   .ai-intro h2 {
@@ -5585,10 +5580,8 @@ main {
     min-height: 131px;
   }
   .ai-intro > .assistant-avatar {
-    height: 125px;
+    height: 95px;
     width: 95px;
-    margin-left: -10px;
-    margin-bottom: -17px;
   }
   .ai-intro .badge {
     font-size: 5px;

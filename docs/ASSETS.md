@@ -1,10 +1,8 @@
-# 原创助手头像
+# 助手头像素材
 
-- 文件：`public/assistant.png`
-- 工具：内置 ImageGen（非 CLI），2026-10-18 生成。
-- 用途：侧栏、AI 消息和空状态中的原创成年二次元助手。
-- 原始输出保持不变，仅复制到项目。
-
-最终生成提示词：
-
-> Create one original anime-style assistant avatar illustration for a Chinese local device-control dashboard called 星涟. A friendly adult anime woman, clearly age 25, head and shoulders portrait, long soft icy blue hair with a subtle pastel pink strand, blue eyes, small star hair clip, modern white high-collar tech jacket with soft blue and pink accents, warm gentle confident smile. Elegant clean Japanese anime illustration, polished delicate linework, pale blue/pink palette, soft lighting, simple very pale blue circle backdrop, square composition with generous crop space around the head, no text, no letters, no logos, no watermark, no sexualization, no extra subjects. This is a small sidebar and chat avatar asset, face readability at 64 pixels is essential.
+- 文件：`public/assistant-avatar.jpg`（1080 × 1080）。
+- 来源：用户提供的图二素材，用户授权用于本项目，2026-10-18 替换。
+- 内容：银白发、红眼、黑色蝴蝶结的二次元头像。
+- 用途：通过统一 `Avatar` 组件用于侧栏、AI 介绍、任务问候、助手消息和聊天空状态。
+- 原图直接复制使用，未重绘、未生成新图、未修改图像内容；圆形裁切由现有页面样式完成。
+- 使用新的文件名，避免浏览器继续沿用旧头像路径的缓存。

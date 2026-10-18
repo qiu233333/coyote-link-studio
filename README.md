@@ -98,7 +98,7 @@ pnpm verify:live
 
 测试包括模拟设备、V3/V4 模拟中继、锁定与急停、竞态、超时和真正的 eve 子进程 + 本地 OpenAI 兼容接口桩。接口桩不使用真实密钥或真实设备。测试通过不等同于实机验收。
 
-实施验证记录见 [docs/VERIFICATION.md](docs/VERIFICATION.md)，头像生成说明见 [docs/ASSETS.md](docs/ASSETS.md)。
+实施验证记录见 [docs/VERIFICATION.md](docs/VERIFICATION.md)，头像素材说明见 [docs/ASSETS.md](docs/ASSETS.md)。
 
 ## 主要目录
 
