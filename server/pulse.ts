@@ -1,4 +1,5 @@
 import { assert } from "./errors.js";
+import type { PulseImportMetadata } from "../shared/types.js";
 import {
   MAX_WAVEFORM_FILE_BYTES,
   MAX_WAVEFORM_FRAMES,
@@ -71,12 +72,25 @@ function integer(text: string, maximum: number, label: string) {
   return value;
 }
 
-function encodePeriod(period: number) {
-  return period <= 100
-    ? period
-    : period <= 600
-      ? Math.floor((period - 100) / 5) + 100
-      : Math.floor((period - 600) / 10) + 200;
+function encodePeriod(numerator: number, denominator = 1) {
+  // Keep interpolated periods rational until V3 quantization. Floating-point
+  // interpolation can otherwise round an exact byte boundary down by one.
+  return numerator <= 100 * denominator
+    ? Math.floor(numerator / denominator)
+    : numerator <= 600 * denominator
+      ? Math.floor((numerator - 100 * denominator) / (5 * denominator)) + 100
+      : Math.floor((numerator - 600 * denominator) / (10 * denominator)) + 200;
+}
+
+function interpolateFrequency(
+  start: number,
+  end: number,
+  index: number,
+  length: number,
+) {
+  if (length <= 1 || start === end) return encodePeriod(start);
+  const denominator = length - 1;
+  return encodePeriod(start * (denominator - index) + end * index, denominator);
 }
 
 export function parsePulse(input: unknown) {
@@ -160,17 +174,15 @@ export function parsePulse(input: unknown) {
       // normalize peaks, multiply by channel intensity or interpolate anchors.
       return Math.floor(amplitude);
     });
-    assert(
-      !enabled || mode === 1 || start === end,
-      `.pulse ${label}使用频率渐变模式 ${mode}，其 APP 插值规则尚未确认。当前支持固定频率（或 A/B 频率相同）；请导出已展开的 V3 JSON，不能自动近似转换。`,
-      "UNSUPPORTED_PULSE_MODE",
-    );
     const repeats = Math.ceil(durations[duration] / amplitudes.length);
     return {
       enabled,
       amplitudes,
       count: repeats * amplitudes.length,
-      frequency: encodePeriod(periods[start]),
+      repeats,
+      mode,
+      startPeriod: periods[start],
+      endPeriod: periods[end],
     };
   });
   invalid(
@@ -189,11 +201,7 @@ export function parsePulse(input: unknown) {
     "WAVEFORM_TOO_LARGE",
     413,
   );
-  assert(
-    ticks % 4 === 0,
-    `.pulse 的完整周期为 ${ticks * 25}ms，无法用当前 100ms 帧无损表示。请在 APP 中调整点数或倍率，使总周期为 100ms 的整数倍，或导出已展开的 V3 JSON。`,
-    "UNSUPPORTED_PULSE_TIMING",
-  );
+  const paddingTicks = (4 - (ticks % 4)) % 4;
 
   const frames: string[] = [];
   let frequencies: number[] = [],
@@ -213,16 +221,44 @@ export function parsePulse(input: unknown) {
   };
   for (const section of sections) {
     if (!section.enabled) continue;
-    for (let point = 0; point < section.count; point++)
+    for (let point = 0; point < section.count; point++) {
+      const motifPoint = point % section.amplitudes.length;
+      const repetition = Math.floor(point / section.amplitudes.length);
+      // Modes share the same interpolation and quantization; only the scope
+      // differs. A one-repetition mode 4 uses A without dividing by zero.
+      const frequency =
+        section.mode === 1
+          ? encodePeriod(section.startPeriod)
+          : interpolateFrequency(
+              section.startPeriod,
+              section.endPeriod,
+              section.mode === 2
+                ? point
+                : section.mode === 3
+                  ? motifPoint
+                  : repetition,
+              section.mode === 2
+                ? section.count
+                : section.mode === 3
+                  ? section.amplitudes.length
+                  : section.repeats,
+            );
       for (let i = 0; i < ticksPerPoint; i++)
-        tick(
-          section.frequency,
-          section.amplitudes[point % section.amplitudes.length],
-        );
+        tick(frequency, section.amplitudes[motifPoint]);
+    }
   }
   for (let i = 0; i < rest * 4; i++) tick(10, 0);
+  // Complete only the final frame, after all sections and the original rest.
+  // Zero waveform amplitude is independent of the device channel strength.
+  for (let i = 0; i < paddingTicks; i++) tick(10, 0);
+  const pulseImport: PulseImportMetadata = {
+    sourceDurationMs: ticks * 25,
+    paddingMs: paddingTicks * 25,
+    frequencyInterpolation: "period-ms-linear",
+  };
   return {
     frames,
-    importNote: `APP 3.4.4 文本：已导入频率、相对幅度与节奏。APP 附加参数 ${appParameter} 未应用；设备设置沿用当前值。`,
+    pulseImport,
+    importNote: `APP 3.4.4 文本：频率渐变按毫秒周期线性转换（多点含起止端点）。${paddingTicks ? `末尾已补 ${pulseImport.paddingMs}ms 零幅度静音，每次循环均包含此停顿。` : ""}APP 附加参数 ${appParameter} 未应用；设备设置沿用当前值。`,
   };
 }

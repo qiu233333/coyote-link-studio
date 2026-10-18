@@ -387,7 +387,10 @@ export class Controller extends EventEmitter {
     );
     const parsed = format === "pulse" ? parsePulse(input) : undefined;
     const wave = normalizeWaveform(parsed ?? input, name);
-    if (parsed) wave.importNote = parsed.importNote;
+    if (parsed) {
+      wave.importNote = parsed.importNote;
+      wave.pulseImport = parsed.pulseImport;
+    }
     assert(
       !this.waves().some((w) => w.hash === wave.hash),
       "该波形已存在，已跳过重复导入。",

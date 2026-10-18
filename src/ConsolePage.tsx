@@ -1134,7 +1134,7 @@ function WaveLibrary({
       </div>
       <p className="small-text muted">
         支持 JSON 与 APP 3.4.4 文本
-        .pulse（固定频率）。仅导入频率、相对幅度和节奏，APP
+        .pulse，包含频率渐变。非整帧周期末尾补零幅度静音，预览显示实际时长。APP
         附加参数不修改设备设置。
       </p>
       {localError && <p className="error-inline">{localError}</p>}
@@ -1247,7 +1247,7 @@ function WaveLibrary({
         <div>
           <strong>把喜欢的波形放进来</strong>
           <p>
-            支持 JSON 与固定频率 .pulse · 每次拖入一个文件，最多 5 MB ·
+            支持 JSON 与 .pulse（含频率渐变） · 每次拖入一个文件，最多 5 MB ·
             导入前自动校验
           </p>
         </div>
@@ -1265,9 +1265,23 @@ function WaveLibrary({
               <strong>{preview.frames.length}</strong>
             </div>
             <div>
-              <span>原始时长</span>
+              <span>{preview.pulseImport ? "实际时长" : "原始时长"}</span>
               <strong>{(preview.durationMs / 1000).toFixed(1)}s</strong>
             </div>
+            {preview.pulseImport && (
+              <>
+                <div>
+                  <span>源文件时长</span>
+                  <strong>
+                    {(preview.pulseImport.sourceDurationMs / 1000).toFixed(3)}s
+                  </strong>
+                </div>
+                <div>
+                  <span>末尾补静音</span>
+                  <strong>{preview.pulseImport.paddingMs}ms</strong>
+                </div>
+              </>
+            )}
           </div>
           <p className="field-hint">
             曲线展示波形相对幅度。实际输出同时受通道强度与设备上限影响。

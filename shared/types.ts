@@ -39,6 +39,11 @@ export interface DeviceDriver {
   stop(): Promise<boolean>;
   on(event: "state", listener: (state: DeviceState) => void): unknown;
 }
+export interface PulseImportMetadata {
+  sourceDurationMs: number;
+  paddingMs: number;
+  frequencyInterpolation: "period-ms-linear";
+}
 export interface Waveform {
   id: string;
   name: string;
@@ -49,6 +54,7 @@ export interface Waveform {
   lastUsedAt: number;
   durationMs: number;
   importNote?: string;
+  pulseImport?: PulseImportMetadata;
 }
 export interface ChannelConfig {
   enabled: boolean;

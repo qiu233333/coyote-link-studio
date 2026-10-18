@@ -29,7 +29,16 @@ let browser: Browser | undefined, page: Page | undefined;
 let baseUrl = "";
 
 type Fixture = { name: string; buffer: Buffer; mimeType: string };
-type ExpectedWave = { name: string; frames: string[]; durationMs: number };
+type ExpectedWave = {
+  name: string;
+  frames: string[];
+  durationMs: number;
+  pulseImport?: {
+    sourceDurationMs: number;
+    paddingMs: number;
+    frequencyInterpolation: "period-ms-linear";
+  };
+};
 
 async function until(
   label: string,
@@ -147,17 +156,32 @@ async function idle(writeCount: number) {
   assert.equal(outputWrites.length, writeCount, "导入和预览不得发送设备命令");
 }
 
-async function imported(expected: ExpectedWave) {
+async function imported(
+  expected:
+    ExpectedWave | (Omit<ExpectedWave, "frames"> & { frameCount: number }),
+) {
   const state = await waitState(`导入 ${expected.name}`, (state) =>
     state.waveforms.some((wave) => wave.name === expected.name),
   );
   const wave = state.waveforms.find((wave) => wave.name === expected.name)!;
-  assert.deepEqual(
-    wave.frames,
-    expected.frames,
-    "转换后的 V3 帧、节奏和相对幅度必须准确",
-  );
+  if ("frames" in expected)
+    assert.deepEqual(
+      wave.frames,
+      expected.frames,
+      "转换后的 V3 帧、节奏和相对幅度必须准确",
+    );
+  const frameCount =
+    "frames" in expected ? expected.frames.length : expected.frameCount;
+  assert.equal(wave.frames.length, frameCount);
   assert.equal(wave.durationMs, expected.durationMs);
+  if (expected.pulseImport)
+    assert.deepEqual(wave.pulseImport, expected.pulseImport);
+  else if (wave.pulseImport)
+    assert.deepEqual(wave.pulseImport, {
+      sourceDurationMs: expected.durationMs,
+      paddingMs: 0,
+      frequencyInterpolation: "period-ms-linear",
+    });
   assert.equal(wave.builtin, false);
   assert.ok(application);
   assert.deepEqual(
@@ -169,9 +193,7 @@ async function imported(expected: ExpectedWave) {
   const tile = page.locator(".wave-tile").filter({
     has: page.getByRole("heading", { name: expected.name, exact: true }),
   });
-  await tile
-    .getByText(`${expected.frames.length} 帧`, { exact: true })
-    .waitFor();
+  await tile.getByText(`${frameCount} 帧`, { exact: true }).waitFor();
   await tile
     .getByText(`${(expected.durationMs / 1000).toFixed(1)} 秒`, { exact: true })
     .waitFor();
@@ -186,16 +208,32 @@ async function imported(expected: ExpectedWave) {
   const metadata = dialog.locator(".review-grid > div");
   assert.equal(
     await metadata.filter({ hasText: "帧数" }).locator("strong").innerText(),
-    String(expected.frames.length),
+    String(frameCount),
   );
   assert.equal(
     await metadata
-      .filter({ hasText: "原始时长" })
+      .filter({ hasText: wave.pulseImport ? "实际时长" : "原始时长" })
       .locator("strong")
       .innerText(),
     `${(expected.durationMs / 1000).toFixed(1)}s`,
   );
-  for (const frame of expected.frames.slice(0, 8))
+  if (wave.pulseImport) {
+    assert.equal(
+      await metadata
+        .filter({ hasText: "源文件时长" })
+        .locator("strong")
+        .innerText(),
+      `${(wave.pulseImport.sourceDurationMs / 1000).toFixed(3)}s`,
+    );
+    assert.equal(
+      await metadata
+        .filter({ hasText: "末尾补静音" })
+        .locator("strong")
+        .innerText(),
+      `${wave.pulseImport.paddingMs}ms`,
+    );
+  }
+  for (const frame of wave.frames.slice(0, 8))
     await dialog.locator("code").filter({ hasText: frame }).first().waitFor();
   if (wave.importNote)
     await dialog.getByText(wave.importNote, { exact: true }).waitFor();
@@ -464,36 +502,195 @@ try {
 
   expectedRejections.add("400 /api/waveforms/import");
   expectedRejections.add("413 /api/waveforms/import");
+  // The expectations below are handwritten byte sequences. They deliberately
+  // do not call the production parser/encoder to calculate their oracle.
+  // Two edit points repeated twice give four endpoint-inclusive periods:
+  // mode 2: 10,12,14,16; mode 3: 10,16,10,16; mode 4: 10,10,16,16 ms.
+  const conversions: Array<{ text: string; expected: ExpectedWave }> = [
+    {
+      text: "Dungeonlab+pulse:0,1,8=0,6,3,2,1/20-1,40-1",
+      expected: {
+        name: "节内频率渐变",
+        frames: [
+          "0A0A0A0A14141414",
+          "0C0C0C0C28282828",
+          "0E0E0E0E14141414",
+          "1010101028282828",
+        ],
+        durationMs: 400,
+      },
+    },
+    {
+      text: "Dungeonlab+pulse:0,1,8=0,6,3,3,1/20-1,40-1",
+      expected: {
+        name: "元内频率渐变",
+        frames: [
+          "0A0A0A0A14141414",
+          "1010101028282828",
+          "0A0A0A0A14141414",
+          "1010101028282828",
+        ],
+        durationMs: 400,
+      },
+    },
+    {
+      text: "Dungeonlab+pulse:0,1,8=0,6,3,4,1/20-1,40-1",
+      expected: {
+        name: "元间频率渐变",
+        frames: [
+          "0A0A0A0A14141414",
+          "0A0A0A0A28282828",
+          "1010101014141414",
+          "1010101028282828",
+        ],
+        durationMs: 400,
+      },
+    },
+    {
+      text: "Dungeonlab+pulse:0,4,8=0,6,0,3,1/20-1,40-1,60-1",
+      expected: {
+        name: "渐变末尾补25ms",
+        frames: ["0A0D100A14283C00"],
+        durationMs: 100,
+        pulseImport: {
+          sourceDurationMs: 75,
+          paddingMs: 25,
+          frequencyInterpolation: "period-ms-linear",
+        },
+      },
+    },
+    {
+      text: "Dungeonlab+pulse:0,4,8=0,20,1,1,1/20-1,40-1",
+      expected: {
+        name: "末尾补50ms",
+        frames: ["0A0A0A0A14280000"],
+        durationMs: 100,
+        pulseImport: {
+          sourceDurationMs: 50,
+          paddingMs: 50,
+          frequencyInterpolation: "period-ms-linear",
+        },
+      },
+    },
+    {
+      text: "Dungeonlab+pulse:0,4,8=0,20,0,1,1/20-1,40-1,60-1,80-1,100-1",
+      expected: {
+        name: "末尾补75ms",
+        frames: ["0A0A0A0A14283C50", "0A0A0A0A64000000"],
+        durationMs: 200,
+        pulseImport: {
+          sourceDurationMs: 125,
+          paddingMs: 75,
+          frequencyInterpolation: "period-ms-linear",
+        },
+      },
+    },
+  ];
+  for (const conversion of conversions) {
+    const fixture: Fixture = {
+      name: `${conversion.expected.name}.pulse`,
+      mimeType: "application/octet-stream",
+      buffer: Buffer.from(conversion.text),
+    };
+    await choose(fixture);
+    const selected = await imported(conversion.expected);
+    assert.match(selected.importNote ?? "", /周期.*线性|线性.*周期/);
+    if (conversion.expected.pulseImport?.paddingMs)
+      assert.match(selected.importNote ?? "", /补.*静音|静音.*补/);
+    await idle(writes);
+    // Hashes refer only to the actual executable frames, across formats.
+    await expectFileError(
+      {
+        name: `${conversion.expected.name}-same-frames.json`,
+        mimeType: "application/json",
+        buffer: Buffer.from(
+          JSON.stringify({
+            name: "不得改名",
+            frames: conversion.expected.frames,
+          }),
+        ),
+      },
+      /已存在|重复/,
+    );
+    assert.equal(
+      (await api(`/api/waveforms/${selected.id}`, undefined, "DELETE")).ok,
+      true,
+    );
+    await waitState(
+      "删除选择导入记录后验证真实拖放",
+      (state) => !state.waveforms.some((item) => item.id === selected.id),
+    );
+    await drop(fixture);
+    await imported(conversion.expected);
+    await idle(writes);
+  }
+  steps.push(
+    "三种频率渐变与25/50/75ms末尾零幅补齐均经真实选择/拖放成功：手算帧字节、端点、名称、帧数、源文件时长/实际时长/补齐说明正确，跨JSON内容哈希去重且无输出",
+  );
+
+  if (process.argv.includes("--user-samples")) {
+    const samples = [
+      {
+        path: "D:/qq/wenjian/pulse-三重低语-波形坩埚.pulse",
+        frameCount: 169,
+        durationMs: 16900,
+      },
+      {
+        path: "D:/qq/wenjian/u_飘逸_高频惩罚.pulse",
+        frameCount: 213,
+        durationMs: 21300,
+      },
+    ];
+    for (const sample of samples) {
+      // Read the user-selected files in place; never modify or copy them into
+      // repository fixtures or artifacts. Only aggregate results are recorded.
+      const fixture: Fixture = {
+        name: basename(sample.path),
+        mimeType: "application/octet-stream",
+        buffer: await readFile(sample.path),
+      };
+      const expectedSample = {
+        name: basename(sample.path, ".pulse"),
+        frameCount: sample.frameCount,
+        durationMs: sample.durationMs,
+      };
+      await choose(fixture);
+      const selected = await imported(expectedSample);
+      assert.ok(selected.frames.every((frame) => /^[0-9A-F]{16}$/.test(frame)));
+      assert.equal(selected.pulseImport?.paddingMs, 0);
+      await idle(writes);
+      assert.equal(
+        (await api(`/api/waveforms/${selected.id}`, undefined, "DELETE")).ok,
+        true,
+      );
+      await waitState(
+        "用户样本选择验收结束后验证拖放",
+        (state) => !state.waveforms.some((item) => item.id === selected.id),
+      );
+      await drop(fixture);
+      await imported(expectedSample);
+      await idle(writes);
+      assert.deepEqual(
+        await readFile(sample.path),
+        fixture.buffer,
+        "用户源文件保持原样",
+      );
+    }
+    steps.push(
+      "两个用户提供的原始.pulse分别通过真实文件选择和拖放，三重低语169帧/16.9秒，高频惩罚213帧/21.3秒；名称、预览和时长正确，无自动输出，原文件只读",
+    );
+  }
+
   await expectFileError(
     {
       ...pulse,
-      name: "unsupported-gradient.pulse",
+      name: "unsupported-mode5.pulse",
       buffer: Buffer.from(
-        pulse.buffer.toString("utf8").replace("=0,20,1,1,1/", "=0,20,1,2,1/"),
+        pulse.buffer.toString("utf8").replace("=0,20,1,1,1/", "=0,20,1,5,1/"),
       ),
     },
-    /渐变|尚未确认|不支持/,
+    /模式|mode|范围|1.*4|不支持/,
     "drop",
-  );
-  const timingRejection = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname === "/api/waveforms/import" &&
-      response.request().method() === "POST",
-  );
-  await expectFileError(
-    {
-      ...pulse,
-      name: "unsupported-total-cycle.pulse",
-      buffer: Buffer.from(
-        pulse.buffer.toString("utf8").replace(":0,1,8=", ":0,4,8="),
-      ),
-    },
-    /完整周期为 50ms|100ms.*整数倍|无损表示/,
-    "drop",
-  );
-  assert.equal(
-    (await (await timingRejection).json()).code,
-    "UNSUPPORTED_PULSE_TIMING",
   );
   await expectFileError(
     {
@@ -548,7 +745,7 @@ try {
   );
   await capture("rejected-import");
   steps.push(
-    "不支持的频率渐变/50ms完整周期、截断 pulse、错误扩展名、超长文件名、损坏 JSON、非法 UTF-8、文件超限显示可操作错误，不落库且不输出",
+    "未知模式5、截断 pulse、错误扩展名、超长文件名、损坏 JSON、非法 UTF-8、文件超限显示可操作错误，不落库且不输出",
   );
 
   for (const width of [390, 375]) {
@@ -587,6 +784,7 @@ try {
     );
     await capture(`library-${width}px`);
     await imported(expected);
+    await imported(conversions[3].expected);
     await idle(writes);
   }
   await page.setViewportSize({ width: 1512, height: 1020 });
@@ -662,6 +860,15 @@ try {
   const lockedRequests = importRequests.length;
   await drop(pulse);
   await page.locator(".wave-library input[type=file]").setInputFiles(pulse);
+  const lockedGradient: Fixture = {
+    name: `${conversions[3].expected.name}.pulse`,
+    mimeType: "application/octet-stream",
+    buffer: Buffer.from(conversions[3].text),
+  };
+  await drop(lockedGradient);
+  await page
+    .locator(".wave-library input[type=file]")
+    .setInputFiles(lockedGradient);
   // Flush browser microtasks and HTTP roundtrips before checking the guards.
   const afterGuards = await snapshot();
   assert.equal(

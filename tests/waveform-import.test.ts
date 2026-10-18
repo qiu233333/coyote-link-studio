@@ -25,6 +25,20 @@ const pulseText = () =>
     "utf8",
   );
 const pulseFrames = ["0A0A0A0A14141414", "0A0A0A0A28282828"];
+// Derived from minimal.pulse: three 25ms editing points repeated twice.
+// Physical periods span 10–30ms, and the final 150ms cycle gets 50ms silence.
+const gradientPulse = (mode = 2, rest = 0) =>
+  pulseText()
+    .replace("pulse:0,1,8", `pulse:${rest},4,8`)
+    .replace(
+      "=0,20,1,1,1/20.00-1,40.00-1",
+      `=0,20,4,${mode},1/20.00-1,40.00-1,60.00-1`,
+    );
+const gradientFrames: Record<number, string[]> = {
+  2: ["0A0E121614283C14", "1A1E0A0A283C0000"],
+  3: ["0A141E0A14283C14", "141E0A0A283C0000"],
+  4: ["0A0A0A1E14283C14", "1E1E0A0A283C0000"],
+};
 
 async function fixture() {
   const directory = mkdtempSync(join(tmpdir(), "coyote-waveform-import-"));
@@ -134,7 +148,17 @@ test("旧 JSON 导入保留名称、帧顺序和时长，并按内容而非名�
         expectedName: "旧 raw 中文名",
       },
       {
-        content: { name: "JSON 导出名称", frames: ["0A0B0C0D090a0b0c"] },
+        content: {
+          name: "JSON 导出名称",
+          frames: ["0A0B0C0D090a0b0c"],
+          // JSON input cannot forge trusted .pulse conversion metadata.
+          pulseImport: {
+            sourceDurationMs: -1,
+            paddingMs: 0,
+            frequencyInterpolation: "arbitrary",
+          },
+          importNote: "伪造已完成渐变转换",
+        },
         expectedName: "JSON 导出名称",
       },
       {
@@ -160,6 +184,8 @@ test("旧 JSON 导入保留名称、帧顺序和时长，并按内容而非名�
       assert.equal(wave.durationMs, frames.length * 100);
       assert.equal(wave.builtin, false);
       assert.equal(wave.lastUsedAt, 0);
+      assert.equal(wave.pulseImport, undefined);
+      assert.equal(wave.importNote, undefined);
       const duplicate = await f.call("/api/waveforms/import", {
         content: { name: "不同名称", frames },
       });
@@ -264,6 +290,112 @@ test("真实格式派生 pulse 经 HTTP 保留节奏和名称，跨格式去重�
   }
 });
 
+test("渐变 pulse 经 HTTP 展开有效帧并在末尾补零，导出 JSON 与 pulse 按内容去重", async () => {
+  const f = await fixture();
+  try {
+    assert.equal(
+      (await f.call("/api/device/connect", { protocol: "simulator" })).status,
+      200,
+    );
+    const config = structuredClone(f.app.controller.config);
+    const commands: string[] = [];
+    const setIntensity = f.app.device.setIntensity.bind(f.app.device);
+    const sendFrames = f.app.device.sendFrames.bind(f.app.device);
+    f.app.device.setIntensity = async (channel, target) => {
+      commands.push(`intensity:${channel}:${target}`);
+      return setIntensity(channel, target);
+    };
+    f.app.device.sendFrames = async (channel, frames) => {
+      commands.push(`pulse:${channel}:${frames.length}`);
+      return sendFrames(channel, frames);
+    };
+    for (const mode of [2, 3, 4]) {
+      const content = gradientPulse(mode);
+      const imported = await f.call("/api/waveforms/import", {
+        format: "pulse",
+        content,
+        name: `渐变模式 ${mode}`,
+      });
+      assert.equal(imported.status, 200, JSON.stringify(imported.result));
+      const wave = imported.result.data as Waveform;
+      assert.equal(wave.name, `渐变模式 ${mode}`);
+      assert.deepEqual(wave.frames, gradientFrames[mode]);
+      assert.equal(wave.durationMs, 200);
+      assert.equal(wave.lastUsedAt, 0);
+      assert.deepEqual(wave.pulseImport, {
+        sourceDurationMs: 150,
+        paddingMs: 50,
+        frequencyInterpolation: "period-ms-linear",
+      });
+      assert.match(wave.importNote ?? "", /50.*ms/);
+      assert.match(wave.importNote ?? "", /8.*未应用/);
+      for (const frame of wave.frames) {
+        const bytes = Buffer.from(frame, "hex");
+        assert.equal(bytes.length, 8);
+        assert.ok(
+          [...bytes.subarray(0, 4)].every(
+            (value) => value >= 10 && value <= 240,
+          ),
+        );
+        assert.ok([...bytes.subarray(4)].every((value) => value <= 100));
+      }
+      const state = await f.state();
+      assert.deepEqual(
+        state.waveforms.find((item) => item.id === wave.id),
+        wave,
+      );
+      assert.deepEqual(f.app.store.get("waveforms", wave.id), wave);
+      // This is the exact existing UI JSON export shape. Its saved frames are
+      // already executable; no .pulse interpolation is needed on reimport.
+      const exported = JSON.parse(
+        JSON.stringify({ label: wave.name, raw: wave.frames }),
+      );
+      for (const body of [
+        { content: exported },
+        { format: "pulse", content, name: "重复渐变文件" },
+      ]) {
+        const duplicate = await f.call("/api/waveforms/import", body);
+        assert.equal(duplicate.status, 409, JSON.stringify(duplicate.result));
+        assert.equal(duplicate.result.code, "DUPLICATE_WAVEFORM");
+      }
+      // Verify the JSON export also imports successfully by itself after the
+      // original entry is removed, with the same frame duration and amplitude.
+      assert.equal(
+        (await f.call(`/api/waveforms/${wave.id}`, {}, "DELETE")).status,
+        200,
+      );
+      const reimported = await f.call("/api/waveforms/import", {
+        content: exported,
+      });
+      assert.equal(reimported.status, 200, JSON.stringify(reimported.result));
+      assert.equal(reimported.result.data.name, wave.name);
+      assert.deepEqual(reimported.result.data.frames, wave.frames);
+      assert.equal(reimported.result.data.durationMs, 200);
+    }
+    const withRest = await f.call("/api/waveforms/import", {
+      format: "pulse",
+      content: gradientPulse(2, 1),
+      name: "先保留休息再补齐",
+    });
+    assert.equal(withRest.status, 200, JSON.stringify(withRest.result));
+    const wave = withRest.result.data as Waveform;
+    assert.deepEqual(wave.frames, [...gradientFrames[2], "0A0A0A0A00000000"]);
+    assert.equal(wave.durationMs, 300);
+    assert.deepEqual(wave.pulseImport, {
+      sourceDurationMs: 250,
+      paddingMs: 50,
+      frequencyInterpolation: "period-ms-linear",
+    });
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 150));
+    assert.deepEqual(commands, [], "渐变计算、补静音与 JSON 导出不能操作设备");
+    assert.deepEqual(f.app.controller.config, config);
+    assert.deepEqual(f.app.device.state.intensities, { A: 0, B: 0 });
+    assert.equal(f.app.controller.run, null);
+  } finally {
+    await f.close();
+  }
+});
+
 test("错误、截断和不支持模式的 pulse 不写入部分波形", async () => {
   const f = await fixture();
   try {
@@ -277,9 +409,8 @@ test("错误、截断和不支持模式的 pulse 不写入部分波形", async (
       original.slice(0, -1),
       original.replace("/20.00-1,40.00-1", ""),
       `${original}\n${original}`,
-      ...[2, 3, 4].map((mode) =>
-        original.replace("=0,20,1,1,1/", `=0,20,1,${mode},1/`),
-      ),
+      original.replace("=0,20,1,1,1/", "=0,20,1,5,1/"),
+      `${gradientPulse().trimEnd()}+section+0,20,1,5,1/20.00-1,40.00-1`,
     ]) {
       const rejected = await f.call("/api/waveforms/import", {
         format: "pulse",
@@ -295,12 +426,12 @@ test("错误、截断和不支持模式的 pulse 不写入部分波形", async (
   }
 });
 
-test("pulse 导入后只有显式播放才向模拟设备按原帧序输出", async () => {
+test("渐变及末尾静音导入后只有显式播放才向模拟设备按保存帧序输出", async () => {
   const f = await fixture();
   try {
     const imported = await f.call("/api/waveforms/import", {
       format: "pulse",
-      content: pulseText(),
+      content: gradientPulse(),
       name: "显式模拟播放",
     });
     assert.equal(imported.status, 200);
@@ -335,11 +466,11 @@ test("pulse 导入后只有显式播放才向模拟设备按原帧序输出", as
     }
     assert.equal(sent[0].channel, "A");
     assert.deepEqual(sent[0].frames, [
-      pulseFrames[0],
-      pulseFrames[1],
-      pulseFrames[0],
-      pulseFrames[1],
-      pulseFrames[0],
+      gradientFrames[2][0],
+      gradientFrames[2][1],
+      gradientFrames[2][0],
+      gradientFrames[2][1],
+      gradientFrames[2][0],
     ]);
     assert.ok(sent.every((item) => item.channel === "A"));
     assert.ok(f.app.device.state.intensities.A <= 3);
@@ -417,7 +548,7 @@ test("导入波形用于列表、阶段和 AI 时保持各自引用快照", asyn
   try {
     const imported = await f.call("/api/waveforms/import", {
       format: "pulse",
-      content: pulseText(),
+      content: gradientPulse(),
       name: "引用的导入波形",
     });
     assert.equal(imported.status, 200);
@@ -445,6 +576,17 @@ test("导入波形用于列表、阶段和 AI 时保持各自引用快照", asyn
     });
     assert.equal(started.status, 200, JSON.stringify(started.result));
     const snapshots = structuredClone(f.app.controller.run!.waveformSnapshots);
+    assert.ok(snapshots[wave.id].lastUsedAt > 0);
+    assert.deepEqual(snapshots[wave.id], {
+      ...wave,
+      lastUsedAt: snapshots[wave.id].lastUsedAt,
+    });
+    assert.deepEqual(snapshots[wave.id].frames, gradientFrames[2]);
+    assert.deepEqual(snapshots[wave.id].pulseImport, {
+      sourceDurationMs: 150,
+      paddingMs: 50,
+      frequencyInterpolation: "period-ms-linear",
+    });
     const extra = await f.call("/api/waveforms/import", {
       content: { name: "追加波形", frames: ["1E1F202105060708"] },
     });
@@ -506,7 +648,7 @@ test("上锁任务经 HTTP 拒绝 JSON 与 pulse 导入，保持阶段、AI 和�
     const wave = (
       await f.call("/api/waveforms/import", {
         format: "pulse",
-        content: pulseText(),
+        content: gradientPulse(),
         name: "锁定引用",
       })
     ).result.data as Waveform;
@@ -534,6 +676,7 @@ test("上锁任务经 HTTP 拒绝 JSON 与 pulse 导入，保持阶段、AI 和�
     for (const body of [
       { content: ["1516171801020304"] },
       { format: "pulse", content: pulseText(), name: "锁定中导入" },
+      { format: "pulse", content: gradientPulse(3), name: "锁定中渐变补齐" },
       { format: "pulse", content: "invalid pulse" },
     ]) {
       const rejected = await f.call("/api/waveforms/import", body);
