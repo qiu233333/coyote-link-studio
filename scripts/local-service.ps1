@@ -21,7 +21,8 @@ function Read-ServiceRecord {
     if (-not (Test-Path -LiteralPath $recordFile)) { return $null }
     try {
         $record = Get-Content -LiteralPath $recordFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ([int]$record.pid -le 0 -or [int]$record.port -lt 1 -or [int]$record.port -gt 65535) { throw 'invalid' }
+        if ([int]$record.pid -le 0) { throw 'invalid' }
+        if ($Action -ne 'stop' -and ([int]$record.port -lt 1 -or [int]$record.port -gt 65535)) { throw 'invalid' }
         if (-not $record.executablePath -or -not $record.processCreationUtc) { throw 'invalid' }
         return $record
     }
@@ -55,34 +56,6 @@ function Test-PortOccupied([int]$ServicePort) {
     return @([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object {
         $_.Port -eq $ServicePort -and ($_.Address.Equals([Net.IPAddress]::Loopback) -or $_.Address.Equals([Net.IPAddress]::Any) -or $_.Address.Equals([Net.IPAddress]::IPv6Any))
     }).Count -gt 0
-}
-
-function Read-StopState([string]$Url, $Session) {
-    $response = Invoke-RestMethod -Uri "$Url/api/state" -WebSession $Session -TimeoutSec 5
-    if ($response.ok -isnot [bool] -or $response.ok -ne $true -or $null -eq $response.data) { throw '无法读取停止后的状态，后台进程已保留。' }
-    return $response.data
-}
-
-function Test-ZeroIntensity($Value) {
-    return ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) -and $Value -eq 0
-}
-
-function Assert-StopConfirmed($State) {
-    # Require explicit booleans: an old/partial/error response must never permit exit.
-    $validFlags = $State.stopUnconfirmed -is [bool] -and $State.stopping -is [bool]
-    $inactive = $State.PSObject.Properties.Name -contains 'run' -and ($null -eq $State.run -or @('stopped', 'completed', 'faulted', 'interrupted') -contains $State.run.status)
-    $zero = $null -ne $State.device -and $null -ne $State.device.intensities -and (Test-ZeroIntensity $State.device.intensities.A) -and (Test-ZeroIntensity $State.device.intensities.B)
-    if ($validFlags -and $State.stopUnconfirmed -eq $false -and $State.stopping -eq $false -and $inactive -and $zero) { return }
-    $reason = '服务未返回完整的停止确认状态'
-    if ($State.stopping -eq $true) { $reason = '停止仍在进行，等待设备回传或 AI 取消完成超时' }
-    elseif ($State.stopUnconfirmed -eq $true) {
-        $reason = '未收到清队列及 A/B 双通道归零的完整确认'
-        if ($State.stopReason) { $reason = [string]$State.stopReason }
-        elseif ($State.device.error) { $reason = [string]$State.device.error }
-    }
-    elseif (-not $inactive) { $reason = '仍有活动运行' }
-    elseif (-not $zero) { $reason = '未确认 A/B 双通道回传均为零' }
-    throw ('设备停止尚未确认，后台进程已保留。原因：{0}。请先在官方 APP 或设备上停止输出，恢复 APP/设备连接后在网页重试急停，再运行 Stop-Coyote.cmd。' -f $reason)
 }
 
 function Find-Node {
@@ -173,7 +146,7 @@ function Wait-ServiceReady($Record) {
 }
 
 try {
-    if (-not $PSBoundParameters.ContainsKey('Port') -and $env:COYOTE_PORT) {
+    if ($Action -ne 'stop' -and -not $PSBoundParameters.ContainsKey('Port') -and $env:COYOTE_PORT) {
         $requestedPort = 0
         if (-not [int]::TryParse($env:COYOTE_PORT, [ref]$requestedPort) -or $requestedPort -lt 1 -or $requestedPort -gt 65535) { throw 'COYOTE_PORT 必须为 1 到 65535。' }
         $Port = $requestedPort
@@ -195,32 +168,10 @@ try {
             if (Test-Path -LiteralPath $recordFile) { Remove-Item -LiteralPath $recordFile }
             exit 0
         }
-        $url = 'http://127.0.0.1:{0}' -f $record.port
-        if ($null -eq (Get-ServiceHealth ([int]$record.port))) { throw '后台未响应，无法确认设备停止；已保留进程，请先在官方 APP 或设备上停止输出。' }
-        $current = Invoke-RestMethod -Uri "$url/api/state" -SessionVariable serviceSession -TimeoutSec 5
-        if ($current.ok -isnot [bool] -or $current.ok -ne $true -or $null -eq $current.data) { throw '无法读取当前运行状态，后台进程已保留。' }
-        # The controller owns the idle/physical confirmation decision and must
-        # invalidate pending starts/model results even when the initial state is idle.
-        Write-Host '正在结束当前运行、清理波形队列并确认归零…'
-        $stopped = Invoke-RestMethod -Method Post -Uri "$url/api/emergency-stop" -WebSession $serviceSession -Headers @{ 'X-Coyote-Request' = '1'; Origin = $url } -ContentType 'application/json' -Body '{}' -TimeoutSec 20
-        if ($stopped.ok -isnot [bool] -or $stopped.ok -ne $true -or $null -eq $stopped.data) { throw '停止接口未返回有效确认，后台进程已保留。' }
-        $state = $stopped.data
-        $stopDeadline = [DateTime]::UtcNow.AddSeconds(20)
-        while ($state.stopping -eq $true -and [DateTime]::UtcNow -lt $stopDeadline) {
-            Start-Sleep -Milliseconds 250
-            $state = Read-StopState $url $serviceSession
-        }
-        Assert-StopConfirmed $state
-        # Re-read after the awaited stop so a stale POST snapshot cannot authorize exit.
-        $state = Read-StopState $url $serviceSession
-        Assert-StopConfirmed $state
-        $ownedProcess = Get-OwnedProcess $record
-        if ($null -ne $ownedProcess) {
-            & "$env:SystemRoot\System32\taskkill.exe" /PID ([string]$record.pid) /T /F | Out-Null
-            if ($LASTEXITCODE -ne 0 -and $null -ne (Get-OwnedProcess $record)) { throw '设备已停止，但后台进程退出失败，请检查后台状态。' }
-        }
+        & "$env:SystemRoot\System32\taskkill.exe" /PID ([string]$record.pid) /T /F | Out-Null
+        if ($LASTEXITCODE -ne 0 -and $null -ne (Get-OwnedProcess $record)) { throw '后台进程退出失败，请检查后台状态。' }
         if (Test-Path -LiteralPath $recordFile) { Remove-Item -LiteralPath $recordFile }
-        Write-Host '已确认停止输出或从未连接的待机状态，控制台与 AI 后台已退出。'
+        Write-Host '控制台与 AI 后台已退出。'
         exit 0
     }
 

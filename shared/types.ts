@@ -208,7 +208,6 @@ export interface AppSnapshot {
   run: ControlSession | null;
   locked: boolean;
   stopUnconfirmed: boolean;
-  stopReason?: string;
   stopping: boolean;
   waveforms: Waveform[];
   logs: LogEntry[];

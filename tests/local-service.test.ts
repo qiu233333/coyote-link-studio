@@ -21,12 +21,7 @@ const source = fileURLToPath(new URL("../", import.meta.url));
 async function run(
   command: string,
   args: string[],
-  options: {
-    cwd?: string;
-    env?: NodeJS.ProcessEnv;
-    input?: string;
-    codepage?: number;
-  } = {},
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; codepage?: number } = {},
 ) {
   const child = spawn(command, args, {
     cwd: options.cwd,
@@ -38,8 +33,8 @@ async function run(
   child.stdout.on("data", (data: Buffer) => chunks.push(data));
   child.stderr.on("data", (data: Buffer) => chunks.push(data));
   child.stdin.on("error", () => {});
-  child.stdin.end(options.input ?? "\r\n");
-  const timer = setTimeout(() => child.kill(), 40_000);
+  child.stdin.end("\r\n");
+  const timer = setTimeout(() => child.kill(), 12_000);
   try {
     const code = await new Promise<number | null>((resolve, reject) => {
       child.once("error", reject);
@@ -56,90 +51,60 @@ async function run(
   }
 }
 
+// Only these disposable processes are started or stopped. No real service,
+// model, device or project data participates in the launcher tests.
 const fixtureServer = `
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-const root = process.cwd();
+const kind = process.argv[2];
 const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { windowsHide: true, stdio: 'ignore' });
-let stops = 0, readsAfterStop = 0;
-const state = (kind, after) => {
-  const value = { stopUnconfirmed: false, stopping: false, run: after ? { status: 'stopped' } : null, device: { connected: false, intensities: { A: 0, B: 0 } } };
-  if (!after) {
-    if (kind !== 'confirmed') {
-      value.run = { status: 'running' };
-      value.device.connected = true;
-      value.device.intensities = { A: 4, B: 3 };
-    }
-    return value;
-  }
-  if (kind === 'unconfirmed' || (kind === 'stale-post' && readsAfterStop > 0)) {
-    value.stopUnconfirmed = true;
-    value.stopReason = '隔离测试：B 通道未回传归零';
-  }
-  if (kind === 'inflight-forever' || (kind === 'inflight' && readsAfterStop < 3)) value.stopping = true;
-  if (kind === 'missing') return {};
-  if (kind === 'string-flags') { value.stopUnconfirmed = 'false'; value.stopping = 'false'; }
-  if (kind === 'string-zero') value.device.intensities = { A: '0', B: '0' };
-  if (kind === 'missing-run') delete value.run;
-  if (kind === 'one-channel') value.device.intensities.B = 7;
-  if (kind === 'active') value.run = { status: 'running' };
-  return value;
-};
+let requests = 0;
 const server = createServer((req, res) => {
-  const kind = JSON.parse(readFileSync(join(root, 'fixture.json'), 'utf8')).kind;
-  res.setHeader('content-type', 'application/json; charset=utf-8');
-  if (req.url === '/api/health') return res.end(JSON.stringify({ ok: true, data: { service: 'coyote-link', ai: { ready: true } } }));
-  if (req.url === '/api/state' && req.method === 'GET') {
-    res.setHeader('Set-Cookie', 'coyote_session=fixture; Path=/; HttpOnly; SameSite=Strict');
-    if (stops) ++readsAfterStop;
-    return res.end(JSON.stringify({ ok: true, data: state(kind, stops > 0) }));
-  }
-  if (req.url === '/api/emergency-stop' && req.method === 'POST') {
-    if (req.headers['x-coyote-request'] !== '1' || req.headers.cookie !== 'coyote_session=fixture' || req.headers.origin !== 'http://127.0.0.1:' + server.address().port) {
-      res.statusCode = 403; return res.end(JSON.stringify({ ok: false }));
-    }
-    ++stops;
-    writeFileSync(join(root, 'stops.json'), JSON.stringify({ stops }));
-    return res.end(JSON.stringify({ ok: true, data: state(kind, true) }));
-  }
-  res.statusCode = 404; res.end('{}');
+  writeFileSync(join(process.cwd(), 'requests.json'), JSON.stringify(++requests));
+  if (kind === 'hanging') return;
+  const data = req.url === '/api/health'
+    ? { service: 'coyote-link', ai: { ready: true } }
+    : { stopUnconfirmed: true, stopping: true, run: { status: 'running' }, device: { intensities: { A: 9, B: 7 } } };
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify({ ok: true, data }));
 });
-server.listen(0, '127.0.0.1', () => writeFileSync(join(root, 'ready.json'), JSON.stringify({ port: server.address().port, childPid: child.pid })));
+server.listen(0, '127.0.0.1', () => {
+  const ready = () => writeFileSync(join(process.cwd(), 'ready.json'), JSON.stringify({ port, childPid: child.pid }));
+  const port = server.address().port;
+  if (kind === 'offline') server.close(ready);
+  else ready();
+});
+setInterval(() => {}, 1000);
 `;
 
-async function fixture(t: TestContext, kind = "confirmed") {
+async function fixture(t: TestContext, kind = "offline") {
   const root = mkdtempSync(join(tmpdir(), "coyote-stop 中文-"));
-  mkdirSync(join(root, "scripts"));
-  mkdirSync(join(root, "server"));
-  mkdirSync(join(root, "data"));
+  for (const directory of ["scripts", "server", "data"])
+    mkdirSync(join(root, directory));
   copyFileSync(
     join(source, "scripts/local-service.ps1"),
     join(root, "scripts/local-service.ps1"),
   );
   copyFileSync(join(source, "Stop-Coyote.cmd"), join(root, "Stop-Coyote.cmd"));
   writeFileSync(join(root, "package.json"), '{"type":"module"}');
-  writeFileSync(join(root, "fixture.json"), JSON.stringify({ kind }));
   const entry = join(root, "server/index.ts");
   writeFileSync(entry, fixtureServer);
-  const service = spawn(process.execPath, [entry], {
+  const service = spawn(process.execPath, [entry, kind], {
     cwd: root,
     windowsHide: true,
     stdio: "ignore",
   });
   let childPid = 0;
   t.after(async () => {
-    if (service.exitCode === null && service.signalCode === null) {
-      // Only the fixture ChildProcess created above is targeted.
+    if (service.exitCode === null && service.signalCode === null)
       await run("taskkill.exe", ["/PID", String(service.pid), "/T", "/F"]);
-    }
     if (childPid && alive(childPid)) {
       try {
         process.kill(childPid);
       } catch {}
     }
-    for (let i = 0; i < 20 && alive(service.pid!); i++) await delay(50);
     rmSync(root, {
       recursive: true,
       force: true,
@@ -181,18 +146,14 @@ async function fixture(t: TestContext, kind = "confirmed") {
     record,
     recordFile,
     save,
-    setKind(value: string) {
-      writeFileSync(
-        join(root, "fixture.json"),
-        JSON.stringify({ kind: value }),
+    assertNoHttp() {
+      assert.equal(
+        existsSync(join(root, "requests.json")),
+        false,
+        "stop must not wait on or call the HTTP service",
       );
     },
-    stops() {
-      return existsSync(join(root, "stops.json"))
-        ? JSON.parse(readFileSync(join(root, "stops.json"), "utf8")).stops
-        : 0;
-    },
-    stop() {
+    stop(env?: NodeJS.ProcessEnv) {
       return run(
         "powershell.exe",
         [
@@ -205,7 +166,7 @@ async function fixture(t: TestContext, kind = "confirmed") {
           "-Action",
           "stop",
         ],
-        { cwd: root },
+        { cwd: root, env },
       );
     },
     cmd(codepage: number) {
@@ -227,6 +188,7 @@ function alive(pid: number) {
     return false;
   }
 }
+
 async function assertExited(service: ChildProcess, childPid: number) {
   for (let i = 0; i < 60 && (alive(service.pid!) || alive(childPid)); ++i)
     await delay(50);
@@ -235,17 +197,14 @@ async function assertExited(service: ChildProcess, childPid: number) {
 }
 
 test(
-  "Windows PowerShell 5.1：idle 也调用停止；确认后退出整个受管进程树；重复 Stop 幂等",
+  "PowerShell 5.1：无 HTTP 服务也直接结束进程树；重复 Stop 幂等",
   { skip: !windows },
   async (t) => {
     const f = await fixture(t);
-    const result = await f.stop();
+    f.record.port = 0;
+    f.save();
+    const result = await f.stop({ COYOTE_PORT: "invalid" });
     assert.equal(result.code, 0, result.output);
-    assert.equal(
-      f.stops(),
-      1,
-      "idle snapshot must not bypass controller cancellation",
-    );
     await assertExited(f.service, f.childPid);
     assert.equal(existsSync(f.recordFile), false);
     assert.equal((await f.stop()).code, 0);
@@ -261,97 +220,20 @@ test(
   },
 );
 
-test(
-  "Windows launcher：停止中的快照等待最终确认",
-  { skip: !windows },
-  async (t) => {
-    const f = await fixture(t, "inflight");
-    const result = await f.stop();
-    assert.equal(result.code, 0, result.output);
-    assert.equal(f.stops(), 1);
-    await assertExited(f.service, f.childPid);
-  },
-);
+test("Stop 无需 HTTP 响应或设备确认", { skip: !windows }, async (t) => {
+  for (const kind of ["hanging", "unconfirmed"]) {
+    await t.test(kind, async (nested) => {
+      const f = await fixture(nested, kind);
+      const result = await f.stop();
+      assert.equal(result.code, 0, result.output);
+      f.assertNoHttp();
+      await assertExited(f.service, f.childPid);
+    });
+  }
+});
 
 test(
-  "Windows launcher：正常运行确认停止后退出整个后台",
-  { skip: !windows },
-  async (t) => {
-    const f = await fixture(t, "running");
-    const result = await f.stop();
-    assert.equal(result.code, 0, result.output);
-    assert.equal(f.stops(), 1);
-    await assertExited(f.service, f.childPid);
-  },
-);
-
-test(
-  "Windows launcher：未确认保留后台，恢复确认后可重试退出",
-  { skip: !windows },
-  async (t) => {
-    const f = await fixture(t, "unconfirmed");
-    const result = await f.stop();
-    assert.equal(result.code, 1, result.output);
-    assert.equal(alive(f.service.pid!), true);
-    assert.equal(alive(f.childPid), true);
-    assert.equal(existsSync(f.recordFile), true);
-    f.setKind("confirmed");
-    assert.equal((await f.stop()).code, 0);
-    assert.equal(f.stops(), 2);
-    await assertExited(f.service, f.childPid);
-  },
-);
-
-test(
-  "Windows launcher：等待停止超时仍保留后台；cmd 传递失败退出码",
-  { skip: !windows },
-  async (t) => {
-    const f = await fixture(t, "inflight-forever");
-    const started = Date.now();
-    const result = await f.stop();
-    assert.equal(result.code, 1, result.output);
-    assert.ok(
-      Date.now() - started >= 20_000,
-      "pending stop should get its confirmation window",
-    );
-    assert.equal(alive(f.service.pid!), true);
-    assert.equal(alive(f.childPid), true);
-    assert.equal(existsSync(f.recordFile), true);
-    f.setKind("unconfirmed");
-    assert.equal((await f.cmd(936)).code, 1);
-    assert.equal(alive(f.service.pid!), true);
-    f.setKind("confirmed");
-    assert.equal((await f.cmd(65001)).code, 0);
-    await assertExited(f.service, f.childPid);
-  },
-);
-
-test(
-  "Windows launcher：陈旧回包、缺字段、字符串布尔值、单路归零和活动运行均保留后台",
-  { skip: !windows },
-  async (t) => {
-    for (const kind of [
-      "stale-post",
-      "missing",
-      "string-flags",
-      "string-zero",
-      "missing-run",
-      "one-channel",
-      "active",
-    ]) {
-      await t.test(kind, async (nested) => {
-        const f = await fixture(nested, kind);
-        assert.equal((await f.stop()).code, 1, kind);
-        assert.equal(alive(f.service.pid!), true);
-        assert.equal(alive(f.childPid), true);
-        assert.equal(existsSync(f.recordFile), true);
-      });
-    }
-  },
-);
-
-test(
-  "Windows launcher：可执行路径、创建时间、项目入口和 PID 所有权验证阻止误杀",
+  "Stop 保留 PID、可执行路径、创建时间和项目入口所有权检查",
   { skip: !windows },
   async (t) => {
     const f = await fixture(t);
@@ -365,26 +247,27 @@ test(
       f.save();
       assert.equal((await f.stop()).code, 1, field);
       assert.equal(alive(f.service.pid!), true);
-      assert.equal(f.stops(), 0);
+      assert.equal(alive(f.childPid), true);
       f.record[field] = original;
     }
     const other = await fixture(t);
-    f.record.pid = other.record.pid;
-    f.record.executablePath = other.record.executablePath;
-    f.record.processCreationUtc = other.record.processCreationUtc;
+    Object.assign(f.record, other.record);
     f.save();
     assert.equal(
       (await f.stop()).code,
       1,
-      "a server from another project root is not owned",
+      "another project's server must survive",
     );
     assert.equal(alive(other.service.pid!), true);
-    assert.equal(other.stops(), 0);
+    assert.equal(alive(other.childPid), true);
+    assert.equal(alive(f.service.pid!), true);
+    f.assertNoHttp();
+    other.assertNoHttp();
   },
 );
 
 test(
-  "Stop-Coyote.cmd：中文代码页 936 与 UTF-8 65001 均调用 PS5.1 并退出后台",
+  "Stop-Coyote.cmd：中文路径，代码页 936 / UTF-8 65001 均立即退出后台",
   { skip: !windows },
   async (t) => {
     for (const codepage of [936, 65001]) {
@@ -392,7 +275,6 @@ test(
         const f = await fixture(nested);
         const result = await f.cmd(codepage);
         assert.equal(result.code, 0, result.output);
-        assert.equal(f.stops(), 1);
         await assertExited(f.service, f.childPid);
       });
     }

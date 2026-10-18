@@ -10,7 +10,7 @@
 
 合并或更新代码后，先双击 `Stop-Coyote.cmd`，再双击 `Start-Coyote.cmd`。启动器会按文件内容检测更新，自动重新构建网页与 AI 运行时；等待窗口显示“控制台与 AI 运行时已就绪”后刷新网页。代码未变时会复用已确认的构建。依赖或构建失败会保留错误提示，不会启动旧产物。
 
-启动后访问 **http://127.0.0.1:3000**；后台服务会继续运行。双击 `Stop-Coyote.cmd` 可归零并停止本项目服务。查看状态：
+启动后访问 **http://127.0.0.1:3000**；后台服务会继续运行。双击 `Stop-Coyote.cmd` 立即结束本项目服务及 AI 子进程，不等待设备或 API 确认。查看状态：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\local-service.ps1 status

@@ -14,7 +14,7 @@
 启动器仅设置本次启动进程的 PATH，不修改系统或用户全局环境。项目不需要 `.env` 文件；AI Base URL、API Key 和模型名在网页系统设置中填写。
 
 - `Start-Coyote.cmd`：检查代码与依赖版本，需要时自动安装锁定依赖并重建网页和 AI 运行时，再启动后台、检查就绪并打开浏览器。
-- `Stop-Coyote.cmd`：停止本项目服务；结束前先尝试急停归零。
+- `Stop-Coyote.cmd`：立即结束本项目服务和 AI 子进程，不等待设备或 API 确认。
 - `scripts/local-service.ps1 status`：查询本项目服务状态。
 - `scripts/local-service.ps1 start -NoBrowser`：后台启动，不自动打开外部浏览器。
 
