@@ -64,6 +64,7 @@ import {
 import { StageIntensityScale } from "./StageIntensityScale";
 import { useStageIntensityScaling } from "./stageIntensityScaling";
 import { useLiveChannels } from "./useLiveChannels";
+import { MAX_WAVEFORM_FILE_BYTES } from "../shared/waveformImport";
 import {
   WaveMetadata,
   Badge,
@@ -1001,11 +1002,46 @@ function WaveLibrary({
     if (!file || disabled) return;
     setLocalError("");
     try {
-      if (file.size > 5_000_000) throw new Error("波形文件不能超过 5 MB");
-      const content = JSON.parse(await file.text());
+      if (file.size > MAX_WAVEFORM_FILE_BYTES)
+        throw new Error("波形文件不能超过 5 MB，请缩小后重试。");
+      if (!/\.(json|pulse)$/i.test(file.name))
+        throw new Error("请选择 .json 或 APP 导出的 .pulse 波形文件。");
+      let text: string;
+      try {
+        text = new TextDecoder("utf-8", { fatal: true }).decode(
+          await file.arrayBuffer(),
+        );
+      } catch {
+        throw new Error(
+          "文件不是有效的 UTF-8 文本；请从 APP 重新导出 .pulse，或选择 UTF-8 JSON 文件。暂不支持压缩或二进制文件。",
+        );
+      }
+      const format = /\.pulse$/i.test(file.name) ? "pulse" : "json";
+      let content: unknown = text;
+      if (format === "json") {
+        try {
+          content = JSON.parse(text);
+        } catch {
+          throw new Error(
+            "JSON 格式错误，请检查文件是否完整；APP 导出的文本波形请保留 .pulse 扩展名。",
+          );
+        }
+      }
+      const hasName =
+        format === "json" &&
+        content !== null &&
+        typeof content === "object" &&
+        ("name" in content || "label" in content);
+      const filename = file.name.replace(/\.(json|pulse)$/i, "");
+      if (!hasName && filename.length > 100)
+        throw new Error("波形名称最多 100 字，请缩短文件名后重新导入。");
       await action(
         "/api/waveforms/import",
-        { content, name: file.name.replace(/\.json$/i, "") },
+        {
+          content,
+          format,
+          name: hasName ? undefined : filename,
+        },
         "POST",
         "波形已导入",
       );
@@ -1037,6 +1073,10 @@ function WaveLibrary({
       onDrop={(e) => {
         e.preventDefault();
         setDragging(false);
+        if (e.dataTransfer.files.length > 1) {
+          setLocalError("请每次导入一个 .json 或 .pulse 文件。");
+          return;
+        }
         void importFile(e.dataTransfer.files[0]);
       }}
     >
@@ -1087,15 +1127,21 @@ function WaveLibrary({
           className="sr-only"
           type="file"
           ref={fileRef}
-          accept="application/json,.json"
+          accept="application/json,.json,.pulse"
+          disabled={disabled}
           onChange={(e) => void importFile(e.target.files?.[0])}
         />
       </div>
+      <p className="small-text muted">
+        支持 JSON 与 APP 3.4.4 文本
+        .pulse（固定频率）。仅导入频率、相对幅度和节奏，APP
+        附加参数不修改设备设置。
+      </p>
       {localError && <p className="error-inline">{localError}</p>}
       {dragging && (
         <div className="drop-overlay">
           <FileJson size={42} />
-          <strong>放开以导入 JSON 波形</strong>
+          <strong>放开以导入 JSON / .pulse 波形</strong>
         </div>
       )}
       <div className="wave-library-grid">
@@ -1193,7 +1239,7 @@ function WaveLibrary({
       </div>
       {!waves.length && (
         <Empty title="这里还没有波形">
-          调整搜索条件，或导入一份 JSON 波形。
+          调整搜索条件，或导入一份 JSON / .pulse 波形。
         </Empty>
       )}
       <div className="import-help">
@@ -1201,7 +1247,7 @@ function WaveLibrary({
         <div>
           <strong>把喜欢的波形放进来</strong>
           <p>
-            支持原始帧数组及 label / raw 格式 JSON · 可直接拖入此处 ·
+            支持 JSON 与固定频率 .pulse · 每次拖入一个文件，最多 5 MB ·
             导入前自动校验
           </p>
         </div>
@@ -1210,6 +1256,9 @@ function WaveLibrary({
         <Modal title={preview.name} onClose={() => setPreview(null)}>
           <WaveGraph frames={preview.frames} />
           <WaveMetadata waveform={preview} />
+          {preview.importNote && (
+            <p className="small-text muted">{preview.importNote}</p>
+          )}
           <div className="review-grid">
             <div>
               <span>帧数</span>

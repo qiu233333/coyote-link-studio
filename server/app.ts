@@ -16,6 +16,7 @@ import { CoyoteDevice, getBuiltinWaveforms } from "./device.js";
 import { Store } from "./store.js";
 import { AppError, assert } from "./errors.js";
 import type { Protocol } from "../shared/types.js";
+import { MAX_WAVEFORM_IMPORT_BODY_BYTES } from "../shared/waveformImport.js";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const secureEqual = (a: string, b: string) => {
@@ -92,6 +93,10 @@ export async function createApplication(
     }
     next();
   });
+  app.use(
+    "/api/waveforms/import",
+    express.json({ limit: MAX_WAVEFORM_IMPORT_BODY_BYTES, strict: true }),
+  );
   app.use(express.json({ limit: "5mb", strict: true }));
   app.get("/api/health", (_req, res) =>
     res.json({ ok: true, data: { service: "coyote-link", ai: ai.status } }),
@@ -174,6 +179,7 @@ export async function createApplication(
       req.body.name === undefined
         ? undefined
         : text(req.body.name, "波形名称", 100),
+      req.body.format,
     ),
   );
   route("patch", "/api/waveforms/:id", (req) =>
@@ -239,7 +245,7 @@ export async function createApplication(
       .json({ ok: false, error: "接口不存在。", code: "NOT_FOUND" }),
   );
   app.use(
-    (error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    (error: unknown, req: Request, res: Response, _next: NextFunction) => {
       let status = 500,
         message = "操作失败，请检查运行记录。",
         code = "INTERNAL_ERROR";
@@ -259,6 +265,13 @@ export async function createApplication(
         if ("status" in error && typeof error.status === "number")
           status = error.status;
         else status = 400;
+        if (
+          status === 413 &&
+          req.path.replace(/\/$/, "") === "/api/waveforms/import"
+        ) {
+          message = "导入请求过大：波形文件最多 5 MB，请缩小后重试。";
+          code = "WAVEFORM_TOO_LARGE";
+        }
       }
       res
         .status(status)

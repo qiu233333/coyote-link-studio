@@ -48,6 +48,7 @@ export interface Waveform {
   favorite: boolean;
   lastUsedAt: number;
   durationMs: number;
+  importNote?: string;
 }
 export interface ChannelConfig {
   enabled: boolean;

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { channelValues } from "../shared/intensity.js";
+import { MAX_WAVEFORM_FRAMES } from "../shared/waveformImport.js";
 import type {
   ControlBounds,
   PlaybackConfig,
@@ -138,7 +139,9 @@ export function normalizeWaveform(
       : {};
   const frames = Array.isArray(input) ? input : (object.raw ?? object.frames);
   assert(
-    Array.isArray(frames) && frames.length > 0 && frames.length <= 100000,
+    Array.isArray(frames) &&
+      frames.length > 0 &&
+      frames.length <= MAX_WAVEFORM_FRAMES,
     "波形应包含 1 到 100000 个 V3 帧。",
   );
   const normalized = frames.map((frame, index) => {
@@ -154,9 +157,13 @@ export function normalizeWaveform(
     );
     return frame.toUpperCase();
   });
-  const label = object.label as { cn?: string; en?: string } | undefined;
+  const label = object.label as
+    { cn?: string; en?: string } | string | undefined;
   const name = String(
-    suggestedName || object.name || label?.cn || label?.en || "导入波形",
+    suggestedName ||
+      object.name ||
+      (typeof label === "string" ? label : label?.cn || label?.en) ||
+      "导入波形",
   )
     .trim()
     .slice(0, 100);

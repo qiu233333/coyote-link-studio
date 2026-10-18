@@ -25,6 +25,7 @@ import type {
 import { AppError, assert } from "./errors.js";
 import { Store } from "./store.js";
 import { AiServiceError } from "./ai.js";
+import { parsePulse } from "./pulse.js";
 import {
   normalizeWaveform,
   channelIntensitySchema,
@@ -377,9 +378,16 @@ export class Controller extends EventEmitter {
     assert(wave, "所选波形不存在。", "WAVEFORM_NOT_FOUND", 404);
     return wave;
   }
-  importWaveform(input: unknown, name?: string) {
+  importWaveform(input: unknown, name?: string, format: unknown = "json") {
     this.assertUnlocked();
-    const wave = normalizeWaveform(input, name);
+    assert(
+      format === "json" || format === "pulse",
+      "导入格式仅支持 json 或 pulse。",
+      "UNSUPPORTED_WAVEFORM_FORMAT",
+    );
+    const parsed = format === "pulse" ? parsePulse(input) : undefined;
+    const wave = normalizeWaveform(parsed ?? input, name);
+    if (parsed) wave.importNote = parsed.importNote;
     assert(
       !this.waves().some((w) => w.hash === wave.hash),
       "该波形已存在，已跳过重复导入。",
