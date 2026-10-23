@@ -70,6 +70,9 @@ async function availablePort(): Promise<number> {
 /** Independent local eve worker. It can recommend, never send device commands. */
 export class AiService extends EventEmitter {
   status: AiStatus = { ready: false };
+  get busy() {
+    return this.requests.size > 0;
+  }
   private child?: ChildProcess;
   private token = randomBytes(32).toString("hex");
   private endpoint = "";
@@ -202,6 +205,7 @@ export class AiService extends EventEmitter {
         "AI_GATEWAY_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "DEEPSEEK_API_KEY",
       ])
         delete (env as Record<string, string | undefined>)[name];
       const child = spawn(process.execPath, args, {
@@ -374,6 +378,11 @@ export class AiService extends EventEmitter {
       );
     if (signal?.aborted)
       throw new AiServiceError("AI_CANCELLED", "AI 请求已取消。");
+    if (this.busy)
+      throw new AiServiceError(
+        "AI_BUSY",
+        "已有 AI 请求正在处理或取消，请稍后重试。",
+      );
     const requestId = randomUUID();
     // Capture credentials and the address together. A late cancellation from a
     // previous generation must never be sent to a replacement worker.

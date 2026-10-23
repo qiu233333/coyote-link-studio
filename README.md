@@ -121,7 +121,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\local-service.ps1 
 
 ### 03 · 想交给 AI，再确认范围
 
-先在系统设置填写 **Base URL、模型名、API Key**，保存并测试聊天与工具调用。无需密钥的本地模型可留空；Base URL 常见形式为 `http://地址:端口/v1`，以服务商要求为准。
+使用 **DeepSeek** 时，在系统设置的「AI 服务」选择 DeepSeek，输入供 DeepSeek 使用的 API Key，再点击「保存并测试连接」。预设官方地址和 `deepseek-flash` 模型，默认关闭思考，也可显式开启。配置与限制见 [DeepSeek 说明](docs/DEEPSEEK.md)。
+
+其他服务选择「自定义 OpenAI 兼容服务」，填写 **Base URL、模型名、API Key**。无需密钥的本地模型可留空；Base URL 常见形式为 `http://地址:端口/v1`，以服务商要求为准。切换服务或地址时必须重新提供目标服务的密钥，旧密钥不会自动转发。
 
 | 功能            | 开始方式                          | 运行中的操作                                                         |
 | :-------------- | :-------------------------------- | :------------------------------------------------------------------- |
@@ -259,6 +261,7 @@ pnpm build
 | [本机运行环境](docs/ENVIRONMENT.md)       | 一键启动、自动构建、端口和日志。 |
 | [`.pulse` 格式说明](docs/PULSE_FORMAT.md) | 格式来源、渐变、时长与兼容边界。 |
 | [AI 超时说明](docs/AI-TIMEOUTS.md)        | 决策、测试与草稿的独立超时预算。 |
+| [DeepSeek 配置](docs/DEEPSEEK.md)         | 官方预设、密钥切换、思考模式与验证限制。 |
 | [AI 中断排查](docs/AI-INTERRUPTIONS.md)   | 中断原因、有限恢复与回归记录。   |
 | [验证记录](docs/VERIFICATION.md)          | 构建、自动化与浏览器验收结果。   |
 | [图片素材](docs/ASSETS.md)                | 助手头像和 README 图标来源。     |

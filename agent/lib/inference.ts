@@ -1,8 +1,14 @@
-import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText, tool } from "ai";
 import { z } from "zod";
 import type { AiProfile } from "../../shared/types.ts";
-import { InferenceError } from "./errors.ts";
+import { InferenceError, safeInferenceError } from "./errors.ts";
+import {
+  model,
+  businessToolChoice,
+  outputBudget,
+  checkFinish,
+  isDeepSeek,
+} from "./provider.ts";
 import {
   availableWaveforms,
   contextBounds,
@@ -28,14 +34,6 @@ stageCount 是任务总阶段数，stageIndex 从 0 开始；isLastStage=false �
 stageDurationSec 是当前阶段从 stageStartedAt 起的总时长，不是追加秒数；不需要修改时省略。普通 AI 控制不使用阶段字段。
 只能依据当前计时状态和用户文字反馈判断完成；助手历史解释不作为用户已完成反馈。
 解释使用简洁中文，不输出内部推理过程。必须调用指定业务工具提交结果。`;
-
-function model(profile: AiProfile) {
-  return createOpenAICompatible({
-    name: "user-configured",
-    baseURL: profile.baseUrl.replace(/\/+$/, ""),
-    apiKey: profile.apiKey,
-  }).chatModel(profile.model);
-}
 
 // This projection is deliberately separate from profile. No endpoint, headers,
 // credentials, or raw hardware data are ever interpolated into a model prompt.
@@ -133,12 +131,13 @@ export async function decide(
         inputSchema: schema,
       }),
     },
-    toolChoice: { type: "tool", toolName: "submit_decision" },
+    toolChoice: businessToolChoice(profile, "submit_decision"),
     abortSignal: signal,
     maxRetries: 0,
-    maxOutputTokens: 1800,
+    maxOutputTokens: outputBudget(profile, "decide"),
     telemetry: { isEnabled: false },
   });
+  checkFinish(result);
   if (
     result.toolCalls.length !== 1 ||
     result.toolCalls[0].toolName !== "submit_decision" ||
@@ -178,12 +177,13 @@ bounds.minIntensity、bounds.maxIntensity、bounds.rampPerSecond、每阶段 int
         inputSchema: draftToolSchema(context),
       }),
     },
-    toolChoice: { type: "tool", toolName: "submit_task_draft" },
+    toolChoice: businessToolChoice(profile, "submit_task_draft"),
     abortSignal: signal,
     maxRetries: 0,
-    maxOutputTokens: 7000,
+    maxOutputTokens: outputBudget(profile, "draft"),
     telemetry: { isEnabled: false },
   });
+  checkFinish(result);
   if (
     result.toolCalls.length !== 1 ||
     result.toolCalls[0].toolName !== "submit_task_draft" ||
@@ -201,11 +201,12 @@ export async function test(profile: AiProfile, signal: AbortSignal) {
   const chat = await generateText({
     model: model(profile),
     prompt: "这是本地接口连通性测试。请用一个词回复：连接成功。",
-    maxOutputTokens: 200,
+    maxOutputTokens: outputBudget(profile, "test"),
     maxRetries: 0,
     abortSignal: signal,
     telemetry: { isEnabled: false },
   });
+  checkFinish(chat);
   if (!chat.text.trim())
     return {
       chat: false,
@@ -214,40 +215,77 @@ export async function test(profile: AiProfile, signal: AbortSignal) {
     };
   try {
     const challenge = crypto.randomUUID();
+    const prompt = `这是无副作用的工具能力测试。调用 connection_probe，原样传回 token：${challenge}。收到工具结果后，仅原样回复结果中的 receipt，不再调用工具。`;
+    const tools = {
+      connection_probe: tool({
+        description: "无副作用的连接测试。",
+        inputSchema: z.object({ token: z.literal(challenge) }).strict(),
+      }),
+    };
     const result = await generateText({
       model: model(profile),
-      prompt: `这是无副作用的工具能力测试。调用 connection_probe，原样传回 token：${challenge}`,
-      tools: {
-        connection_probe: tool({
-          description: "无副作用的连接测试。",
-          inputSchema: z.object({ token: z.literal(challenge) }).strict(),
-        }),
-      },
-      toolChoice: { type: "tool", toolName: "connection_probe" },
-      maxOutputTokens: 400,
+      prompt,
+      tools,
+      toolChoice: businessToolChoice(profile, "connection_probe"),
+      maxOutputTokens: outputBudget(profile, "test"),
       maxRetries: 0,
       abortSignal: signal,
       telemetry: { isEnabled: false },
     });
+    checkFinish(result);
     const call = result.toolCalls[0];
-    const supported =
+    let supported =
       result.toolCalls.length === 1 &&
       call.toolName === "connection_probe" &&
       !call.invalid &&
       dictionary(call.input).token === challenge;
+    if (supported && isDeepSeek(profile)) {
+      const receipt = crypto.randomUUID();
+      const followup = await generateText({
+        model: model(profile),
+        messages: [
+          { role: "user", content: prompt },
+          // The installed adapter preserves reasoning_content in these messages.
+          // Keep it only within this request; never expose or persist it.
+          ...result.response.messages,
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: call.toolCallId,
+                toolName: "connection_probe",
+                output: { type: "json", value: { receipt } },
+              },
+            ],
+          },
+        ],
+        tools,
+        toolChoice: "none",
+        maxOutputTokens: outputBudget(profile, "test"),
+        maxRetries: 0,
+        abortSignal: signal,
+        telemetry: { isEnabled: false },
+      });
+      checkFinish(followup);
+      supported =
+        followup.toolCalls.length === 0 && followup.text.trim() === receipt;
+    }
     return {
       chat: true,
       tools: supported,
       message: supported
-        ? "聊天与业务工具调用均已通过实际请求测试。"
+        ? isDeepSeek(profile)
+          ? "DeepSeek 聊天、工具调用与工具结果回传均已通过当前接口测试。"
+          : "聊天与业务工具调用均已通过实际请求测试。"
         : "聊天可用，但模型未返回有效工具调用；暂不能开启 AI 控制。",
     };
-  } catch {
+  } catch (error) {
     if (signal.aborted) throw signal.reason;
     return {
       chat: true,
       tools: false,
-      message: "聊天可用，但工具调用测试失败；请检查所选模型与接口兼容性。",
+      message: `聊天可用，但工具调用测试失败：${safeInferenceError(error).error}`,
     };
   }
 }

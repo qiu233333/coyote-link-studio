@@ -9,6 +9,8 @@ import type {
 } from "../../shared/types.ts";
 
 export const profileSchema = z.object({
+  provider: z.enum(["openai-compatible", "deepseek"]).optional(),
+  deepseekThinking: z.enum(["disabled", "enabled"]).optional(),
   baseUrl: z
     .string()
     .url()

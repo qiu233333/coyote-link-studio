@@ -16,6 +16,12 @@ import {
   X,
 } from "lucide-react";
 import type { AppSnapshot } from "../shared/types";
+import {
+  aiProvider,
+  credentialTarget,
+  DEEPSEEK_PRESET,
+  type AiProvider,
+} from "../shared/aiProvider";
 import { isActive, type Action } from "./api";
 import { Badge, Card, Field, LoadingButton, NumberInput } from "./ui";
 import {
@@ -42,10 +48,16 @@ export default function SettingsPage({
   } | null>(null);
   const [testing, setTesting] = useState(false);
   const active = isActive(state);
-  const disabled = active || state.stopping || pending;
+  const disabled = active || state.stopping || pending || testing;
+  const provider = aiProvider(form);
+  const targetChanged =
+    credentialTarget(form) !== credentialTarget(state.settings);
+  const savedKeyUsable = state.settings.apiKeySet && !targetChanged;
   useEffect(
-    () => setForm((f) => ({ ...state.settings, apiKey: f.apiKey })),
+    () => setForm({ ...state.settings, apiKey: "" }),
     [
+      state.settings.provider,
+      state.settings.deepseekThinking,
       state.settings.baseUrl,
       state.settings.model,
       state.settings.contextWindow,
@@ -54,10 +66,38 @@ export default function SettingsPage({
       state.settings.apiKeySet,
     ],
   );
+  useEffect(() => setResult(null), [form]);
+  const chooseProvider = (selected: AiProvider) => {
+    setShowKey(false);
+    setForm({
+      ...form,
+      ...(selected === "deepseek"
+        ? DEEPSEEK_PRESET
+        : {
+            provider: selected,
+            baseUrl:
+              aiProvider(state.settings) === selected
+                ? state.settings.baseUrl
+                : "",
+            model:
+              aiProvider(state.settings) === selected
+                ? state.settings.model
+                : "",
+            contextWindow:
+              aiProvider(state.settings) === selected
+                ? state.settings.contextWindow
+                : 32000,
+            deepseekThinking: "disabled" as const,
+          }),
+      apiKey: "",
+    });
+  };
   const save = async () => {
     const result = await action(
       "/api/settings",
       {
+        provider,
+        deepseekThinking: form.deepseekThinking ?? "disabled",
         baseUrl: form.baseUrl.trim(),
         model: form.model.trim(),
         contextWindow: form.contextWindow,
@@ -144,8 +184,44 @@ export default function SettingsPage({
           >
             <fieldset className="plain-fieldset" disabled={disabled}>
               <Field
+                label="AI 服务"
+                hint="切换服务或地址后需重新输入密钥，旧密钥不会自动转发。"
+              >
+                <select
+                  aria-label="AI 服务"
+                  value={provider}
+                  onChange={(e) => chooseProvider(e.target.value as AiProvider)}
+                >
+                  <option value="openai-compatible">
+                    自定义 OpenAI 兼容服务
+                  </option>
+                  <option value="deepseek">DeepSeek</option>
+                </select>
+              </Field>
+              {provider === "deepseek" && (
+                <div className="notice notice-blue">
+                  <span>
+                    DeepSeek 官方预设：deepseek-flash；也可填写
+                    deepseek-v4-pro。默认关闭思考以减少控制等待。请使用 DeepSeek
+                    开放平台的 API Key。
+                    <a
+                      href="https://platform.deepseek.com/api_keys"
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {" "}
+                      获取密钥
+                    </a>
+                  </span>
+                </div>
+              )}
+              <Field
                 label="Base URL"
-                hint="填写兼容 API 的基础地址，通常以 /v1 结尾。"
+                hint={
+                  provider === "deepseek"
+                    ? "官方地址为 https://api.deepseek.com；使用代理时请确认地址与密钥的归属。"
+                    : "填写兼容 API 的基础地址，通常以 /v1 结尾。"
+                }
               >
                 <div className="input-with-icon">
                   <Link size={17} />
@@ -155,18 +231,21 @@ export default function SettingsPage({
                     required
                     placeholder="https://api.openai.com/v1"
                     value={form.baseUrl}
-                    onChange={(e) =>
-                      setForm({ ...form, baseUrl: e.target.value })
-                    }
+                    onChange={(e) => {
+                      setShowKey(false);
+                      setForm({ ...form, baseUrl: e.target.value, apiKey: "" });
+                    }}
                   />
                 </div>
               </Field>
               <Field
                 label="API Key"
                 hint={
-                  state.settings.apiKeySet
-                    ? "已加密保存。留空保留现有密钥，填写新值可替换。"
-                    : "密钥仅保存在后端，不会进入浏览器持久化或日志。"
+                  targetChanged && state.settings.apiKeySet
+                    ? "地址或服务已变化：请重新输入此服务的密钥。原配置在成功保存前保持有效。"
+                    : savedKeyUsable
+                      ? "已加密保存。留空保留现有密钥，填写新值可替换。"
+                      : "密钥仅保存在后端，不会进入浏览器持久化或日志。"
                 }
               >
                 <div className="input-with-icon">
@@ -176,9 +255,7 @@ export default function SettingsPage({
                     type={showKey ? "text" : "password"}
                     autoComplete="new-password"
                     placeholder={
-                      state.settings.apiKeySet
-                        ? "••••••••••••••••（已保存）"
-                        : "sk-…"
+                      savedKeyUsable ? "••••••••••••••••（已保存）" : "sk-…"
                     }
                     value={form.apiKey}
                     onChange={(e) =>
@@ -204,7 +281,9 @@ export default function SettingsPage({
                   <input
                     aria-label="AI 模型名称"
                     required
-                    placeholder="例如 gpt-4.1-mini"
+                    placeholder={
+                      provider === "deepseek" ? "deepseek-flash" : "填写模型 ID"
+                    }
                     value={form.model}
                     onChange={(e) =>
                       setForm({ ...form, model: e.target.value })
@@ -212,6 +291,27 @@ export default function SettingsPage({
                   />
                 </div>
               </Field>
+              {provider === "deepseek" && (
+                <Field
+                  label="DeepSeek 思考模式"
+                  hint="开启后可能更慢；仍需返回有效业务工具，超时或无效输出不会产生动作。任务截止时间不变。"
+                >
+                  <select
+                    aria-label="DeepSeek 思考模式"
+                    value={form.deepseekThinking ?? "disabled"}
+                    onChange={(e) =>
+                      setForm({
+                        ...form,
+                        deepseekThinking: e.target.value as
+                          "enabled" | "disabled",
+                      })
+                    }
+                  >
+                    <option value="disabled">关闭（推荐用于实时控制）</option>
+                    <option value="enabled">开启</option>
+                  </select>
+                </Field>
+              )}
               <div className="form-grid">
                 <Field label="上下文窗口 / tokens">
                   <NumberInput
@@ -267,6 +367,8 @@ export default function SettingsPage({
                     const cleared = await action(
                       "/api/settings",
                       {
+                        provider,
+                        deepseekThinking: form.deepseekThinking ?? "disabled",
                         baseUrl: form.baseUrl.trim(),
                         model: form.model.trim(),
                         contextWindow: form.contextWindow,

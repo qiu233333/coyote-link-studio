@@ -1,5 +1,33 @@
 # 实施验证记录
 
+## DeepSeek 支持（2026-10-23）
+
+基于 `2e588c7`，独立工作树与 `codex/deepseek-support` 分支。环境：Windows、Node.js 24.22.1、pnpm 11.25.0；AI SDK 7.0.142、OpenAI compatible 3.0.70、eve 0.80.1，依赖与锁文件未变。官方协议依据、配置步骤和限制见 [DeepSeek 说明](DEEPSEEK.md)。
+
+| 验证 | 结果与范围 |
+| --- | --- |
+| 类型与构建 | `pnpm typecheck`、`pnpm build`（含 eve 产物）、修改代码 Prettier 检查、`git diff --check` 通过。 |
+| 全量测试 | **196/196 通过**。保留原有控制器、设备/波形、HTTP、超时/取消、A/B 独立范围和 Windows Stop 直接结束项目进程树回归。 |
+| DeepSeek 契约 | 新增 9 项测试；包括服务切换的密钥绑定、加密存储、旧配置迁移、思考开/关、聊天与工具回执、非空/空推理内容回传、草稿和决策、余额/认证/参数/速率/临时服务错误、空文本/错误回执/非法工具/越界/截断、重定向不转发凭证。 |
+| Worker 与隔离 | 真正启动构建后的独立 eve 进程，用本地 API 桩验证两种模式。检查 worker 临时目录无测试密钥与推理内容；并行草稿/测试被拒绝，取消后的新请求可正常执行。 |
+| 草稿生命周期 | 急停取消生成请求；即使模型忽略取消并迟到返回，也不能入库。生成期间拒绝第二个草稿和启动；取消收尾后可以重新生成。 |
+| 默认 DeepSeek 浏览器流程 | `verify-browser.ts --deepseek`：9 组流程，10 次本地模型请求，通过。包含模拟连接、控制台、独立 AI 范围与自主输出、反馈、暂停、改范围、恢复、接管、草稿生成/重新生成/编辑、确认冻结、锁定反馈和后端 423、急停。 |
+| 思考模式浏览器流程 | `verify-browser.ts --deepseek --thinking`：同样 9 组流程、10 次本地模型请求，通过；桩强制检查 `thinking=enabled`、合法工具选择及推理回传。 |
+| DeepSeek 中断与完成 | `verify-ai-interruptions-browser.ts --deepseek`：5 组流程、26 次本地模型请求、6 次取消，通过。覆盖慢响应、最多一次恢复、失败归零、快速反馈、冻结边界、阶段推进、任务完成、硬截止、断线、异常工具与急停；含状态流断开/恢复。 |
+| 自定义兼容服务 | 原 `verify-browser.ts`：9 组流程、8 次本地模型请求，通过，确认不注入 DeepSeek 参数。 |
+| 控制台回归 | `verify:limits`：7 组流程，通过；包括 20/19 独立上限、热更新、暂停后配置、动态上限、控制权互斥、锁定和 390px 界面。 |
+| 波形回归 | `verify:pulse-import`：9 组流程、25 次导入请求，通过；覆盖 JSON/`.pulse`、渐变与25/50/75ms补齐、文件选择/拖放、去重、导出、非法输入、锁定和375/390px界面。未读取用户私有样本。 |
+
+上述浏览器套件无非预期页面、控制台或网络错误。使用临时 SQLite 与独立 eve 数据目录、随机本机端口、显式模拟设备或内存设备桩。未调用真实设备、真实模型 API、主工作区运行服务或生产配置。启动器 Stop 语义保持原样。
+
+另在应用内浏览器实际验证新增设置页：从带假密钥的自定义配置切换到 DeepSeek，留空保存/测试被后端拒绝，模型接口请求数仍为 0；输入新的专用假密钥后 3 请求测试成功，旧假密钥未转发。刷新后思考设置保留、输入框只有固定掩码；切回自定义服务清空未保存的密钥。390px 视口（可用内容375px）无横向溢出。隔离实例与浏览器已关闭并清理临时数据库。
+
+本地证据（Git 忽略）：`artifacts-deepseek-final-build.log`、`artifacts-deepseek-final-test.log`、各专项 `artifacts-*.log`、`artifacts/deepseek-disabled/`、`artifacts/deepseek-enabled/`、`artifacts/deepseek-interruptions/`、`artifacts/deepseek-settings-verified.png`、`artifacts/deepseek-settings-mobile.png`。
+
+**真实 API：未验证。** 没有用户明确提供给 DeepSeek 使用的有效密钥；须在设置页输入 Key 后测试实际账户、模型可用性、网络和输出质量。**真实硬件：未验证。** 模拟通过不能替代实机验收，不能宣称所有模型输出或设备组合保证通过。
+
+---
+
 日期：2026-10-18。环境：Windows、Node.js 24.19.0、pnpm 11.25.0、Microsoft Edge（Playwright 驱动）。
 
 AI 会话中途中断专项修复、脱敏证据、135 项回归及隔离浏览器验收见 [AI-INTERRUPTIONS.md](AI-INTERRUPTIONS.md)。下列记录保留此前各功能的独立验收范围。

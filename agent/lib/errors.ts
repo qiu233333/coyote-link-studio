@@ -13,6 +13,15 @@ export function safeInferenceError(error: unknown) {
   const value = dictionary(error);
   const code = error instanceof InferenceError ? error.errorCode : undefined;
   const status = Number(value.statusCode);
+  const messages: Record<string, string> = {
+    AI_KEY_REQUIRED:
+      "请在系统设置输入供 DeepSeek 使用的 API Key，保存后再测试。",
+    AI_OUTPUT_TRUNCATED:
+      "模型输出被截断，未执行任何建议。请关闭思考模式或简化任务后重试。",
+    AI_CONTENT_FILTER: "模型未提供可用结果，未执行任何建议。请调整任务描述。",
+    AI_PROVIDER_UNAVAILABLE: "AI 接口暂时不可用。",
+  };
+  if (code && messages[code]) return { errorCode: code, error: messages[code] };
   if (value.name === "TimeoutError")
     return { errorCode: "AI_TIMEOUT", error: "AI 推理请求超时。" };
   if (value.name === "AbortError")
@@ -26,6 +35,16 @@ export function safeInferenceError(error: unknown) {
     return {
       errorCode: "AI_MODEL_NOT_FOUND",
       error: "AI 模型或接口路径不存在，请检查 Base URL 与模型名称。",
+    };
+  if (status === 402)
+    return {
+      errorCode: "AI_BALANCE",
+      error: "AI 服务账户余额不足，请在提供商平台检查余额。",
+    };
+  if (status === 400 || status === 422)
+    return {
+      errorCode: "AI_PARAMETERS",
+      error: "AI 接口不接受当前请求参数，请检查模型、服务类型与思考模式。",
     };
   if (status === 429)
     return { errorCode: "AI_RATE_LIMIT", error: "AI 接口达到速率或额度限制。" };

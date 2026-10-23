@@ -36,6 +36,7 @@ import {
 
 export interface AiBridge {
   status: { ready: boolean; error?: string; errorCode?: string };
+  readonly busy?: boolean;
   decide(
     profile: AiProfile,
     context: unknown,
@@ -87,6 +88,7 @@ export class Controller extends EventEmitter {
   private nextAiAt = 0;
   private aiEpoch = 0;
   private aiAbort?: AbortController;
+  private draftAbort?: AbortController;
   private aiFlight?: Promise<void>;
   private profile?: AiProfile;
   private aiAction?: {
@@ -244,6 +246,12 @@ export class Controller extends EventEmitter {
   }
   assertIdle() {
     this.assertUnlocked();
+    assert(
+      !this.ai.busy && !this.draftAbort,
+      "已有 AI 请求正在处理或取消，请稍后重试。",
+      "AI_BUSY",
+      409,
+    );
     assert(
       !active(this.run) && !this.stopping,
       "请先停止当前控制，再执行此操作。",
@@ -1000,7 +1008,7 @@ export class Controller extends EventEmitter {
     );
   }
   async draftTask(prompt: string) {
-    this.assertUnlocked();
+    this.assertIdle();
     this.requireAi();
     assert(
       typeof prompt === "string" &&
@@ -1009,11 +1017,26 @@ export class Controller extends EventEmitter {
       "请填写 1 到 8000 字的任务需求。",
     );
     const context = this.aiContext(false);
-    const generated = await this.ai.draft(
-      this.store.profile(),
-      prompt,
-      context,
-    );
+    const abort = new AbortController(),
+      epoch = this.epoch;
+    this.draftAbort = abort;
+    let generated: Awaited<ReturnType<AiBridge["draft"]>>;
+    try {
+      generated = await this.ai.draft(
+        this.store.profile(),
+        prompt,
+        context,
+        abort.signal,
+      );
+      assert(
+        !abort.signal.aborted && epoch === this.epoch,
+        "草稿请求已取消，请重新生成。",
+        "AI_CANCELLED",
+        409,
+      );
+    } finally {
+      if (this.draftAbort === abort) this.draftAbort = undefined;
+    }
     this.assertUnlocked();
     const plan = parsePlan({
       ...generated,
@@ -1077,6 +1100,7 @@ export class Controller extends EventEmitter {
   }
   private cancelAi() {
     ++this.aiEpoch;
+    this.draftAbort?.abort();
     this.aiAbort?.abort();
     this.aiAbort = undefined;
     if (this.run) {

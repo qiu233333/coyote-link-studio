@@ -66,6 +66,15 @@ async function run(request: Request, operation: "test" | "decide" | "draft") {
         },
         409,
       );
+    if (active.size > 0)
+      return json(
+        {
+          ok: false,
+          errorCode: "AI_BUSY",
+          error: "已有 AI 请求正在处理或取消，请稍后重试。",
+        },
+        409,
+      );
     const controller = new AbortController();
     current = {
       controller,

@@ -11,8 +11,13 @@ import { createApplication } from "../server/app.ts";
 import type { AppSnapshot, ControlBounds, TaskPlan } from "../shared/types.ts";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
+const deepseek = process.argv.includes("--deepseek");
 const directory = await mkdtemp(resolve(tmpdir(), "coyote-ai-interruptions-"));
-const artifacts = resolve(root, "artifacts", "ai-interruptions");
+const artifacts = resolve(
+  root,
+  "artifacts",
+  deepseek ? "deepseek-interruptions" : "ai-interruptions",
+);
 const fixtureKey = "isolated-interruption-fixture-key";
 const steps: string[] = [],
   errors: string[] = [],
@@ -68,7 +73,21 @@ const provider = createServer(async (request, response) => {
       "fixture credentials cannot enter prompts",
     );
     const body = JSON.parse(raw);
-    const name = body.tools?.[0]?.function?.name;
+    if (deepseek) {
+      assert.equal(body.thinking.type, "enabled");
+      assert.ok([undefined, "auto", "none"].includes(body.tool_choice));
+    }
+    const toolResult = body.messages.findLast(
+      (item: any) => item.role === "tool",
+    );
+    if (toolResult) {
+      const assistant = body.messages.findLast(
+        (item: any) => item.role === "assistant",
+      );
+      assert.equal(toolResult.tool_call_id, assistant.tool_calls[0].id);
+      assert.equal(assistant.reasoning_content, "isolated-fixture-reasoning");
+    }
+    const name = toolResult ? undefined : body.tools?.[0]?.function?.name;
     calls++;
     let input: unknown;
     if (name === "connection_probe") {
@@ -157,6 +176,9 @@ const provider = createServer(async (request, response) => {
               ? {
                   role: "assistant",
                   content: null,
+                  ...(deepseek
+                    ? { reasoning_content: "isolated-fixture-reasoning" }
+                    : {}),
                   tool_calls: [
                     {
                       id: `call-${calls}`,
@@ -165,7 +187,12 @@ const provider = createServer(async (request, response) => {
                     },
                   ],
                 }
-              : { role: "assistant", content: "fixture connected" },
+              : {
+                  role: "assistant",
+                  content: toolResult
+                    ? JSON.parse(toolResult.content).receipt
+                    : "fixture connected",
+                },
             finish_reason: name ? "tool_calls" : "stop",
           },
         ],
@@ -353,6 +380,14 @@ try {
   await page.goto(baseUrl, { waitUntil: "networkidle" });
   await state("eve ready", (s) => s.aiRuntime.ready, 120000);
   await navigate("系统设置");
+  if (deepseek) {
+    await page
+      .getByRole("combobox", { name: "AI 服务", exact: true })
+      .selectOption("deepseek");
+    await page
+      .getByRole("combobox", { name: "DeepSeek 思考模式", exact: true })
+      .selectOption("enabled");
+  }
   await page
     .getByLabel("AI Base URL", { exact: true })
     .fill(`http://127.0.0.1:${address.port}/v1`);
@@ -365,7 +400,12 @@ try {
     .getByRole("button", { name: "保存并测试连接", exact: true })
     .click();
   await page
-    .getByText("聊天与业务工具调用均已通过实际请求测试。", { exact: true })
+    .getByText(
+      deepseek
+        ? "DeepSeek 聊天、工具调用与工具结果回传均已通过当前接口测试。"
+        : "聊天与业务工具调用均已通过实际请求测试。",
+      { exact: true },
+    )
     .waitFor();
   await api("/api/device/connect", { protocol: "simulator" });
   assert.equal(snapshot().device.protocol, "simulator");

@@ -10,6 +10,11 @@ import {
   AI_TIMEOUT_MAX_SEC,
 } from "../shared/aiTimeouts.js";
 import { assert } from "./errors.js";
+import {
+  aiProvider,
+  credentialTarget,
+  type AiProvider,
+} from "../shared/aiProvider.js";
 
 export class Store {
   private db: DatabaseSync;
@@ -82,6 +87,11 @@ export class Store {
   profile(): AiProfile {
     const saved = this.get<AiSettings & { secret?: string }>("settings", "ai");
     return {
+      provider: aiProvider({
+        baseUrl: saved?.baseUrl ?? "",
+        provider: saved?.provider,
+      }),
+      deepseekThinking: saved?.deepseekThinking ?? "disabled",
       baseUrl: saved?.baseUrl ?? "",
       model: saved?.model ?? "",
       contextWindow: saved?.contextWindow ?? 32000,
@@ -121,6 +131,24 @@ export class Store {
     );
     const model = String(input.model ?? previous.model).trim();
     assert(model.length > 0 && model.length <= 200, "请填写模型名称。");
+    const selected = input.provider ?? previous.provider;
+    assert(
+      selected === "deepseek" || selected === "openai-compatible",
+      "AI 服务类型无效。",
+    );
+    const provider = aiProvider({ baseUrl, provider: selected as AiProvider });
+    const deepseekThinking =
+      input.deepseekThinking ?? previous.deepseekThinking;
+    assert(
+      deepseekThinking === "disabled" || deepseekThinking === "enabled",
+      "DeepSeek 思考模式无效。",
+    );
+    assert(
+      !previous.apiKey ||
+        typeof input.apiKey === "string" ||
+        credentialTarget(previous) === credentialTarget({ baseUrl, provider }),
+      "已切换 AI 服务或地址，请重新输入供该服务使用的 API Key；旧密钥不会自动转发。无需密钥时请先清除已保存的密钥。",
+    );
     const contextWindow = Number(input.contextWindow ?? previous.contextWindow),
       timeoutSec = Number(input.timeoutSec ?? previous.timeoutSec),
       draftTimeoutSec = Number(
@@ -148,6 +176,8 @@ export class Store {
       typeof input.apiKey === "string" ? input.apiKey.trim() : previous.apiKey;
     assert(apiKey.length <= 4096, "API Key 过长。");
     this.set("settings", "ai", {
+      provider,
+      deepseekThinking,
       baseUrl,
       model,
       contextWindow,

@@ -198,6 +198,8 @@ export interface LogEntry {
   channel?: Channel;
 }
 export interface AiSettings {
+  provider?: import("./aiProvider.js").AiProvider;
+  deepseekThinking?: import("./aiProvider.js").DeepSeekThinking;
   baseUrl: string;
   model: string;
   apiKeySet: boolean;

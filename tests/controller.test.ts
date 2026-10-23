@@ -1329,6 +1329,43 @@ test("an unavailable AI runtime immediately ends an active session between decis
   }
 });
 
+test("草稿与启动互斥；急停取消草稿且迟到结果不能入库", async () => {
+  const f = await fixture();
+  try {
+    const p = f.plan(),
+      pending = deferred<TaskPlan>();
+    let signal: AbortSignal | undefined;
+    f.ai.draft = async (_profile, _prompt, _context, abort) => {
+      signal = abort;
+      return pending.promise;
+    };
+    const draft = f.controller.draftTask("生成隔离草稿");
+    const failed = assert.rejects(
+      draft,
+      (error: any) => error.code === "AI_CANCELLED",
+    );
+    await assert.rejects(
+      f.controller.draftTask("第二个草稿"),
+      (error: any) => error.code === "AI_BUSY",
+    );
+    await assert.rejects(
+      f.controller.startAi(f.bounds(), randomUUID()),
+      (error: any) => error.code === "AI_BUSY",
+    );
+    await f.controller.emergency();
+    assert.equal(signal?.aborted, true);
+    pending.resolve(p);
+    await failed;
+    assert.equal(f.store.list("plans").length, 1);
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    f.ai.draft = async () => p;
+    await f.controller.draftTask("重新生成");
+    assert.equal(f.store.list("plans").length, 2);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("a fresh task draft sees the current library and no ended-run authorization", async () => {
   const f = await fixture();
   try {

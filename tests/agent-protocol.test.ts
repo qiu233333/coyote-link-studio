@@ -157,6 +157,15 @@ test("重复内部请求不能移除原请求的取消控制器", async () => {
       internalRequest("/internal/decide", payload),
     );
     assert.equal(duplicate.status, 409);
+    const concurrent = await route("/internal/draft")(
+      internalRequest("/internal/draft", {
+        ...payload,
+        requestId: crypto.randomUUID(),
+        prompt: "other",
+      }),
+    );
+    assert.equal(concurrent.status, 409);
+    assert.equal((await concurrent.json()).errorCode, "AI_BUSY");
     await route("/internal/cancel")(
       internalRequest("/internal/cancel", { requestId: payload.requestId }),
     );

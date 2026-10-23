@@ -10,7 +10,13 @@ import { createApplication } from "../server/app.ts";
 import type { AppSnapshot, ControlBounds } from "../shared/types.ts";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const artifacts = resolve(root, "artifacts");
+const deepseek = process.argv.includes("--deepseek");
+const thinking = process.argv.includes("--thinking") ? "enabled" : "disabled";
+const artifacts = resolve(
+  root,
+  "artifacts",
+  deepseek ? `deepseek-${thinking}` : ".",
+);
 const directory = await mkdtemp(resolve(tmpdir(), "coyote-browser-"));
 const fixtureKey = "local-browser-fixture-key";
 const steps: string[] = [];
@@ -54,8 +60,25 @@ const provider = createServer(async (request, response) => {
     assert.equal(request.headers.authorization, `Bearer ${fixtureKey}`);
     assert.ok(!text.includes(fixtureKey), "凭证不得进入提示词");
     const body = JSON.parse(text);
+    if (deepseek) {
+      assert.equal(body.thinking.type, thinking);
+      if (thinking === "enabled")
+        assert.ok([undefined, "auto", "none"].includes(body.tool_choice));
+      assert.equal(body.response_format, undefined);
+    } else assert.equal(body.thinking, undefined);
     providerCalls++;
-    const name = body.tools?.[0]?.function?.name;
+    const toolResult = body.messages.findLast(
+      (item: any) => item.role === "tool",
+    );
+    if (toolResult) {
+      const assistant = body.messages.findLast(
+        (item: any) => item.role === "assistant",
+      );
+      assert.equal(toolResult.tool_call_id, assistant.tool_calls[0].id);
+      if (thinking === "enabled")
+        assert.equal(assistant.reasoning_content, "isolated-fixture-reasoning");
+    }
+    const name = toolResult ? undefined : body.tools?.[0]?.function?.name;
     let input: unknown;
     if (name === "connection_probe")
       input = {
@@ -150,6 +173,9 @@ const provider = createServer(async (request, response) => {
       ? {
           role: "assistant",
           content: null,
+          ...(deepseek && thinking === "enabled"
+            ? { reasoning_content: "isolated-fixture-reasoning" }
+            : {}),
           tool_calls: [
             {
               id: `browser-call-${providerCalls}`,
@@ -158,7 +184,12 @@ const provider = createServer(async (request, response) => {
             },
           ],
         }
-      : { role: "assistant", content: "连接成功" };
+      : {
+          role: "assistant",
+          content: toolResult
+            ? JSON.parse(toolResult.content).receipt
+            : "连接成功",
+        };
     response.writeHead(200, { "content-type": "application/json" });
     response.end(
       JSON.stringify({
@@ -328,6 +359,22 @@ try {
   steps.push("本地应用与独立 eve 运行时实际启动");
 
   await navigate(page, "系统设置");
+  if (deepseek) {
+    await page
+      .getByRole("combobox", { name: "AI 服务", exact: true })
+      .selectOption("deepseek");
+    assert.equal(
+      await page.getByLabel("AI Base URL", { exact: true }).inputValue(),
+      "https://api.deepseek.com",
+    );
+    assert.equal(
+      await page.getByLabel("AI 模型名称", { exact: true }).inputValue(),
+      "deepseek-flash",
+    );
+    await page
+      .getByRole("combobox", { name: "DeepSeek 思考模式", exact: true })
+      .selectOption(thinking);
+  }
   await page
     .getByRole("textbox", { name: "AI Base URL" })
     .fill(`http://127.0.0.1:${providerAddress.port}/v1`);
@@ -347,7 +394,12 @@ try {
     .getByRole("button", { name: "保存并测试连接", exact: true })
     .click();
   await page
-    .getByText("聊天与业务工具调用均已通过实际请求测试。", { exact: true })
+    .getByText(
+      deepseek
+        ? "DeepSeek 聊天、工具调用与工具结果回传均已通过当前接口测试。"
+        : "聊天与业务工具调用均已通过实际请求测试。",
+      { exact: true },
+    )
     .waitFor();
   const configured = await snapshot(page);
   assert.equal(configured.settings.apiKeySet, true);
@@ -649,6 +701,17 @@ try {
     .fill("先平稳适应，再留一点休息，依据我的文字反馈调整，最多三分钟。");
   await page.getByRole("button", { name: "生成任务草稿", exact: true }).click();
   await page.getByRole("textbox", { name: "任务名称", exact: true }).waitFor();
+  if (deepseek) {
+    const draftsBefore = (await snapshot(page)).plans.length;
+    await page
+      .getByRole("button", { name: "重新生成任务草稿", exact: true })
+      .click();
+    await waitState(
+      page,
+      "草稿重新生成",
+      (state) => state.plans.length > draftsBefore,
+    );
+  }
   await page
     .getByRole("textbox", { name: "任务名称", exact: true })
     .fill("星涟 · 蓝粉约定");
