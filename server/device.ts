@@ -18,13 +18,17 @@ import type {
   DeviceState,
   Protocol,
 } from "../shared/types.js";
+import {
+  DEVICE_RPC_TIMEOUT_MS,
+  DEVICE_STATE_STALE_MS,
+} from "../shared/executionPolicy.js";
 
 export const DEFAULT_RELAY = {
   v4: "wss://trex.dungeon-lab.cn/v4",
   v3: "wss://ws.dungeon-lab.cn/",
 };
-const RPC_TIMEOUT = 1_000;
-const FRESH_MS = 5_000;
+const RPC_TIMEOUT = DEVICE_RPC_TIMEOUT_MS;
+const FRESH_MS = DEVICE_STATE_STALE_MS;
 const CHANNELS: Channel[] = ["A", "B"];
 const key = (client: string, slot: string) => `${client}\u0000${slot}`;
 const number = (value: unknown): value is number =>
@@ -353,7 +357,7 @@ export class CoyoteDevice extends EventEmitter implements DeviceDriver {
       this.state.relayStatus === "connected" &&
       this.state.appStatus === "paired";
     this.state.canConfirmZero =
-      this.state.connected && Date.now() - this.state.lastSeenAt < FRESH_MS;
+      this.state.connected && Date.now() - this.state.lastSeenAt <= FRESH_MS;
     this.state.error = fault
       ? "设备未连接或通道故障"
       : !telemetry

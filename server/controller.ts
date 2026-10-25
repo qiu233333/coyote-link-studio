@@ -3,6 +3,10 @@ import { randomUUID, randomInt } from "node:crypto";
 import { z } from "zod";
 import { channelLimit, outputLimit } from "../shared/limits.js";
 import { channelValues } from "../shared/intensity.js";
+import {
+  AI_MAX_RECOVERY_ATTEMPTS,
+  DEVICE_STATE_STALE_MS,
+} from "../shared/executionPolicy.js";
 import type {
   AiProfile,
   AiDecision,
@@ -267,7 +271,7 @@ export class Controller extends EventEmitter {
       409,
     );
     assert(
-      Date.now() - this.device.state.lastSeenAt <= 6000,
+      Date.now() - this.device.state.lastSeenAt <= DEVICE_STATE_STALE_MS,
       "设备状态已过期，请重新连接。",
       "DEVICE_STALE",
       409,
@@ -1771,7 +1775,8 @@ export class Controller extends EventEmitter {
           } else if (
             error instanceof AiServiceError &&
             error.retryable &&
-            !this.run.inferenceRecovery
+            (this.run.inferenceRecovery?.attempt ?? 0) <
+              AI_MAX_RECOVERY_ATTEMPTS
           ) {
             await this.waitForInferenceRetry(this.run, error);
           } else {
@@ -1809,23 +1814,26 @@ export class Controller extends EventEmitter {
   ) {
     // Recovery retries only inference. Physical stop is performed once and must
     // be confirmed before another model request can authorize any output.
+    const previousRecovery = run.inferenceRecovery;
     const epoch = ++this.epoch;
     this.aiAction = undefined;
     run.thinking = false;
     run.inferenceRecovery = {
-      attempt: 1,
-      maxAttempts: 1,
+      attempt: (previousRecovery?.attempt ?? 0) + 1,
+      maxAttempts: AI_MAX_RECOVERY_ATTEMPTS,
       retryAt: Date.now() + 1000,
       code: error.code,
       message: this.store.redact(error.message),
     };
-    this.stopping = true;
+    this.nextAiAt = run.inferenceRecovery.retryAt;
+    if (!previousRecovery) this.stopping = true;
     this.persist();
     this.log(
       "warning",
       "AI 推理",
-      `${error.code}：${error.message}；正在清队列并确认归零，最多重试一次，截止时间不变。`,
+      `${error.code}：${error.message}；${previousRecovery ? "保持双通道归零" : "正在清队列并确认归零"}，等待重试 ${run.inferenceRecovery.attempt}/${AI_MAX_RECOVERY_ATTEMPTS}，截止时间不变。`,
     );
+    if (previousRecovery) return;
     try {
       const confirmed = await this.stopDevice();
       if (this.run !== run || this.epoch !== epoch || run.status !== "running")
@@ -1883,7 +1891,7 @@ export class Controller extends EventEmitter {
     }
     if (
       !this.device.state.connected ||
-      now - this.device.state.lastSeenAt > 6000
+      now - this.device.state.lastSeenAt > DEVICE_STATE_STALE_MS
     ) {
       void this.finish(
         "faulted",

@@ -16,6 +16,7 @@ async function relay(
   options: {
     ignoreClear?: boolean;
     ignoreIntensity?: boolean;
+    ignorePulse?: boolean;
     retainIntensity?: boolean;
   } = {},
 ) {
@@ -62,6 +63,8 @@ async function relay(
       requests.push(req);
       if (req.m === "device.op.clear" && options.ignoreClear) return;
       if (req.m === "device.op" && req.data.t !== 0 && options.ignoreIntensity)
+        return;
+      if (req.m === "device.op" && req.data.t === 0 && options.ignorePulse)
         return;
       let result: unknown = {};
       if (req.m === "devices.get") result = { devices: [device()] };
@@ -202,6 +205,86 @@ test("V4 discovers devices, uses reported limits and translates absolute targets
   } finally {
     await driver.dispose();
     await mock.close();
+  }
+});
+
+for (const acknowledge of [false, true]) {
+  test(`V4 pulse response waits 20 seconds: ${acknowledge ? "late ACK succeeds" : "missing ACK times out"}`, async (t) => {
+    const mock = await relay({ ignorePulse: true });
+    const driver = new CoyoteDevice();
+    const networkUntil = async (condition: () => boolean) => {
+      const end = Date.now() + 2000;
+      while (!condition()) {
+        if (Date.now() > end) throw new Error("Network condition timed out");
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    };
+    try {
+      await driver.connect({ protocol: "v4", relayUrl: mock.url });
+      await until(() => driver.state.devices.length === 1);
+      await driver.selectDevice("app-1", "slot-1");
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      let settled = false;
+      const result = driver.sendFrames("A", ["0A0A0A0A00000000"]).then(
+        () => {
+          settled = true;
+          return undefined;
+        },
+        (error: Error) => {
+          settled = true;
+          return error;
+        },
+      );
+      const pulseRequest = () =>
+        mock.requests.find(
+          (req) => req.m === "device.op" && (req.data as { t: number }).t === 0,
+        );
+      await networkUntil(() => Boolean(pulseRequest()));
+      t.mock.timers.tick(19_999);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(
+        settled,
+        false,
+        "a response may still arrive before 20 seconds",
+      );
+      if (acknowledge) {
+        mock.send({
+          t: "resp",
+          reqId: pulseRequest()!.reqId,
+          result: {
+            type: 0,
+            reason: "completed",
+            channel: 0,
+            slotId: "slot-1",
+          },
+        });
+        await networkUntil(() => settled);
+        assert.equal(await result, undefined);
+      } else {
+        t.mock.timers.tick(1);
+        assert.match((await result)!.message, /超时/);
+      }
+    } finally {
+      t.mock.timers.reset();
+      await driver.dispose();
+      await mock.close();
+    }
+  });
+}
+
+test("driver accepts 20-second telemetry and rejects older state before sending", async () => {
+  const driver = new CoyoteDevice();
+  try {
+    await driver.connect({ protocol: "simulator" });
+    for (const age of [7000, 19_900]) {
+      driver.state.lastSeenAt = Date.now() - age;
+      await driver.sendFrames("A", ["0A0A0A0A00000000"]);
+      assert.equal(driver.state.connected, true);
+    }
+    driver.state.lastSeenAt = Date.now() - 20_001;
+    await assert.rejects(driver.sendFrames("A", ["0A0A0A0A00000000"]), /过期/);
+  } finally {
+    await driver.dispose();
   }
 });
 

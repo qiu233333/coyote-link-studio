@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { DEVICE_STATE_STALE_MS } from "../shared/executionPolicy.js";
 import type {
   AppSnapshot,
   Channel,
@@ -392,13 +393,24 @@ test("AI 及任务预检全局数据格式，未选通道设备上限及反向�
   assert.match(taskPlanIssue(snapshot, plan)!, /AI 最高强度.*B 通道强度须为/);
 });
 
+test("播放器与后台共同采用20秒设备状态阈值", (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const snapshot = state();
+  for (const age of [7000, 19_999, 20_000]) {
+    snapshot.device.lastSeenAt = Date.now() - age;
+    assert.equal(playbackConfigIssue(snapshot, playback()), null);
+  }
+  snapshot.device.lastSeenAt = Date.now() - 20_001;
+  assert.match(playbackConfigIssue(snapshot, playback())!, /已过期/);
+});
+
 test("播放器明确说明失联、停止未确认、运行和锁定阻止启动", () => {
   const snapshot = state();
   snapshot.channels.A.limit = snapshot.channels.B.limit = 10;
   snapshot.device.connected = false;
   assert.match(playbackConfigIssue(snapshot, playback())!, /连接/);
   snapshot.device.connected = true;
-  snapshot.device.lastSeenAt = Date.now() - 7000;
+  snapshot.device.lastSeenAt = Date.now() - DEVICE_STATE_STALE_MS - 1;
   assert.match(playbackConfigIssue(snapshot, playback())!, /已过期/);
   snapshot.device.lastSeenAt = Date.now();
   snapshot.stopUnconfirmed = true;

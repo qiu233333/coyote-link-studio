@@ -8,6 +8,7 @@ import type {
   TaskPlan,
 } from "../shared/types";
 import { channelLimit } from "../shared/limits";
+import { DEVICE_STATE_STALE_MS } from "../shared/executionPolicy";
 
 const channels: Channel[] = ["A", "B"];
 const active = (state: AppSnapshot) =>
@@ -116,7 +117,7 @@ export function playbackConfigIssue(
   if (state.stopUnconfirmed) return "设备停止尚未确认，请重新连接并清理。";
   if (active(state)) return "请先停止当前控制，再开始新的播放。";
   if (!state.device.connected) return "请先连接并选择设备。";
-  if (Date.now() - state.device.lastSeenAt > 6000)
+  if (Date.now() - state.device.lastSeenAt > DEVICE_STATE_STALE_MS)
     return "设备状态已过期，请重新连接。";
   const waves = new Set(state.waveforms.map((wave) => wave.id));
   if (config.mode === "random") {

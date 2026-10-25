@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { chromium, type Browser, type Page } from "playwright";
 import { createApplication } from "../server/app.ts";
 import type { AppSnapshot, ControlBounds, TaskPlan } from "../shared/types.ts";
+import { AI_MAX_RECOVERY_ATTEMPTS } from "../shared/executionPolicy.ts";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const deepseek = process.argv.includes("--deepseek");
@@ -30,6 +31,7 @@ let scenario:
   | "normal"
   | "timeout-once"
   | "timeout-always"
+  | "unavailable-always"
   | "invalid"
   | "finish"
   | "phase" = "normal";
@@ -125,6 +127,15 @@ const provider = createServer(async (request, response) => {
         feedbackText,
       );
       const requestedPhase = feedbackText.includes("完成当前模拟阶段");
+      if (scenario === "unavailable-always") {
+        response.writeHead(503, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({
+            error: { message: "isolated unavailable fixture" },
+          }),
+        );
+        return;
+      }
       if (
         scenario === "timeout-always" ||
         (scenario === "timeout-once" &&
@@ -313,9 +324,11 @@ async function feedback(text: string) {
     ),
   );
 }
-async function finished(source: string) {
-  await state(source, (s) =>
-    Boolean(s.run?.termination?.source === source && !s.stopping),
+async function finished(source: string, timeout?: number) {
+  await state(
+    source,
+    (s) => Boolean(s.run?.termination?.source === source && !s.stopping),
+    timeout,
   );
   assert.deepEqual(snapshot().device.intensities, { A: 0, B: 0 });
   assert.ok(page);
@@ -548,7 +561,8 @@ try {
   );
 
   for (const owner of ["ai-control", "locked-task"] as const) {
-    scenario = "timeout-always";
+    scenario = "unavailable-always";
+    const callsBefore = calls;
     await navigate(owner === "ai-control" ? "AI 控制" : "AI 上锁任务");
     if (owner === "ai-control")
       await api("/api/ai-control/start", { bounds, requestId: randomUUID() });
@@ -556,9 +570,10 @@ try {
       await api(`/api/locked-tasks/${planId}/start`, {
         requestId: randomUUID(),
       });
-    await finished("ai-inference");
+    await finished("ai-inference", (AI_MAX_RECOVERY_ATTEMPTS + 1) * 2000);
     assert.equal(snapshot().run!.status, "faulted");
-    assert.equal(snapshot().run!.termination?.code, "AI_TIMEOUT");
+    assert.equal(snapshot().run!.termination?.code, "AI_PROVIDER_UNAVAILABLE");
+    assert.equal(calls - callsBefore, AI_MAX_RECOVERY_ATTEMPTS + 1);
     const failedId = snapshot().run!.id;
     scenario = "normal";
     await new Promise((resolveWait) => setTimeout(resolveWait, 1100));
@@ -567,7 +582,7 @@ try {
     await capture(`${owner}-persistent-timeout`);
   }
   steps.push(
-    "两种 AI 模式持续真实超时仅有限重试，最终故障来源/AI_TIMEOUT可见，故障后不自动恢复",
+    "两种 AI 模式持续503故障在初次失败后各重试20次，最终故障来源可见，故障后不自动恢复；单次真实超时已在前序流程验证",
   );
 
   await navigate("AI 控制");
