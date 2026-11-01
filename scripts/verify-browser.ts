@@ -382,6 +382,28 @@ try {
   await page
     .getByRole("textbox", { name: "AI 模型名称" })
     .fill("browser-local-fixture");
+  const contextWindow = page.getByLabel("模型上下文窗口", { exact: true });
+  for (const value of [32000, 128000, 1000000, 2000000]) {
+    await contextWindow.fill(String(value));
+    assert.equal(
+      await contextWindow.evaluate(
+        (input: HTMLInputElement) => input.validity.valid,
+      ),
+      true,
+      `上下文窗口 ${value} 应能通过浏览器原生校验`,
+    );
+  }
+  for (const value of [1023, 2000001, 1000000.5]) {
+    await contextWindow.fill(String(value));
+    assert.equal(
+      await contextWindow.evaluate(
+        (input: HTMLInputElement) => input.validity.valid,
+      ),
+      false,
+      `上下文窗口 ${value} 应被范围或整数校验拒绝`,
+    );
+  }
+  await contextWindow.fill("1000000");
   const decisionTimeout = page.getByLabel("AI 请求超时", { exact: true });
   const draftTimeout = page.getByLabel("AI 任务草稿超时", { exact: true });
   assert.equal(await decisionTimeout.inputValue(), "120");
@@ -390,6 +412,12 @@ try {
   assert.equal(await draftTimeout.getAttribute("max"), "600");
   await decisionTimeout.fill("240");
   await draftTimeout.fill("300");
+  await page.getByRole("button", { name: "保存配置", exact: true }).click();
+  await waitState(
+    page,
+    "普通表单提交保存一百万 token 的上下文窗口",
+    (state) => state.settings.contextWindow === 1000000,
+  );
   await page
     .getByRole("button", { name: "保存并测试连接", exact: true })
     .click();
@@ -403,6 +431,7 @@ try {
     .waitFor();
   const configured = await snapshot(page);
   assert.equal(configured.settings.apiKeySet, true);
+  assert.equal(configured.settings.contextWindow, 1000000);
   assert.equal(configured.settings.timeoutSec, 240);
   assert.equal(configured.settings.draftTimeoutSec, 300);
   assert.ok(!JSON.stringify(configured).includes(fixtureKey));

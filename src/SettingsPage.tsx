@@ -313,13 +313,16 @@ export default function SettingsPage({
                 </Field>
               )}
               <div className="form-grid">
-                <Field label="上下文窗口 / tokens">
+                <Field
+                  label="上下文窗口 / tokens"
+                  hint="填写模型实际支持的整数 token 数，范围为 1024–2000000。"
+                >
                   <NumberInput
                     label="模型上下文窗口"
                     value={form.contextWindow}
                     min={1024}
                     max={2000000}
-                    step={1024}
+                    step={1}
                     onChange={(contextWindow) =>
                       setForm({ ...form, contextWindow })
                     }
