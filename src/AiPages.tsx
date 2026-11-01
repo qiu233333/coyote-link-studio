@@ -405,7 +405,7 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
               <span>最晚截止倒计时</span>
               <strong>{duration(timeLeft(run.deadlineAt))}</strong>
               <small>
-                {new Date(run.deadlineAt).toLocaleString("zh-CN", {
+                {new Date(run.deadlineAt!).toLocaleString("zh-CN", {
                   hour12: false,
                 })}
               </small>

@@ -103,8 +103,8 @@ export function useAppState() {
 export const requestId = () => crypto.randomUUID();
 export const isActive = (state: AppSnapshot) =>
   Boolean(state.run && ["running", "paused"].includes(state.run.status));
-export const timeLeft = (deadline: number) =>
-  Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+export const timeLeft = (deadline: number | null) =>
+  Math.max(0, Math.ceil(((deadline ?? Date.now()) - Date.now()) / 1000));
 export function duration(value: number) {
   const seconds = Math.max(0, Math.floor(value));
   return `${Math.floor(seconds / 60)
@@ -114,6 +114,7 @@ export function duration(value: number) {
 export const clockTime = (at: number) =>
   new Date(at).toLocaleTimeString("zh-CN", { hour12: false });
 export const ownerNames = {
+  roleplay: "情景演绎",
   manual: "控制台",
   "ai-control": "AI 控制",
   "locked-task": "AI 上锁任务",

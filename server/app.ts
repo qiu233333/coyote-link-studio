@@ -1,3 +1,5 @@
+import { RoleplayService } from "./roleplay.js";
+import { fileOf } from "../shared/roleplay.js";
 import express, {
   type Request,
   type Response,
@@ -41,6 +43,7 @@ export async function createApplication(
   const device = new CoyoteDevice(),
     ai = new AiService({ runtimeDirectory: options.aiDirectory });
   const controller = new Controller(store, device, ai, getBuiltinWaveforms());
+  const roleplay = new RoleplayService(store, controller, ai);
   const csrf = randomBytes(32).toString("hex");
   let localPort = 0;
   const allowedHosts = () =>
@@ -97,6 +100,11 @@ export async function createApplication(
     "/api/waveforms/import",
     express.json({ limit: MAX_WAVEFORM_IMPORT_BODY_BYTES, strict: true }),
   );
+  app.use(
+    "/api/roleplay/cards/import/extract",
+    express.raw({ type: "application/octet-stream", limit: "20mb" }),
+  );
+  app.use("/api/roleplay", express.json({ limit: "20mb", strict: true }));
   app.use(express.json({ limit: "5mb", strict: true }));
   app.get("/api/health", (_req, res) =>
     res.json({ ok: true, data: { service: "coyote-link", ai: ai.status } }),
@@ -110,7 +118,7 @@ export async function createApplication(
   });
   type Action = (req: Request) => unknown | Promise<unknown>;
   const route = (
-    method: "post" | "put" | "patch" | "delete",
+    method: "get" | "post" | "put" | "patch" | "delete",
     path: string,
     action: Action,
   ) => {
@@ -119,7 +127,7 @@ export async function createApplication(
       async (req: Request, res: Response, next: NextFunction) => {
         try {
           const result = await action(req);
-          controller.broadcast(true);
+          if (method !== "get") controller.broadcast(true);
           res.json({
             ok: true,
             data: result === undefined ? controller.snapshot() : result,
@@ -239,6 +247,92 @@ export async function createApplication(
     controller.assertIdle();
     return ai.test(store.profile());
   });
+  route("get", "/api/roleplay/card-format", () => roleplay.format());
+  route("get", "/api/roleplay/cards", () => roleplay.cards());
+  route("post", "/api/roleplay/cards", (req) => roleplay.saveCard(req.body));
+  route("patch", "/api/roleplay/cards/:id", (req) =>
+    roleplay.saveCard(req.body, String(req.params.id)),
+  );
+  route("delete", "/api/roleplay/cards/:id", (req) => {
+    roleplay.deleteCard(String(req.params.id));
+    return { deleted: true };
+  });
+  route("post", "/api/roleplay/cards/:id/copy", (req) =>
+    roleplay.copyCard(String(req.params.id)),
+  );
+  route("get", "/api/roleplay/cards/:id/export", (req) =>
+    fileOf(roleplay.card(String(req.params.id))),
+  );
+  route("post", "/api/roleplay/cards/import/extract", (req) => {
+    assert(Buffer.isBuffer(req.body), "请上传二进制文件");
+    return roleplay.extract(req.body);
+  });
+  route("post", "/api/roleplay/cards/import/convert", (req) =>
+    roleplay.convert(req.body.source),
+  );
+  route("get", "/api/roleplay/sessions", () => roleplay.sessions());
+  route("post", "/api/roleplay/sessions", (req) => roleplay.create(req.body));
+  route("get", "/api/roleplay/sessions/:id", (req) =>
+    req.query.status === "1"
+      ? (() => {
+          const { id, title, revision, updatedAt, memory, turnId } =
+            roleplay.session(String(req.params.id));
+          return { id, title, revision, updatedAt, memory, turnId };
+        })()
+      : roleplay.session(String(req.params.id)),
+  );
+  route("patch", "/api/roleplay/sessions/:id", (req) =>
+    roleplay.rename(String(req.params.id), req.body.title),
+  );
+  route("delete", "/api/roleplay/sessions/:id", (req) => {
+    roleplay.remove(String(req.params.id));
+    return { deleted: true };
+  });
+  route("get", "/api/roleplay/sessions/:id/messages", (req) => {
+    const before =
+      req.query.before === undefined ? undefined : Number(req.query.before);
+    assert(
+      before === undefined || Number.isSafeInteger(before),
+      "分页游标无效",
+    );
+    return roleplay.messages(String(req.params.id), before);
+  });
+  route("get", "/api/roleplay/sessions/:id/export", (req) =>
+    roleplay.export(String(req.params.id)),
+  );
+  route("post", "/api/roleplay/sessions/:id/messages", (req) =>
+    roleplay.send(String(req.params.id), req.body),
+  );
+  route("get", "/api/roleplay/sessions/:id/turns/:turnId", (req) =>
+    roleplay.turn(String(req.params.id), String(req.params.turnId)),
+  );
+  route("post", "/api/roleplay/sessions/:id/link/start", (req) =>
+    roleplay.startLink(
+      String(req.params.id),
+      req.body.bounds,
+      String(req.body.requestId),
+    ),
+  );
+  route("post", "/api/roleplay/sessions/:id/link/pause", (req) => {
+    roleplay.link(String(req.params.id));
+    return controller.pause("roleplay");
+  });
+  route("post", "/api/roleplay/sessions/:id/link/resume", (req) => {
+    roleplay.link(String(req.params.id));
+    return controller.resume("roleplay");
+  });
+  route("patch", "/api/roleplay/sessions/:id/link/bounds", (req) => {
+    roleplay.link(String(req.params.id));
+    return controller.changeRoleplayBounds(req.body.bounds);
+  });
+  route("post", "/api/roleplay/sessions/:id/link/stop", (req) => {
+    roleplay.link(String(req.params.id));
+    return controller.stop("roleplay");
+  });
+  route("post", "/api/roleplay/cancel", () => {
+    roleplay.cancel();
+    return { cancelled: true };
+  });
   app.use("/api", (_req, res) =>
     res
       .status(404)
@@ -350,6 +444,7 @@ export async function createApplication(
     app,
     server,
     controller,
+    roleplay,
     store,
     ai,
     device,
@@ -375,6 +470,7 @@ export async function createApplication(
       return `http://127.0.0.1:${localPort}`;
     },
     async close() {
+      await roleplay.close();
       await controller.close();
       await ai.stop();
       await device.disconnect();

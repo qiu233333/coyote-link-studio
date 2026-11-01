@@ -1,3 +1,9 @@
+import {
+  applyOutputPatch,
+  roleplayBoundsSchema,
+  type RoleplayBounds,
+  type RoleplayPatch,
+} from "../shared/roleplay.js";
 import { EventEmitter } from "node:events";
 import { randomUUID, randomInt } from "node:crypto";
 import { z } from "zod";
@@ -15,6 +21,7 @@ import type {
   ChannelConfig,
   ControlBounds,
   ControlSession,
+  TimedControlSession,
   DeviceDriver,
   Feedback,
   LogEntry,
@@ -74,6 +81,8 @@ export class Controller extends EventEmitter {
   public synced = false;
   public stopUnconfirmed = false;
   public stopping = false;
+  public roleplayBusy = false;
+  public roleplaySummary?: () => AppSnapshot["roleplay"];
   private logs: LogEntry[];
   private history: AppSnapshot["history"] = [];
   private timer: ReturnType<typeof setInterval>;
@@ -217,7 +226,7 @@ export class Controller extends EventEmitter {
               this.config.A.enabled &&
               this.config.B.enabled &&
               this.run?.owner === "manual",
-            this.run?.bounds,
+            this.run?.roleplay?.bounds ?? this.run?.bounds,
           );
           if (state.intensities[channel] > limit) {
             void this.finish(
@@ -251,7 +260,7 @@ export class Controller extends EventEmitter {
   assertIdle() {
     this.assertUnlocked();
     assert(
-      !this.ai.busy && !this.draftAbort,
+      !this.ai.busy && !this.draftAbort && !this.roleplayBusy,
       "已有 AI 请求正在处理或取消，请稍后重试。",
       "AI_BUSY",
       409,
@@ -292,7 +301,9 @@ export class Controller extends EventEmitter {
         this.run?.mode !== "live" &&
         (!active(this.run) || this.run?.mode === "single") &&
         (!active(this.run) || this.run?.owner === "manual"),
-      active(this.run) ? this.run?.bounds : undefined,
+      active(this.run)
+        ? (this.run?.roleplay?.bounds ?? this.run?.bounds)
+        : undefined,
     );
   }
   private clampToDeviceLimits() {
@@ -314,6 +325,14 @@ export class Controller extends EventEmitter {
           this.run.playback.singleTargets[channel] = maximum;
         changed = true;
       }
+      if (
+        active(this.run) &&
+        this.run?.roleplay &&
+        this.run.roleplay.output[channel].target > maximum
+      ) {
+        this.run.roleplay.output[channel].target = maximum;
+        changed = true;
+      }
       this.levels[channel] = Math.min(
         this.levels[channel],
         this.effectiveLimit(channel),
@@ -327,6 +346,7 @@ export class Controller extends EventEmitter {
   }
   snapshot(): AppSnapshot {
     return {
+      roleplay: this.roleplaySummary?.(),
       device: this.device.state,
       channels: this.config,
       synced: this.synced,
@@ -837,12 +857,110 @@ export class Controller extends EventEmitter {
       if (this.epoch === epoch) this.stopping = false;
     }
   }
+  async startRoleplay(sessionId: string, input: unknown, requestId: string) {
+    if (this.seenRequest(requestId)) return;
+    const bounds = roleplayBoundsSchema.parse(input);
+    this.checkRoleplayBounds(bounds);
+    await this.prepare(requestId);
+    this.checkRoleplayBounds(bounds);
+    const run: ControlSession = {
+      ...this.makeRun("manual", "roleplay", 1, bounds.waveformIds),
+      owner: "roleplay",
+      deadlineAt: null,
+      roleplay: {
+        sessionId,
+        bounds,
+        output: {
+          A: {
+            target: 0,
+            waveformId: bounds.waveformIds[0],
+            rampPerSecond: bounds.rampPerSecond.A,
+          },
+          B: {
+            target: 0,
+            waveformId: bounds.waveformIds[0],
+            rampPerSecond: bounds.rampPerSecond.B,
+          },
+        },
+      },
+    };
+    this.run = run;
+    this.persist();
+    this.broadcast(true);
+  }
+  private checkRoleplayBounds(bounds: RoleplayBounds) {
+    for (const c of bounds.channels) {
+      assert(this.config[c].enabled, c + " 通道未启用");
+      assert(
+        bounds.maxIntensity[c] <= this.device.state.limits[c],
+        c + " 授权超过设备上限",
+      );
+    }
+    for (const id of bounds.waveformIds) this.requireWave(id);
+  }
+  applyRoleplay(runId: string, version: number, patch: RoleplayPatch) {
+    const run = this.run;
+    assert(
+      run?.id === runId &&
+        run.owner === "roleplay" &&
+        run.status === "running" &&
+        !this.stopping &&
+        run.boundsVersion === version,
+      "演绎授权已经失效",
+      "STALE_ACTION",
+      409,
+    );
+    const link = run.roleplay!;
+    const next = applyOutputPatch(link.output, patch, link.bounds);
+    for (const c of channels)
+      assert(
+        next[c].target <= this.device.state.limits[c],
+        c + " 目标超过设备当前上限",
+      );
+    link.output = next;
+    this.persist();
+    return structuredClone(next);
+  }
+  async changeRoleplayBounds(input: unknown) {
+    assert(
+      this.run?.owner === "roleplay" && active(this.run),
+      "当前没有演绎联动",
+      "OWNER_CONFLICT",
+      409,
+    );
+    const bounds = roleplayBoundsSchema.parse(input);
+    this.checkRoleplayBounds(bounds);
+    if (this.run.status === "running") await this.pause("roleplay");
+    assert(
+      this.run?.owner === "roleplay" &&
+        this.run.status === "paused" &&
+        !this.stopUnconfirmed,
+      "归零尚未确认",
+    );
+    this.checkRoleplayBounds(bounds);
+    this.run.roleplay!.bounds = bounds;
+    this.run.boundsVersion++;
+    for (const c of channels)
+      this.run.roleplay!.output[c] = {
+        target: 0,
+        waveformId: bounds.waveformIds[0],
+        rampPerSecond: bounds.rampPerSecond[c],
+      };
+    this.run.waveformSnapshots = Object.fromEntries(
+      bounds.waveformIds.map((id) => [
+        id,
+        structuredClone(this.requireWave(id)),
+      ]),
+    );
+    this.persist();
+    this.broadcast(true);
+  }
   private makeRun(
-    owner: Owner,
+    owner: Exclude<Owner, "roleplay">,
     mode: string,
     durationSec: number,
     waveformIds: string[],
-  ): ControlSession {
+  ): TimedControlSession {
     const now = Date.now();
     const snapshots = Object.fromEntries(
       [...new Set(waveformIds)].map((id) => {
@@ -1098,11 +1216,12 @@ export class Controller extends EventEmitter {
     this.log(
       "info",
       "上锁任务",
-      `「${plan.title}」已确认并锁定，最晚 ${new Date(this.run.deadlineAt).toLocaleTimeString("zh-CN")} 结束`,
+      `「${plan.title}」已确认并锁定，最晚 ${new Date(this.run.deadlineAt!).toLocaleTimeString("zh-CN")} 结束`,
     );
     this.nextAiAt = 0;
   }
   private cancelAi() {
+    this.emit("roleplay-cancel");
     ++this.aiEpoch;
     this.draftAbort?.abort();
     this.aiAbort?.abort();
@@ -1131,6 +1250,8 @@ export class Controller extends EventEmitter {
       epoch = ++this.epoch;
     run.elapsedMs += Date.now() - this.progressAt;
     run.status = "paused";
+    if (run.roleplay)
+      for (const c of channels) run.roleplay.output[c].target = 0;
     this.cancelAi();
     this.stopping = true;
     this.broadcast(true);
@@ -1184,7 +1305,7 @@ export class Controller extends EventEmitter {
       );
     this.assertDevice();
     assert(
-      Date.now() < this.run.deadlineAt,
+      this.run.deadlineAt === null || Date.now() < this.run.deadlineAt,
       "会话已经到期，不能恢复。",
       "RUN_EXPIRED",
       409,
@@ -1412,7 +1533,8 @@ export class Controller extends EventEmitter {
     }
     await this.pause("manual");
     run.elapsedMs = Math.floor(elapsed / pass) * pass + cursor;
-    if (Date.now() < run.deadlineAt) await this.resume("manual");
+    if (run.deadlineAt === null || Date.now() < run.deadlineAt)
+      await this.resume("manual");
   }
   private zeroDesired(): Desired {
     return {
@@ -1671,7 +1793,7 @@ export class Controller extends EventEmitter {
           this.aiEpoch !== aiEpoch ||
           this.run.boundsVersion !== version ||
           this.run.status !== "running" ||
-          Date.now() >= this.run.deadlineAt
+          (this.run.deadlineAt !== null && Date.now() >= this.run.deadlineAt)
         )
           return;
         const decision = decisionSchema.parse(raw),
@@ -1735,7 +1857,7 @@ export class Controller extends EventEmitter {
           decision.stageDurationSec !== undefined &&
           this.run.owner === "locked-task"
         ) {
-          const remaining = this.run.deadlineAt - this.run.stageStartedAt;
+          const remaining = this.run.deadlineAt! - this.run.stageStartedAt;
           assert(
             decision.stageDurationSec * 1000 <= remaining,
             "AI 阶段延时超过最晚截止时间。",
@@ -1752,7 +1874,7 @@ export class Controller extends EventEmitter {
             decision,
             expiresAt: Math.min(
               Date.now() + decision.durationSec * 1000,
-              this.run.deadlineAt,
+              this.run.deadlineAt!,
             ),
             stageIndex: this.run.stageIndex,
           };
@@ -1766,7 +1888,10 @@ export class Controller extends EventEmitter {
           this.aiEpoch === aiEpoch &&
           this.run.status === "running"
         ) {
-          if (Date.now() >= this.run.deadlineAt) {
+          if (
+            this.run.deadlineAt !== null &&
+            Date.now() >= this.run.deadlineAt
+          ) {
             await this.finish(
               "completed",
               "已到达确认的最晚截止时间",
@@ -1881,7 +2006,7 @@ export class Controller extends EventEmitter {
       this.broadcast();
       return;
     }
-    if (now >= this.run!.deadlineAt) {
+    if (this.run!.deadlineAt !== null && now >= this.run!.deadlineAt) {
       void this.finish("completed", "已到达确认的最晚截止时间", "deadline");
       return;
     }
@@ -1916,7 +2041,12 @@ export class Controller extends EventEmitter {
     const run = this.run!,
       epoch = this.epoch;
     let desired: Desired;
-    if (run.owner === "manual") desired = this.playbackDesired(now);
+    if (run.owner === "roleplay")
+      desired = {
+        A: { ...run.roleplay!.output.A },
+        B: { ...run.roleplay!.output.B },
+      };
+    else if (run.owner === "manual") desired = this.playbackDesired(now);
     else {
       desired =
         run.owner === "locked-task"
@@ -1938,7 +2068,7 @@ export class Controller extends EventEmitter {
         { A: 200, B: 200 },
         channel,
         this.synced && run.mode === "single" && run.owner === "manual",
-        run.bounds,
+        run.roleplay?.bounds ?? run.bounds,
       );
       if (
         !Number.isFinite(output.target) ||
@@ -1956,11 +2086,13 @@ export class Controller extends EventEmitter {
       this.levels[channel] = Math.min(this.levels[channel], maximum);
       const rate = Math.min(
         20,
-        run.bounds
-          ? run.bounds.rampPerSecond[channel]
-          : run.mode === "live"
-            ? 20
-            : this.config[channel].rampPerSecond,
+        run.roleplay
+          ? run.roleplay.output[channel].rampPerSecond
+          : run.bounds
+            ? run.bounds.rampPerSecond[channel]
+            : run.mode === "live"
+              ? 20
+              : this.config[channel].rampPerSecond,
       );
       const difference = output.target - this.levels[channel];
       this.levels[channel] =
@@ -2011,7 +2143,9 @@ export class Controller extends EventEmitter {
         }
         const remainingFrames = Math.max(
           1,
-          Math.min(5, Math.ceil((run.deadlineAt - now) / 100)),
+          run.deadlineAt === null
+            ? 5
+            : Math.min(5, Math.ceil((run.deadlineAt - now) / 100)),
         );
         const frames = Array.from(
           { length: remainingFrames },

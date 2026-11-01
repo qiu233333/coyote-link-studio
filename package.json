@@ -17,7 +17,8 @@
     "verify:ai-interruptions": "tsx scripts/verify-ai-interruptions-browser.ts",
     "verify:intensity-scaling": "tsx scripts/verify-intensity-scaling-browser.ts",
     "verify:limits": "tsx scripts/verify-limits-browser.ts",
-    "verify:live": "tsx scripts/verify-limits-browser.ts"
+    "verify:live": "tsx scripts/verify-limits-browser.ts",
+    "verify:roleplay": "tsx scripts/verify-roleplay.ts"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "3.0.70",

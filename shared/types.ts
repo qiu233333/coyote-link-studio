@@ -1,6 +1,6 @@
 export type Channel = "A" | "B";
 export type ChannelValues = Record<Channel, number>;
-export type Owner = "manual" | "ai-control" | "locked-task";
+export type Owner = "manual" | "ai-control" | "locked-task" | "roleplay";
 export type Protocol = "v4" | "v3" | "simulator";
 export type RunStatus =
   "running" | "paused" | "completed" | "stopped" | "faulted" | "interrupted";
@@ -155,13 +155,11 @@ export type RunTerminationSource =
   | "stop-unconfirmed"
   | "service-shutdown"
   | "service-restart";
-export interface ControlSession {
+interface ControlSessionBase {
   id: string;
-  owner: Owner;
   status: RunStatus;
   mode: string;
   startedAt: number;
-  deadlineAt: number;
   boundsVersion: number;
   bounds?: ControlBounds;
   plan?: TaskPlan;
@@ -189,6 +187,17 @@ export interface ControlSession {
   lastDecision?: AiDecision;
   thinking: boolean;
 }
+export type TimedControlSession = ControlSessionBase & {
+  owner: Exclude<Owner, "roleplay">;
+  deadlineAt: number;
+  roleplay?: never;
+};
+export type RoleplayControlSession = ControlSessionBase & {
+  owner: "roleplay";
+  deadlineAt: null;
+  roleplay: import("./roleplay.js").RoleplayLink;
+};
+export type ControlSession = TimedControlSession | RoleplayControlSession;
 export interface LogEntry {
   id: string;
   at: number;
@@ -211,6 +220,10 @@ export interface AiProfile extends AiSettings {
   apiKey: string;
 }
 export interface AppSnapshot {
+  roleplay?: {
+    activeSessionId?: string;
+    turn?: import("./roleplay.js").RoleplayTurn;
+  };
   device: DeviceState;
   channels: Record<Channel, ChannelConfig>;
   synced: boolean;

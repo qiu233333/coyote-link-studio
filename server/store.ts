@@ -61,6 +61,52 @@ export class Store {
       .prepare("DELETE FROM documents WHERE collection=? AND id=?")
       .run(collection, id);
   }
+  transaction<T>(fn: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const value = fn();
+      this.db.exec("COMMIT");
+      return value;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+  page<T>(
+    collection: string,
+    limit = 50,
+    before = Number.MAX_SAFE_INTEGER,
+  ): { items: T[]; cursor?: number } {
+    const rows = this.db
+      .prepare(
+        "SELECT rowid,payload FROM documents WHERE collection=? AND rowid<? ORDER BY rowid DESC LIMIT ?",
+      )
+      .all(collection, before, Math.min(100, Math.max(1, limit))) as {
+      rowid: number;
+      payload: string;
+    }[];
+    return {
+      items: rows.map((r) => JSON.parse(r.payload) as T),
+      cursor: rows.length ? rows.at(-1)!.rowid : undefined,
+    };
+  }
+  storyRange<T>(
+    collection: string,
+    afterSeq: number,
+    beforeSeq: number,
+    limit = 20,
+  ): T[] {
+    return (
+      this.db
+        .prepare(
+          "SELECT payload FROM documents WHERE collection=? AND json_extract(payload,'$.seq')>? AND json_extract(payload,'$.seq')<? ORDER BY rowid ASC LIMIT ?",
+        )
+        .all(collection, afterSeq, beforeSeq, limit) as { payload: string }[]
+    ).map((r) => JSON.parse(r.payload) as T);
+  }
+  clear(collection: string) {
+    this.db.prepare("DELETE FROM documents WHERE collection=?").run(collection);
+  }
   private seal(text: string): string {
     const iv = randomBytes(12),
       cipher = createCipheriv("aes-256-gcm", this.key, iv);

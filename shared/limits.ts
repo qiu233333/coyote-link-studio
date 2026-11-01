@@ -11,7 +11,7 @@ export function channelLimit(
   config: Channels,
   deviceLimits: Limits,
   channel: Channel,
-  bounds?: ControlBounds,
+  bounds?: Pick<ControlBounds, "channels" | "maxIntensity">,
 ): number {
   if (
     !config[channel].enabled ||
@@ -30,7 +30,7 @@ export function outputLimit(
   deviceLimits: Limits,
   channel: Channel,
   synced: boolean,
-  bounds?: ControlBounds,
+  bounds?: Pick<ControlBounds, "channels" | "maxIntensity">,
 ): number {
   return synced
     ? Math.min(

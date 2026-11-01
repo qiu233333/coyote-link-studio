@@ -7,6 +7,7 @@ import {
   aiTimeoutMessage,
   AI_TIMEOUT_MAX_SEC,
 } from "../../shared/aiTimeouts.ts";
+import { story } from "../lib/roleplay.ts";
 import * as inference from "../lib/inference.ts";
 import { safeInferenceError } from "../lib/errors.ts";
 import { profileSchema } from "../lib/schemas.ts";
@@ -37,7 +38,10 @@ function authorized(request: Request) {
 const json = (data: unknown, status = 200) =>
   Response.json(data, { status, headers: { "cache-control": "no-store" } });
 
-async function run(request: Request, operation: "test" | "decide" | "draft") {
+async function run(
+  request: Request,
+  operation: "test" | "decide" | "draft" | "roleplay" | "card" | "summarize",
+) {
   if (!authorized(request))
     return json({ ok: false, error: "Unauthorized" }, 401);
   if (Number(request.headers.get("content-length") ?? 0) > 524288)
@@ -90,8 +94,14 @@ async function run(request: Request, operation: "test" | "decide" | "draft") {
       () => controller.abort(new DOMException("Timed out", "TimeoutError")),
       aiTimeoutSeconds(profile, operation) * 1000,
     );
-    const data =
-      operation === "test"
+    const data = ["roleplay", "card", "summarize"].includes(operation)
+      ? await story(
+          operation as "roleplay" | "card" | "summarize",
+          profile,
+          payload.context,
+          controller.signal,
+        )
+      : operation === "test"
         ? await inference.test(profile, controller.signal)
         : operation === "decide"
           ? await inference.decide(profile, payload.context, controller.signal)
@@ -157,6 +167,9 @@ export default defineChannel({
           })
         : json({ ok: false, error: "Unauthorized" }, 401),
     ),
+    POST("/internal/roleplay", (request) => run(request, "roleplay")),
+    POST("/internal/card", (request) => run(request, "card")),
+    POST("/internal/summarize", (request) => run(request, "summarize")),
     POST("/internal/test", (request) => run(request, "test")),
     POST("/internal/decide", (request) => run(request, "decide")),
     POST("/internal/draft", (request) => run(request, "draft")),

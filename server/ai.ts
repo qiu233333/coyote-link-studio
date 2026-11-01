@@ -510,6 +510,14 @@ export class AiService extends EventEmitter {
   ): Promise<Omit<TaskPlan, "id" | "version" | "createdAt">> {
     return this.invoke("draft", profile, { prompt, context }, signal);
   }
+  story(
+    operation: "roleplay" | "card" | "summarize",
+    profile: AiProfile,
+    context: unknown,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    return this.invoke(operation, profile, { context }, signal);
+  }
   test(profile: AiProfile): Promise<TestResult> {
     return this.invoke("test", profile, {});
   }

@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import {
   ArrowUpRight,
   AudioLines,
   Bot,
+  BookOpen,
   Check,
   ChevronRight,
   CircleHelp,
@@ -28,7 +29,9 @@ import { duration, isActive, ownerNames, timeLeft, useAppState } from "./api";
 import { Avatar, Badge, IconButton, Modal } from "./ui";
 import { version as appVersion } from "../package.json";
 
-type Page = "console" | "ai-control" | "locked-task" | "settings";
+const RoleplayPage = lazy(() => import("./RoleplayPage"));
+
+type Page = "console" | "ai-control" | "locked-task" | "settings" | "roleplay";
 const pages = [
   { id: "console", label: "控制台", en: "Console", icon: LayoutDashboard },
   { id: "ai-control", label: "AI 控制", en: "AI Control", icon: Bot },
@@ -38,6 +41,7 @@ const pages = [
     en: "Locked Tasks",
     icon: LockKeyhole,
   },
+  { id: "roleplay", label: "情景演绎", en: "Roleplay", icon: BookOpen },
   { id: "settings", label: "系统设置", en: "Settings", icon: Settings2 },
 ] as const;
 
@@ -243,7 +247,13 @@ export default function App() {
                   action={action}
                   pending={pending > 0}
                   onNavigateAI={() =>
-                    navigate(state.locked ? "locked-task" : "ai-control")
+                    navigate(
+                      state.owner === "roleplay"
+                        ? "roleplay"
+                        : state.locked
+                          ? "locked-task"
+                          : "ai-control",
+                    )
                   }
                 />
               )}
@@ -260,6 +270,15 @@ export default function App() {
                   action={action}
                   pending={pending > 0}
                 />
+              )}
+              {page === "roleplay" && (
+                <Suspense
+                  fallback={
+                    <div className="app-loading">正在打开情景演绎…</div>
+                  }
+                >
+                  <RoleplayPage state={state} action={action} />
+                </Suspense>
               )}
               {page === "settings" && (
                 <SettingsPage
@@ -314,7 +333,9 @@ export default function App() {
             </strong>
             <span>
               {active && state?.run
-                ? `剩余 ${duration(timeLeft(state.run.deadlineAt))}`
+                ? state.run.deadlineAt === null
+                  ? "无限时联动 · 持续保持输出"
+                  : `剩余 ${duration(timeLeft(state.run.deadlineAt))}`
                 : "设备输出以实际回传为准"}
             </span>
           </div>
@@ -322,6 +343,7 @@ export default function App() {
         </div>
         <button
           className="emergency-button"
+          aria-label="紧急停止"
           disabled={emergencyPending}
           onClick={() => void emergency()}
         >

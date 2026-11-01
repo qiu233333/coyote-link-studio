@@ -234,7 +234,12 @@ export default function ConsolePage({
               : "AI 正在控制设备。你可以查看状态，或先停止 AI 后接管。"}
           </span>
           <button className="text-button" onClick={onNavigateAI}>
-            进入 {state.locked ? "上锁任务" : "AI 控制"}
+            进入{" "}
+            {state.owner === "roleplay"
+              ? "情景演绎"
+              : state.locked
+                ? "上锁任务"
+                : "AI 控制"}
             <ChevronRight size={14} />
           </button>
           {!state.locked && (
@@ -844,17 +849,25 @@ function RunPlayer({
           {run.status === "paused" ? "已暂停" : "运行中"}
         </Badge>
         <strong>{names[run.mode] || ownerNames[run.owner]}</strong>
-        <span>{duration(timeLeft(run.deadlineAt))}</span>
+        <span>
+          {run.deadlineAt === null
+            ? "无限时联动"
+            : duration(timeLeft(run.deadlineAt))}
+        </span>
       </div>
-      <div className="progress-track">
-        <i
-          style={{
-            width: `${Math.min(100, Math.max(0, ((Date.now() - run.startedAt) / (run.deadlineAt - run.startedAt)) * 100))}%`,
-          }}
-        />
-      </div>
+      {run.deadlineAt !== null && (
+        <div className="progress-track">
+          <i
+            style={{
+              width: `${Math.min(100, Math.max(0, ((Date.now() - run.startedAt) / (run.deadlineAt - run.startedAt)) * 100))}%`,
+            }}
+          />
+        </div>
+      )}
       <p className="muted">
-        {run.mode === "live" ? (
+        {run.owner === "roleplay" ? (
+          "随玩家对话调整 · 当前输出持续保持"
+        ) : run.mode === "live" ? (
           "A / B 独立播放 · 参数实时更新"
         ) : (
           <>
