@@ -114,17 +114,18 @@ export default function RoleplayPage({
     }),
     [scenario, setScenario] = useState(""),
     [greeting, setGreeting] = useState(0);
+  const initialBounds = (): RoleplayBounds => ({
+    channels: ["A", "B"],
+    waveformIds: state.waveforms.map((w) => w.id),
+    minIntensity: { A: 0, B: 0 },
+    maxIntensity: { ...state.device.limits },
+    rampPerSecond: { A: 5, B: 5 },
+    allowSync: true,
+    allowRest: true,
+    allowRamp: true,
+  });
   const [linkDialog, setLinkDialog] = useState(false),
-    [bounds, setBounds] = useState<RoleplayBounds>({
-      channels: ["A", "B"],
-      waveformIds: state.waveforms.slice(0, 3).map((w) => w.id),
-      minIntensity: { A: 0, B: 0 },
-      maxIntensity: { A: 0, B: 0 },
-      rampPerSecond: { A: 2, B: 2 },
-      allowSync: true,
-      allowRest: true,
-      allowRamp: true,
-    });
+    [bounds, setBounds] = useState<RoleplayBounds>(initialBounds);
   const [input, setInput] = useState(""),
     [busy, setBusy] = useState(false),
     [notice, setNotice] = useState("");
@@ -593,7 +594,10 @@ export default function RoleplayPage({
                       busy ||
                       turn?.status === "pending"
                     }
-                    onClick={() => setLinkDialog(true)}
+                    onClick={() => {
+                      setBounds(initialBounds());
+                      setLinkDialog(true);
+                    }}
                   >
                     启用设备联动
                   </button>

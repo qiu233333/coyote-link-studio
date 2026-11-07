@@ -339,6 +339,10 @@ try {
   );
   console.log(JSON.stringify({ url, ...report }));
   if (process.argv.includes("--browser")) {
+    app.device.state.limits = { A: 41, B: 40 };
+    app.device.state.lastSeenAt = Date.now();
+    app.device.emit("state", app.device.state);
+    app.controller.broadcast(true);
     const { chromium } = await import("playwright");
     const browser = await chromium.launch({
       executablePath:
@@ -436,6 +440,60 @@ try {
       await page
         .getByRole("button", { name: "启用设备联动", exact: true })
         .click();
+      const dialog = page.getByRole("dialog", {
+        name: "确认持续设备联动",
+        exact: true,
+      });
+      for (const c of ["A", "B"] as const) {
+        assert.equal(
+          await dialog
+            .getByRole("spinbutton", { name: `${c} 最低强度`, exact: true })
+            .inputValue(),
+          "0",
+        );
+        assert.equal(
+          await dialog
+            .getByRole("spinbutton", { name: `${c} 最高强度`, exact: true })
+            .inputValue(),
+          String(app.device.state.limits[c]),
+        );
+        assert.equal(
+          await dialog
+            .getByRole("spinbutton", { name: `${c} 最大变化速率`, exact: true })
+            .inputValue(),
+          "5",
+        );
+      }
+      assert.equal(
+        await dialog.locator(".wave-check input").count(),
+        app.controller.snapshot().waveforms.length,
+      );
+      for (const check of await dialog.getByRole("checkbox").all())
+        assert.ok(
+          await check.isChecked(),
+          "channels, every waveform and permissions default to selected",
+        );
+      await page.screenshot({
+        path: resolve(artifacts, "roleplay-link-defaults.png"),
+        fullPage: true,
+        animations: "disabled",
+      });
+      await dialog
+        .getByRole("spinbutton", { name: "A 最高强度", exact: true })
+        .fill("12");
+      await dialog
+        .getByRole("button", { name: "关闭弹窗", exact: true })
+        .click();
+      await page
+        .getByRole("button", { name: "启用设备联动", exact: true })
+        .click();
+      assert.equal(
+        await dialog
+          .getByRole("spinbutton", { name: "A 最高强度", exact: true })
+          .inputValue(),
+        "41",
+        "new authorization reads fresh defaults instead of a cancelled form",
+      );
       await page
         .getByRole("spinbutton", { name: "A 最高强度", exact: true })
         .fill("12");
@@ -455,6 +513,26 @@ try {
         })
         .click();
       await page.getByText("持续联动中", { exact: true }).waitFor();
+      await page.getByRole("button", { name: "修改范围", exact: true }).click();
+      const existing = page.getByRole("dialog", {
+        name: "修改演绎授权范围",
+        exact: true,
+      });
+      assert.equal(
+        await existing
+          .getByRole("spinbutton", { name: "A 最高强度", exact: true })
+          .inputValue(),
+        "12",
+      );
+      assert.equal(
+        await existing
+          .getByRole("spinbutton", { name: "B 最高强度", exact: true })
+          .inputValue(),
+        "7",
+      );
+      await existing
+        .getByRole("button", { name: "关闭弹窗", exact: true })
+        .click();
       await page
         .getByRole("textbox", { name: "回复剧情", exact: true })
         .fill("先保持这样，我想继续聊天。");
@@ -566,6 +644,9 @@ try {
           "third-party upload/AI parse/preview/save",
           "create story and pure dialogue",
           "authorize A/B",
+          "new link defaults to all channels/waves/permissions, 0-device limits and 5/s",
+          "cancelled new link restores defaults on reopening",
+          "editing an active link preserves confirmed bounds",
           "keep at zero is explicit and preserves zero",
           "model control explanation and update record",
           "continuous output",
