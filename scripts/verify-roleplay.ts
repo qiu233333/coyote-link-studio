@@ -22,6 +22,7 @@ const deepseek = process.argv.includes("--deepseek"),
 let calls = 0,
   cancelled = 0;
 const failures: string[] = [];
+const formatCounts = new Map<string, number>();
 const memory = {
   recentPlot: "玩家发现星城的试炼入口",
   plotBackground: "星城试炼馆",
@@ -46,6 +47,7 @@ const provider = createServer(async (req, res) => {
         ?.content ?? "";
     const context = JSON.parse(String(prompt).split("\n").at(-1)!);
     let input: unknown;
+    let latest = "";
     if (tool === "submit_character_card")
       input = {
         card: {
@@ -69,8 +71,8 @@ const provider = createServer(async (req, res) => {
       assert.ok(system.includes("玩家要求保持或休息时尊重其表达"));
       assert.ok(!String(prompt).includes("仅在必要时"));
       assert.ok(body.tools[0].function.parameters.properties.controlReason);
-      const latest = context.memory.recentDialogue.at(-1)?.text ?? "";
-      if (latest.includes("持续错误")) {
+      latest = context.memory.recentDialogue.at(-1)?.text ?? "";
+      if (latest === "持续错误") {
         res.writeHead(503, { "content-type": "application/json" });
         res.end(
           JSON.stringify({ error: { message: "temporary unavailable" } }),
@@ -114,6 +116,17 @@ const provider = createServer(async (req, res) => {
       };
     } else throw Error("unexpected tool " + tool);
     if (res.destroyed) return;
+    const formatCount = formatCounts.get(latest) ?? 0;
+    formatCounts.set(latest, formatCount + 1);
+    const invalidFormat =
+      latest.includes("格式持续错误") ||
+      (latest.includes("格式重试") && formatCount < 2);
+    const jsonReply = latest.includes("完整JSON");
+    const toolCall = {
+      id: randomUUID(),
+      type: "function",
+      function: { name: tool, arguments: JSON.stringify(input) },
+    };
     res.writeHead(200, { "content-type": "application/json" });
     res.end(
       JSON.stringify({
@@ -126,19 +139,23 @@ const provider = createServer(async (req, res) => {
             index: 0,
             message: {
               role: "assistant",
-              content: null,
+              content: invalidFormat
+                ? "这次只返回了普通文字，不能当作结构化控制建议。"
+                : jsonReply
+                  ? JSON.stringify(input)
+                  : null,
               ...(thinking
                 ? { reasoning_content: "fixture reasoning not persisted" }
                 : {}),
-              tool_calls: [
-                {
-                  id: randomUUID(),
-                  type: "function",
-                  function: { name: tool, arguments: JSON.stringify(input) },
-                },
-              ],
+              ...(!invalidFormat && !jsonReply
+                ? {
+                    tool_calls: latest.includes("重复工具")
+                      ? [toolCall, { ...toolCall, id: randomUUID() }]
+                      : [toolCall],
+                  }
+                : {}),
             },
-            finish_reason: "tool_calls",
+            finish_reason: invalidFormat || jsonReply ? "stop" : "tool_calls",
           },
         ],
         usage: {
@@ -280,6 +297,26 @@ try {
   };
   assert.equal((await send("保持，继续研究线索")).status, "completed");
   assert.equal(stops, 0);
+  for (const text of [
+    "完整JSON回复，继续探索",
+    "重复工具回复，继续探索",
+    "偶发格式重试，继续探索",
+  ]) {
+    const t = await send(text);
+    assert.equal(t.status, "completed");
+    if (text.includes("格式重试")) assert.equal(t.formatAttempt, 2);
+    assert.equal(stops, 0);
+  }
+  const liveId = app.controller.run!.id;
+  const malformed = await send("格式持续错误");
+  assert.equal(malformed.status, "failed");
+  assert.equal(malformed.formatAttempt, 3);
+  assert.equal(app.controller.run!.id, liveId);
+  assert.equal(app.controller.run!.status, "running");
+  assert.equal(stops, 0);
+  assert.equal(app.device.state.intensities.A, 8);
+  assert.equal((await send("保持，格式错误后重新发送")).status, "completed");
+  assert.equal(app.controller.run!.id, liveId);
   const slow = await api<RoleplayTurn>(root + "/messages", {
     text: "延迟回复",
     requestId: randomUUID(),
@@ -323,6 +360,8 @@ try {
       "pure dialogue",
       "independent continuous A/B",
       "keep and delayed inference no zero",
+      "complete JSON and duplicate tools are recovered",
+      "format retries preserve output and resend retains run",
       "cancel and late result",
       "pause and no replay",
       "21 HTTP503 requests then confirmed stop",
@@ -428,6 +467,17 @@ try {
       await page
         .getByRole("textbox", { name: "玩家称呼", exact: true })
         .fill("浏览器旅人");
+      assert.ok(
+        await page
+          .getByRole("checkbox", {
+            name: "进入故事时启用设备联动",
+            exact: true,
+          })
+          .isChecked(),
+      );
+      await page
+        .getByRole("checkbox", { name: "进入故事时启用设备联动", exact: true })
+        .uncheck();
       await page.getByRole("button", { name: "进入故事", exact: true }).click();
       await page
         .getByRole("textbox", { name: "回复剧情", exact: true })
@@ -636,6 +686,75 @@ try {
       await page.getByRole("button", { name: "恢复联动", exact: true }).click();
       assert.equal(app.controller.run!.roleplay!.output.A.target, 0);
       await page.getByRole("button", { name: "结束联动", exact: true }).click();
+      await page
+        .getByRole("button", { name: "启用设备联动", exact: true })
+        .waitFor();
+      const beforeOpening = calls;
+      await page
+        .locator(".story-card")
+        .filter({ hasText: "浏览器向导" })
+        .getByRole("button", { name: "开始演绎", exact: true })
+        .click();
+      assert.ok(
+        await page
+          .getByRole("checkbox", {
+            name: "进入故事时启用设备联动",
+            exact: true,
+          })
+          .isChecked(),
+      );
+      await page.getByRole("button", { name: "进入故事", exact: true }).click();
+      await page.getByText("持续联动中", { exact: true }).waitFor();
+      assert.equal(calls, beforeOpening, "linked opening does not call AI");
+      assert.equal(app.controller.run!.roleplay!.output.A.target, 0);
+      const newRun = app.controller.run!.id;
+      const input = page.getByRole("textbox", {
+        name: "回复剧情",
+        exact: true,
+      });
+      await input.fill("第一行");
+      await input.press("Shift+Enter");
+      assert.equal(await input.inputValue(), "第一行\n");
+      const beforeIme = calls;
+      await input.dispatchEvent("compositionstart");
+      await input.press("Enter");
+      assert.equal(calls, beforeIme, "IME confirmation must not send");
+      await input.dispatchEvent("compositionend");
+      await input.fill("回车发送剧情\n第二行");
+      await input.press("Enter");
+      await until(
+        async () =>
+          app.device.state.intensities.A === 8 &&
+          app.device.state.intensities.B === 4,
+      );
+      const activeStory = app.controller.run!.roleplay!.sessionId;
+      assert.ok(
+        app.roleplay
+          .messages(activeStory)
+          .items.some(
+            (m) => m.role === "user" && m.text === "回车发送剧情\n第二行",
+          ),
+      );
+      const beforeFormat = stops;
+      await input.fill("浏览器格式持续错误");
+      await input.press("Enter");
+      await page.getByText(/本轮回复格式在 3 次自动重试后/).waitFor();
+      assert.equal(app.controller.run!.id, newRun);
+      assert.equal(app.controller.run!.status, "running");
+      assert.equal(app.device.state.intensities.A, 8);
+      assert.equal(stops, beforeFormat);
+      await input.fill("保持，浏览器重发继续");
+      await input.press("Enter");
+      await until(async () =>
+        app.roleplay
+          .messages(activeStory)
+          .items.some(
+            (m) => m.role === "user" && m.text === "保持，浏览器重发继续",
+          ),
+      );
+      await until(async () => !app.controller.roleplayBusy);
+      assert.equal(app.controller.run!.id, newRun);
+      await page.getByRole("button", { name: "结束联动", exact: true }).click();
       assert.deepEqual(errors, []);
       const browserReport = {
         checks: [
@@ -654,6 +773,9 @@ try {
           "reload restores true state",
           "pause/resume no replay",
           "stop",
+          "new story starts linked without a second enable action",
+          "Enter sends, Shift+Enter inserts newline and IME confirmation does not send",
+          "format exhaustion and resend leave continuous device linkage active",
         ],
         errors,
       };

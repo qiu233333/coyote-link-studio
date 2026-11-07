@@ -12,12 +12,16 @@ import {
   replySchema,
   substitute,
   roleplayExecutionLabel,
+  roleplayBoundsSchema,
   type CharacterCard,
   type RoleplaySession,
   type RoleplayTurn,
   type StoryMessage,
 } from "../shared/roleplay.js";
-import { AI_MAX_RECOVERY_ATTEMPTS } from "../shared/executionPolicy.js";
+import {
+  AI_MAX_RECOVERY_ATTEMPTS,
+  STORY_FORMAT_MAX_RETRIES,
+} from "../shared/executionPolicy.js";
 import { AiServiceError } from "./ai.js";
 import { Controller } from "./controller.js";
 import { Store } from "./store.js";
@@ -47,6 +51,9 @@ type Work = {
   promise: Promise<unknown>;
   turn?: RoleplayTurn;
 };
+const formatError = (error: unknown): error is AiServiceError =>
+  error instanceof AiServiceError &&
+  ["AI_INVALID_TOOL_RESULT", "AI_INVALID_DECISION"].includes(error.code);
 const wait = (signal: AbortSignal) =>
   new Promise<void>((resolve, reject) => {
     const cancel = () => {
@@ -328,6 +335,46 @@ export class RoleplayService {
     this.available();
     await this.controller.startRoleplay(id, bounds, requestId);
   }
+  async createWithLink(raw: unknown) {
+    const input = z
+      .object({
+        cardId: z.string(),
+        title: title.optional(),
+        player: playerSchema,
+        scenario: z.string().max(16000),
+        greetingIndex: z.number().int().min(0).max(30).optional(),
+        link: z
+          .object({
+            bounds: roleplayBoundsSchema,
+            requestId: z.string().uuid(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .parse(raw);
+    const { link, ...data } = input;
+    if (link) this.available();
+    const session = this.create(data);
+    if (!link) return session;
+    try {
+      await this.startLink(session.id, link.bounds, link.requestId);
+      assert(
+        this.controller.run?.roleplay?.sessionId === session.id,
+        "启动请求已使用，请重新进入故事",
+        "DUPLICATE_REQUEST",
+        409,
+      );
+      return session;
+    } catch (error) {
+      if (this.controller.run?.roleplay?.sessionId !== session.id)
+        this.store.transaction(() => {
+          this.store.delete("stories", session.id);
+          this.store.clear(`story-messages:${session.id}`);
+        });
+      throw error;
+    }
+  }
   link(id: string) {
     this.session(id);
     assert(
@@ -431,11 +478,16 @@ export class RoleplayService {
       } catch (error) {
         if (unit.abort.signal.aborted) return;
         turn.status = "failed";
-        turn.error = this.store.redact(
-          error instanceof Error ? error.message : "演绎失败",
-        );
+        turn.errorCode =
+          error instanceof AiServiceError ? error.code : "AI_INVALID_DECISION";
+        turn.error = formatError(error)
+          ? `本轮回复格式在 ${STORY_FORMAT_MAX_RETRIES} 次自动重试后仍未通过校验，未执行新参数。${link && this.controller.run?.id === link.id && this.controller.run.status === "running" ? "联动保持原输出，可直接重新发送。" : "可以直接重新发送。"}`
+          : this.store.redact(
+              error instanceof Error ? error.message : "演绎失败",
+            );
         this.store.set("story-turns", turn.id, turn);
         if (
+          !formatError(error) &&
           link &&
           this.controller.run?.id === link.id &&
           this.controller.isActive()
@@ -478,9 +530,26 @@ export class RoleplayService {
       for (;;) {
         signal.throwIfAborted();
         try {
-          return await this.ai.story(operation, profile, context, signal);
+          const retryContext = turn.formatAttempt
+            ? {
+                ...(context as Record<string, unknown>),
+                responseFormatRepair:
+                  "上一次回复未通过结构校验。请只调用本轮指定工具一次，完整提交所有必填字段；不能将剧情与设备补丁拆成多次调用。不要输出额外字段或 JSON 之外的文字。",
+              }
+            : context;
+          return await this.ai.story(operation, profile, retryContext, signal);
         } catch (error) {
           if (signal.aborted) throw error;
+          if (formatError(error)) {
+            if ((turn.formatAttempt ?? 0) >= STORY_FORMAT_MAX_RETRIES)
+              throw error;
+            turn.formatAttempt = (turn.formatAttempt ?? 0) + 1;
+            turn.retryKind = "format";
+            this.store.set("story-turns", turn.id, turn);
+            this.controller.broadcast(true);
+            await this.retryWait(signal);
+            continue;
+          }
           if (!(
             link &&
             error instanceof AiServiceError &&
@@ -489,6 +558,7 @@ export class RoleplayService {
           ))
             throw error;
           turn.attempt++;
+          turn.retryKind = "provider";
           if (link) this.recovery = { runId: link.id, attempt: turn.attempt };
           this.store.set("story-turns", turn.id, turn);
           this.controller.broadcast(true);
@@ -614,6 +684,7 @@ export class RoleplayService {
       s.updatedAt = now;
       s.title = this.session(s.id).title;
       turn.status = "completed";
+      delete turn.retryKind;
       if (link) this.recovery = { runId: link.id, attempt: 0 };
       this.addMessage(s, {
         role: "assistant",

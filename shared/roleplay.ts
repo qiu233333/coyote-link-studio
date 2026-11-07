@@ -168,6 +168,9 @@ export interface RoleplayTurn {
   revision: number;
   status: "pending" | "completed" | "cancelled" | "failed" | "interrupted";
   attempt: number;
+  formatAttempt?: number;
+  retryKind?: "format" | "provider";
+  errorCode?: string;
   error?: string;
   createdAt: number;
 }

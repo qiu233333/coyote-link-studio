@@ -271,7 +271,9 @@ export async function createApplication(
     roleplay.convert(req.body.source),
   );
   route("get", "/api/roleplay/sessions", () => roleplay.sessions());
-  route("post", "/api/roleplay/sessions", (req) => roleplay.create(req.body));
+  route("post", "/api/roleplay/sessions", (req) =>
+    roleplay.createWithLink(req.body),
+  );
   route("get", "/api/roleplay/sessions/:id", (req) =>
     req.query.status === "1"
       ? (() => {

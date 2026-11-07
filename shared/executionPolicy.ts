@@ -1,3 +1,4 @@
 export const DEVICE_RPC_TIMEOUT_MS = 20_000;
 export const DEVICE_STATE_STALE_MS = 20_000;
 export const AI_MAX_RECOVERY_ATTEMPTS = 20;
+export const STORY_FORMAT_MAX_RETRIES = 3;

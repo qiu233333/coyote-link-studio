@@ -31,6 +31,7 @@ import {
 } from "../shared/roleplay";
 import { request, type Action } from "./api";
 import { Badge, Field, Modal, NumberInput } from "./ui";
+import { STORY_FORMAT_MAX_RETRIES } from "../shared/executionPolicy";
 
 const base = "/api/roleplay";
 const fieldNames: Record<string, string> = {
@@ -126,11 +127,14 @@ export default function RoleplayPage({
   });
   const [linkDialog, setLinkDialog] = useState(false),
     [bounds, setBounds] = useState<RoleplayBounds>(initialBounds);
+  const [startWithLink, setStartWithLink] = useState(true);
   const [input, setInput] = useState(""),
     [busy, setBusy] = useState(false),
     [notice, setNotice] = useState("");
   const selected = useRef<string | null>(null),
-    bottom = useRef<HTMLDivElement>(null);
+    bottom = useRef<HTMLDivElement>(null),
+    sending = useRef(false),
+    composing = useRef(false);
   const activeRun =
     state.run && ["running", "paused"].includes(state.run.status)
       ? state.run
@@ -304,19 +308,32 @@ export default function RoleplayPage({
     });
   }
   async function send() {
-    if (!session || !input.trim()) return;
+    if (
+      !session ||
+      !input.trim() ||
+      busy ||
+      sending.current ||
+      locked ||
+      (activeRun && !run)
+    )
+      return;
+    sending.current = true;
     const text = input;
-    await task(async () => {
-      const result = await action<RoleplayTurn>(
-        `${base}/sessions/${session.id}/messages`,
-        { text, requestId: crypto.randomUUID(), revision: session.revision },
-      );
-      if (result) {
-        setInput("");
-        setTurn(result);
-        await open(session.id);
-      }
-    });
+    try {
+      await task(async () => {
+        const result = await action<RoleplayTurn>(
+          `${base}/sessions/${session.id}/messages`,
+          { text, requestId: crypto.randomUUID(), revision: session.revision },
+        );
+        if (result) {
+          setInput("");
+          setTurn(result);
+          await open(session.id);
+        }
+      });
+    } finally {
+      sending.current = false;
+    }
   }
   async function link(op: string, body: unknown = {}, method = "POST") {
     if (!session) return;
@@ -327,6 +344,100 @@ export default function RoleplayPage({
     );
     if (r) setLinkDialog(false);
   }
+  const boundsFields = () => (
+    <>
+      <div className="story-toolbar">
+        {(["A", "B"] as Channel[]).map((c) => (
+          <label key={c}>
+            <input
+              type="checkbox"
+              checked={bounds.channels.includes(c)}
+              onChange={(e) =>
+                setBounds({
+                  ...bounds,
+                  channels: e.target.checked
+                    ? [...bounds.channels, c]
+                    : bounds.channels.filter((x) => x !== c),
+                })
+              }
+            />
+            通道 {c}
+          </label>
+        ))}
+      </div>
+      {(["A", "B"] as Channel[]).map((c) => (
+        <fieldset key={c} disabled={!bounds.channels.includes(c)}>
+          <legend>
+            通道 {c} · 设备上限 {state.device.limits[c]}
+          </legend>
+          <div className="form-grid three">
+            {(["minIntensity", "maxIntensity", "rampPerSecond"] as const).map(
+              (k) => (
+                <Field
+                  key={k}
+                  label={
+                    {
+                      minIntensity: "最低强度",
+                      maxIntensity: "最高强度",
+                      rampPerSecond: "最大变化速率 / s",
+                    }[k]
+                  }
+                >
+                  <NumberInput
+                    label={`${c} ${{ minIntensity: "最低强度", maxIntensity: "最高强度", rampPerSecond: "最大变化速率" }[k]}`}
+                    value={bounds[k][c]}
+                    min={k === "rampPerSecond" ? 0.1 : 0}
+                    step={k === "rampPerSecond" ? 0.1 : 1}
+                    max={k === "rampPerSecond" ? 20 : state.device.limits[c]}
+                    onChange={(v) =>
+                      setBounds({ ...bounds, [k]: { ...bounds[k], [c]: v } })
+                    }
+                  />
+                </Field>
+              ),
+            )}
+          </div>
+        </fieldset>
+      ))}
+      <Field label="允许波形">
+        <div className="wave-checks">
+          {state.waveforms.map((w) => (
+            <label className="wave-check" key={w.id}>
+              <input
+                type="checkbox"
+                checked={bounds.waveformIds.includes(w.id)}
+                onChange={(e) =>
+                  setBounds({
+                    ...bounds,
+                    waveformIds: e.target.checked
+                      ? [...bounds.waveformIds, w.id]
+                      : bounds.waveformIds.filter((x) => x !== w.id),
+                  })
+                }
+              />
+              {w.name}
+            </label>
+          ))}
+        </div>
+      </Field>
+      {(["allowSync", "allowRamp", "allowRest"] as const).map((k) => (
+        <label className="story-option" key={k}>
+          <input
+            type="checkbox"
+            checked={bounds[k]}
+            onChange={(e) => setBounds({ ...bounds, [k]: e.target.checked })}
+          />
+          {
+            {
+              allowSync: "允许双通道同时输出",
+              allowRamp: "允许渐变",
+              allowRest: "允许 AI 按剧情归零休息",
+            }[k]
+          }
+        </label>
+      ))}
+    </>
+  );
   const smallAvatar = (card: CharacterCard) =>
     card.character.avatar ? (
       <img
@@ -419,6 +530,8 @@ export default function RoleplayPage({
                     disabled={locked}
                     onClick={() => {
                       setNewCard(card);
+                      setStartWithLink(true);
+                      setBounds(initialBounds());
                       setScenario(card.character.scenario);
                       setGreeting(0);
                     }}
@@ -734,9 +847,11 @@ export default function RoleplayPage({
               {turn?.status === "pending" && (
                 <div className="story-thinking">
                   <Sparkles size={16} />{" "}
-                  {turn.attempt
-                    ? `模型暂时不可用，保持输出并重试 ${turn.attempt}/20`
-                    : "角色正在构思下一幕…"}
+                  {turn.retryKind === "format" && turn.formatAttempt
+                    ? `正在调整回复格式 ${turn.formatAttempt}/${STORY_FORMAT_MAX_RETRIES}${run?.status === "running" ? "，保持当前输出" : ""}`
+                    : turn.attempt
+                      ? `模型暂时不可用，保持输出并重试 ${turn.attempt}/20`
+                      : "角色正在构思下一幕…"}
                   <button onClick={() => void action(base + "/cancel", {})}>
                     取消生成
                   </button>
@@ -759,6 +874,24 @@ export default function RoleplayPage({
                   placeholder="正常回复剧情，例如：我接过徽章，问她下一步去哪里。"
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
+                  onCompositionStart={() => {
+                    composing.current = true;
+                  }}
+                  onCompositionEnd={() => {
+                    composing.current = false;
+                  }}
+                  onKeyDown={(e) => {
+                    if (
+                      e.key === "Enter" &&
+                      !e.shiftKey &&
+                      !composing.current &&
+                      !e.nativeEvent.isComposing &&
+                      e.nativeEvent.keyCode !== 229
+                    ) {
+                      e.preventDefault();
+                      void send();
+                    }
+                  }}
                   maxLength={8000}
                 />
                 <button
@@ -771,6 +904,7 @@ export default function RoleplayPage({
                   发送
                 </button>
               </form>
+              <p className="field-hint">Enter 发送 · Shift+Enter 换行</p>
               <details className="story-memory">
                 <summary>六部分故事记忆</summary>
                 <h4>角色与玩家设定</h4>
@@ -1148,9 +1282,48 @@ export default function RoleplayPage({
               ))}
             </select>
           </Field>
+          <label className="story-option">
+            <input
+              type="checkbox"
+              checked={startWithLink}
+              onChange={(e) => setStartWithLink(e.target.checked)}
+            />
+            进入故事时启用设备联动
+          </label>
+          {startWithLink && (
+            <>
+              <p className="notice notice-pink">
+                进入故事即按以下范围启用持续联动：{bounds.channels.join("/")}{" "}
+                通道，A {bounds.minIntensity.A}–{bounds.maxIntensity.A} / B{" "}
+                {bounds.minIntensity.B}–{bounds.maxIntensity.B}，最大变化速率 A{" "}
+                {bounds.rampPerSecond.A}/s、B {bounds.rampPerSecond.B}
+                /s。开场输出为零，首条玩家回复后由 AI
+                调整；等待回复及关闭网页后保持输出，可随时暂停、结束或急停。
+              </p>
+              <details>
+                <summary>查看或调整联动范围</summary>
+                {boundsFields()}
+              </details>
+              {(!state.device.connected || !!activeRun) && (
+                <p role="status" className="notice">
+                  {activeRun
+                    ? "设备正被其他运行占用，请先结束当前联动；也可取消勾选，创建纯文字故事。"
+                    : "设备未连接，请先在控制台连接；也可取消勾选，创建纯文字故事。"}
+                </p>
+              )}
+            </>
+          )}
           <button
             className="button primary"
-            disabled={busy || locked}
+            disabled={
+              busy ||
+              locked ||
+              (startWithLink &&
+                (!state.device.connected ||
+                  !!activeRun ||
+                  state.stopping ||
+                  state.stopUnconfirmed))
+            }
             onClick={() =>
               void task(async () => {
                 const r = await action<RoleplaySession>(base + "/sessions", {
@@ -1158,6 +1331,9 @@ export default function RoleplayPage({
                   player,
                   scenario,
                   greetingIndex: greeting,
+                  ...(startWithLink
+                    ? { link: { bounds, requestId: crypto.randomUUID() } }
+                    : {}),
                 });
                 if (r) {
                   setNewCard(null);
@@ -1170,7 +1346,10 @@ export default function RoleplayPage({
             进入故事
           </button>
           <p className="muted">
-            先展示开场；可在故事中启用设备联动。开场不会产生输出。
+            {startWithLink
+              ? "进入故事后自动启用联动，无需再次点击开启。"
+              : "纯文字演绎，之后也可单独启用设备联动。"}
+            开场不会产生输出。
           </p>
         </Modal>
       )}
@@ -1182,98 +1361,7 @@ export default function RoleplayPage({
           <p className="notice notice-pink">
             无限时保持输出。等待回复及关闭网页后，后台仍保持当前输出；可随时暂停、停止或急停。修改范围会先暂停归零，确认后由下一条消息生成新动作。
           </p>
-          <div className="story-toolbar">
-            {(["A", "B"] as Channel[]).map((c) => (
-              <label key={c}>
-                <input
-                  type="checkbox"
-                  checked={bounds.channels.includes(c)}
-                  onChange={(e) =>
-                    setBounds({
-                      ...bounds,
-                      channels: e.target.checked
-                        ? [...bounds.channels, c]
-                        : bounds.channels.filter((x) => x !== c),
-                    })
-                  }
-                />
-                通道 {c}
-              </label>
-            ))}
-          </div>
-          {(["A", "B"] as Channel[]).map((c) => (
-            <fieldset key={c} disabled={!bounds.channels.includes(c)}>
-              <legend>
-                通道 {c} · 设备上限 {state.device.limits[c]}
-              </legend>
-              <div className="form-grid three">
-                {(
-                  ["minIntensity", "maxIntensity", "rampPerSecond"] as const
-                ).map((k) => (
-                  <Field
-                    key={k}
-                    label={
-                      {
-                        minIntensity: "最低强度",
-                        maxIntensity: "最高强度",
-                        rampPerSecond: "最大变化速率 / s",
-                      }[k]
-                    }
-                  >
-                    <NumberInput
-                      label={`${c} ${{ minIntensity: "最低强度", maxIntensity: "最高强度", rampPerSecond: "最大变化速率" }[k]}`}
-                      value={bounds[k][c]}
-                      min={k === "rampPerSecond" ? 0.1 : 0}
-                      step={k === "rampPerSecond" ? 0.1 : 1}
-                      max={k === "rampPerSecond" ? 20 : state.device.limits[c]}
-                      onChange={(v) =>
-                        setBounds({ ...bounds, [k]: { ...bounds[k], [c]: v } })
-                      }
-                    />
-                  </Field>
-                ))}
-              </div>
-            </fieldset>
-          ))}
-          <Field label="允许波形">
-            <div className="wave-checks">
-              {state.waveforms.map((w) => (
-                <label className="wave-check" key={w.id}>
-                  <input
-                    type="checkbox"
-                    checked={bounds.waveformIds.includes(w.id)}
-                    onChange={(e) =>
-                      setBounds({
-                        ...bounds,
-                        waveformIds: e.target.checked
-                          ? [...bounds.waveformIds, w.id]
-                          : bounds.waveformIds.filter((x) => x !== w.id),
-                      })
-                    }
-                  />
-                  {w.name}
-                </label>
-              ))}
-            </div>
-          </Field>
-          {(["allowSync", "allowRamp", "allowRest"] as const).map((k) => (
-            <label className="story-option" key={k}>
-              <input
-                type="checkbox"
-                checked={bounds[k]}
-                onChange={(e) =>
-                  setBounds({ ...bounds, [k]: e.target.checked })
-                }
-              />
-              {
-                {
-                  allowSync: "允许双通道同时输出",
-                  allowRamp: "允许渐变",
-                  allowRest: "允许 AI 按剧情归零休息",
-                }[k]
-              }
-            </label>
-          ))}
+          {boundsFields()}
           <button
             className="button primary"
             disabled={

@@ -479,6 +479,105 @@ test("transient retries hold output, 20 retries exhaust and stop with confirmati
     await f.close();
   }
 });
+
+test("format errors retry without zero, exhaustion preserves linkage, and resending uses the same run", async () => {
+  const f = await fixture();
+  try {
+    await f.service.startLink(f.session.id, f.bounds, randomUUID());
+    f.setReply(async () =>
+      answer({
+        action: "update",
+        channels: { A: { target: 8 }, B: { target: 5 } },
+      }),
+    );
+    await f.send();
+    const runId = f.controller.run!.id;
+    let stops = 0,
+      failures = 0;
+    const original = f.device.stop.bind(f.device);
+    f.device.stop = async () => {
+      stops++;
+      return original();
+    };
+    f.setReply(async (_op, _profile, context) => {
+      assert.equal(f.controller.run!.roleplay!.output.A.target, 8);
+      if (failures++ < 2)
+        throw new AiServiceError("AI_INVALID_TOOL_RESULT", "结构不兼容");
+      assert.ok(
+        (context as { responseFormatRepair?: string }).responseFormatRepair,
+      );
+      return answer();
+    });
+    const recovered = await f.send();
+    assert.equal(recovered.status, "completed");
+    assert.equal(recovered.formatAttempt, 2);
+    let attempts = 0;
+    f.setReply(async () => {
+      attempts++;
+      throw new AiServiceError("AI_INVALID_TOOL_RESULT", "结构不兼容");
+    });
+    const failed = await f.send();
+    assert.equal(attempts, 4);
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.formatAttempt, 3);
+    assert.match(failed.error!, /联动保持原输出/);
+    assert.equal(f.controller.run!.status, "running");
+    assert.equal(f.controller.run!.roleplay!.output.B.target, 5);
+    f.setReply(async () =>
+      answer({ action: "update", channels: { A: { target: 6 } } }),
+    );
+    assert.equal((await f.send("重新发送")).status, "completed");
+    assert.equal(f.controller.run!.id, runId);
+    assert.equal(f.controller.run!.roleplay!.output.A.target, 6);
+    assert.equal(stops, 0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("entering a story can start linked at zero; conflicting or disconnected starts leave no orphan story", async () => {
+  const f = await fixture();
+  const data = {
+    cardId: f.card.id,
+    player: { name: "玩家", identity: "客人", relationship: "同伴" },
+    scenario: "",
+  };
+  try {
+    const s = await f.service.createWithLink({
+      ...data,
+      link: { bounds: f.bounds, requestId: randomUUID() },
+    });
+    assert.equal(f.controller.run!.roleplay!.sessionId, s.id);
+    assert.equal(f.controller.run!.roleplay!.output.A.target, 0);
+    assert.equal(
+      f.calls(),
+      0,
+      "opening never triggers model or nonzero output",
+    );
+    const count = f.service.sessions().length;
+    await assert.rejects(() =>
+      f.service.createWithLink({
+        ...data,
+        link: { bounds: f.bounds, requestId: randomUUID() },
+      }),
+    );
+    assert.equal(f.service.sessions().length, count);
+    await f.controller.stop("roleplay");
+    await f.controller.disconnect();
+    await assert.rejects(() =>
+      f.service.createWithLink({
+        ...data,
+        link: { bounds: f.bounds, requestId: randomUUID() },
+      }),
+    );
+    assert.equal(f.service.sessions().length, count);
+    const text = await f.service.createWithLink(data);
+    assert.ok(text.id);
+    assert.equal(f.service.sessions().length, count + 1);
+  } finally {
+    await f.close();
+  }
+});
 test("pause/range/resume cannot replay output; late inference after emergency is discarded", async () => {
   const f = await fixture();
   try {
