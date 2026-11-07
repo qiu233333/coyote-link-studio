@@ -16,6 +16,8 @@ import {
   fileOf,
   applyOutputPatch,
   emptyMemory,
+  replySchema,
+  roleplayExecutionLabel,
   type RoleplayReply,
   type RoleplayBounds,
   type StoryMessage,
@@ -338,6 +340,62 @@ test("messages, keep, waveform changes and delayed model responses never reset c
     const calls = f.calls();
     await new Promise((r) => setTimeout(r, 200));
     assert.equal(f.calls(), calls, "no timer-driven roleplay");
+  } finally {
+    await f.close();
+  }
+});
+
+test("linkage records distinguish keeping zero, updating and resting, and preserve optional model explanations", async () => {
+  const f = await fixture();
+  try {
+    const file = fileOf(f.card);
+    file.character.linkageStyle =
+      "所有互动均为虚构，不涉及现实设备控制或实际硬件操作。";
+    f.service.saveCard(file, f.card.id);
+    const session = f.service.create({
+      cardId: f.card.id,
+      player: { name: "玩家", identity: "客人", relationship: "朋友" },
+      scenario: "",
+    });
+    await f.service.startLink(session.id, f.bounds, randomUUID());
+    const reason = "玩家希望先保持当前节奏，因此继续保持零输出。";
+    f.setReply(async () => ({ ...answer(), controlReason: reason }));
+    const turn = f.service.send(session.id, {
+      text: "先保持这样，我们继续喝茶。",
+      requestId: randomUUID(),
+    });
+    await until(
+      () => f.service.turn(session.id, turn.id).status === "completed",
+    );
+    const message = f.service.messages(session.id).items.at(-1)!;
+    assert.equal(message.controlReason, reason);
+    assert.equal(message.execution, "保持原参数，未提交新的强度或波形");
+    assert.equal(message.output!.A.target, 0);
+    assert.equal(message.output!.B.target, 0);
+    assert.equal(f.controller.run!.roleplay!.output.A.target, 0);
+    assert.match(
+      roleplayExecutionLabel(
+        { action: "update", channels: { A: { target: 1 } } },
+        true,
+      ),
+      /参数更新已提交/,
+    );
+    assert.match(
+      roleplayExecutionLabel({ action: "rest", channels: ["A"] }, true),
+      /归零休息/,
+    );
+    assert.equal(
+      roleplayExecutionLabel({ action: "keep" }, false),
+      "纯文字演绎",
+    );
+    assert.ok(
+      replySchema.safeParse(answer()).success,
+      "older replies may omit an explanation",
+    );
+    assert.ok(
+      !replySchema.safeParse({ ...answer(), controlReason: "x".repeat(501) })
+        .success,
+    );
   } finally {
     await f.close();
   }

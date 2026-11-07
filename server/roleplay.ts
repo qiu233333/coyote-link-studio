@@ -11,6 +11,7 @@ import {
   memorySchema,
   replySchema,
   substitute,
+  roleplayExecutionLabel,
   type CharacterCard,
   type RoleplaySession,
   type RoleplayTurn,
@@ -624,10 +625,9 @@ export class RoleplayService {
         ),
         turnId: turn.id,
         control: reply.control,
+        controlReason: reply.controlReason,
         output,
-        execution: authorized
-          ? "目标已提交，设备实际强度以回传为准"
-          : "纯文字演绎",
+        execution: roleplayExecutionLabel(reply.control, authorized),
       });
       this.store.set("stories", s.id, s);
       this.store.set("story-turns", turn.id, turn);

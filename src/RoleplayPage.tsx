@@ -21,6 +21,7 @@ import {
   cardSchema,
   cardTemplate,
   fileOf,
+  roleplayExecutionLabel,
   type CardFile,
   type CharacterCard,
   type RoleplayBounds,
@@ -704,11 +705,19 @@ export default function RoleplayPage({
                     {m.text && <p>{m.text}</p>}
                     {m.control && (
                       <details>
-                        <summary>{m.execution}</summary>
+                        <summary>
+                          {roleplayExecutionLabel(m.control, !!m.output)}
+                        </summary>
+                        {m.controlReason && <p>联动说明：{m.controlReason}</p>}
+                        {m.control.action === "keep" && m.output && (
+                          <p>
+                            keep 只保留原参数；原目标为 0 时会继续保持零输出。
+                          </p>
+                        )}
                         <pre>{JSON.stringify(m.control, null, 2)}</pre>
                         {m.output && (
                           <small>
-                            提交目标 A {m.output.A.target} / B{" "}
+                            当时目标 A {m.output.A.target} / B{" "}
                             {m.output.B.target}；实际执行请查看设备回传。
                           </small>
                         )}

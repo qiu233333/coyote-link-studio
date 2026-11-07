@@ -59,6 +59,16 @@ const provider = createServer(async (req, res) => {
       };
     else if (tool === "submit_story_memory") input = memory;
     else if (tool === "submit_roleplay") {
+      const system = body.messages
+        .filter((m: { role: string }) => m.role === "system")
+        .map((m: { content: string }) => m.content)
+        .join("\n");
+      assert.ok(system.includes("不需要玩家在剧情中再提"));
+      assert.ok(system.includes("首次有效玩家回复后"));
+      assert.ok(system.includes("叙事描述不等于撤销这份授权"));
+      assert.ok(system.includes("玩家要求保持或休息时尊重其表达"));
+      assert.ok(!String(prompt).includes("仅在必要时"));
+      assert.ok(body.tools[0].function.parameters.properties.controlReason);
       const latest = context.memory.recentDialogue.at(-1)?.text ?? "";
       if (latest.includes("持续错误")) {
         res.writeHead(503, { "content-type": "application/json" });
@@ -77,6 +87,13 @@ const provider = createServer(async (req, res) => {
         narration: "星涟推开试炼馆的门，一条新的线索出现在你面前。",
         dialogue: "沿着蓝色灯光走，还是先研究手中的徽章？",
         memory,
+        controlReason: !context.authorization
+          ? "当前未授权或已暂停，只推进文字剧情。"
+          : latest.includes("保持")
+            ? "玩家要求保持当前节奏，本轮保留全部参数。"
+            : latest.includes("休息")
+              ? "本轮按剧情安排休息。"
+              : "根据探索剧情分别调整 A/B 目标，等待设备确认。",
         control: !context.authorization
           ? { action: "keep" }
           : latest.includes("休息")
@@ -199,7 +216,10 @@ try {
     "/api/roleplay/card-format",
   );
   assert.deepEqual(format.template, cardTemplate);
-  const card = await api<{ id: string }>("/api/roleplay/cards", cardTemplate);
+  const fixtureCard = structuredClone(cardTemplate);
+  fixtureCard.character.linkageStyle =
+    "所有互动均为虚构故事，不涉及现实设备控制或实际硬件操作。";
+  const card = await api<{ id: string }>("/api/roleplay/cards", fixtureCard);
   const preview = await api<{ card: typeof cardTemplate }>(
     "/api/roleplay/cards/import/convert",
     {
@@ -355,6 +375,7 @@ try {
       await page.getByText("JSON 模板已复制", { exact: true }).waitFor();
       const json = structuredClone(cardTemplate);
       json.character.name = "浏览器向导";
+      json.character.linkageStyle = fixtureCard.character.linkageStyle;
       await page
         .getByRole("textbox", { name: "粘贴 JSON 校验" })
         .fill(JSON.stringify(json));
@@ -436,6 +457,32 @@ try {
       await page.getByText("持续联动中", { exact: true }).waitFor();
       await page
         .getByRole("textbox", { name: "回复剧情", exact: true })
+        .fill("先保持这样，我想继续聊天。");
+      await page.getByRole("button", { name: "发送", exact: true }).click();
+      const heldZero = page
+        .locator(".story-message.assistant")
+        .filter({
+          has: page.getByText("保持原参数，未提交新的强度或波形", {
+            exact: true,
+          }),
+        })
+        .last();
+      await heldZero.waitFor();
+      await heldZero.locator("summary").click();
+      await heldZero
+        .getByText("keep 只保留原参数；原目标为 0 时会继续保持零输出。", {
+          exact: true,
+        })
+        .waitFor();
+      await heldZero
+        .getByText("联动说明：玩家要求保持当前节奏，本轮保留全部参数。", {
+          exact: true,
+        })
+        .waitFor();
+      assert.equal(app.controller.run!.roleplay!.output.A.target, 0);
+      assert.equal(app.controller.run!.roleplay!.output.B.target, 0);
+      await page
+        .getByRole("textbox", { name: "回复剧情", exact: true })
         .fill("我沿着灯光前进");
       await page.getByRole("button", { name: "发送", exact: true }).click();
       await until(
@@ -443,6 +490,21 @@ try {
           app.device.state.intensities.A === 8 &&
           app.device.state.intensities.B === 4,
       );
+      const updated = page
+        .locator(".story-message.assistant")
+        .filter({
+          has: page.getByText("参数更新已提交，设备实际强度以回传为准", {
+            exact: true,
+          }),
+        })
+        .last();
+      await updated.waitFor();
+      await updated.locator("summary").click();
+      await updated
+        .getByText("联动说明：根据探索剧情分别调整 A/B 目标，等待设备确认。", {
+          exact: true,
+        })
+        .waitFor();
       await page.getByText("设备详情与授权范围", { exact: true }).click();
       await page.screenshot({
         path: resolve(artifacts, "roleplay-desktop.png"),
@@ -504,6 +566,8 @@ try {
           "third-party upload/AI parse/preview/save",
           "create story and pure dialogue",
           "authorize A/B",
+          "keep at zero is explicit and preserves zero",
+          "model control explanation and update record",
           "continuous output",
           "375/390 responsive with fixed emergency",
           "reload restores true state",

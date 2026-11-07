@@ -127,6 +127,7 @@ export const replySchema = z
     dialogue: z.string().max(12000),
     memory: memorySchema,
     control: outputPatchSchema,
+    controlReason: z.string().trim().min(1).max(500).optional(),
   })
   .strict()
   .refine(
@@ -158,6 +159,7 @@ export interface StoryMessage {
   control?: RoleplayPatch;
   output?: RoleplayOutputState;
   execution?: string;
+  controlReason?: string;
 }
 export interface RoleplayTurn {
   id: string;
@@ -212,6 +214,16 @@ export function substitute(text: string, character: string, user: string) {
   return text
     .replace(/\{\{char\}\}/gi, () => character)
     .replace(/\{\{user\}\}/gi, () => user);
+}
+export function roleplayExecutionLabel(
+  control: RoleplayPatch,
+  linked: boolean,
+) {
+  if (!linked) return "纯文字演绎";
+  if (control.action === "keep") return "保持原参数，未提交新的强度或波形";
+  if (control.action === "rest")
+    return "归零休息目标已提交，设备实际强度以回传为准";
+  return "参数更新已提交，设备实际强度以回传为准";
 }
 export function applyOutputPatch(
   current: RoleplayOutputState,
