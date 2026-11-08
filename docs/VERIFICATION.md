@@ -14,6 +14,10 @@
 
 GitHub Windows Server 2022 的首次检查暴露了测试目录的短路径差异：TEMP 可能是 `RUNNER~1`，PowerShell 则返回完整用户名目录，导致人工创建的测试进程记录被所有权检查拒绝。测试与验收目录统一使用原生 realpath 后修复；没有放宽启动器对 PID、创建时间、可执行路径及项目入口的检查。v0.2.0 标签的失败检查没有生成正式 Release，修正后的首个正式包使用 v0.2.1。
 
+正式发布：[v0.2.1](https://github.com/qiu233333/coyote-link-studio/releases/tag/v0.2.1)。[GitHub Windows 验收](https://github.com/qiu233333/coyote-link-studio/actions/runs/42484152399) 全部通过：226 项测试、正式构建、解压启动、两组浏览器完整回归、升级数据迁移，随后才公开 ZIP 与 SHA256 附件。成品 109,386,866 字节，源提交 `1377980647aa886588ddab3464b67efbca91fbb9`。
+
+发布后从公开附件地址重新下载 ZIP，SHA256 同时匹配随附校验文件及 GitHub 的附件摘要，实际解压后再次完成上述 8 组启动/API/模型工具/数据/停止检查。最终 ZIP SHA256：`44759734eb174cc5d70218a18204b3e30a157c476cc053fff98bb311355c9d4f`。公开附件复核日志在 `artifacts/published-download/acceptance.log`。
+
 ## 演绎回复兼容、默认联动与回车发送（2026-11-07）
 
 演绎原先严格要求恰好一次工具调用，完整 JSON 回复和重复的相同调用也会被拒绝；服务随后把格式错误当作致命故障结束联动。本次仅调整演绎业务入口：完整工具参数、完整 JSON／JSON 代码块及语义完全相同的重复调用经严格 schema 校验后可接收；冲突提案、未知工具、叙事夹带指令、数值强转和截断输出仍被拒绝。SDK 的强制工具选择错误可从其公开的完整文本内容恢复 JSON，不读取或展示推理文本。
