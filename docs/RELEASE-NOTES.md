@@ -1,4 +1,4 @@
-Windows x64 免安装版：下载 **Coyote-Link-v0.2.0-windows-x64.zip**，完整解压，双击 **Start-Coyote.cmd**。无需安装 Node.js、pnpm、Git 或 Codex。
+Windows x64 免安装版：下载 **Coyote-Link-v0.2.1-windows-x64.zip**，完整解压，双击 **Start-Coyote.cmd**。无需安装 Node.js、pnpm、Git 或 Codex。
 
 包含控制台、A/B 独立控制、JSON/.pulse 波形、AI 控制、AI 上锁任务、情景演绎和角色卡/故事记忆；支持 DeepSeek 和自定义 OpenAI 兼容接口。使用 AI 需在设置页提供自己的 API Key 和模型。
 
