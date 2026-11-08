@@ -1,11 +1,17 @@
 import { createApplication } from "./app.js";
+import { mkdirSync } from "node:fs";
+import { resolve } from "node:path";
 
 const port = Number(process.env.COYOTE_PORT || process.env.PORT || 3000);
 if (!Number.isInteger(port) || port < 1 || port > 65535)
   throw new Error("端口必须为 1 到 65535。");
+const directory = process.env.COYOTE_DATA_DIR;
+const aiDirectory = directory ? resolve(directory, "eve-runtime") : undefined;
+if (aiDirectory) mkdirSync(aiDirectory, { recursive: true });
 const application = await createApplication({
   dev: process.argv.includes("--dev"),
-  directory: process.env.COYOTE_DATA_DIR,
+  directory,
+  aiDirectory,
 });
 const url = await application.listen(port);
 process.stdout.write(

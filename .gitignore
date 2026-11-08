@@ -9,3 +9,4 @@ data/
 artifacts/
 *.log
 ai-runtime/node_modules/
+.server-build/

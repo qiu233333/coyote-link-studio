@@ -5,7 +5,9 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { createApplication } from "../server/app.ts";
+const { createApplication } = (await import(
+  process.env.COYOTE_VERIFY_APP ?? "../server/app.ts"
+)) as typeof import("../server/app.ts");
 import {
   cardTemplate,
   type RoleplaySession,
@@ -385,6 +387,7 @@ try {
     const { chromium } = await import("playwright");
     const browser = await chromium.launch({
       executablePath:
+        process.env.COYOTE_BROWSER_PATH ??
         "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
       headless: true,
     });

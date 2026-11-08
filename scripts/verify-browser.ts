@@ -6,7 +6,9 @@ import { tmpdir } from "node:os";
 import { basename, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium, type Browser, type Page } from "playwright";
-import { createApplication } from "../server/app.ts";
+const { createApplication } = (await import(
+  process.env.COYOTE_VERIFY_APP ?? "../server/app.ts"
+)) as typeof import("../server/app.ts");
 import type { AppSnapshot, ControlBounds } from "../shared/types.ts";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -324,6 +326,7 @@ try {
   assert.notEqual(new URL(baseUrl).port, "3000");
   browser = await chromium.launch({
     executablePath:
+      process.env.COYOTE_BROWSER_PATH ??
       "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
     headless: true,
   });

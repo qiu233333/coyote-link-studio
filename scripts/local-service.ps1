@@ -9,8 +9,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $workspace = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$serverFile = Join-Path $workspace 'server\index.ts'
-$recordDirectory = Join-Path $workspace 'data'
+$portable = Test-Path -LiteralPath (Join-Path $workspace 'release.json')
+$serverFile = if ($portable) { Join-Path $workspace 'app\server\index.js' } else { Join-Path $workspace 'server\index.ts' }
+$recordDirectory = if ($env:COYOTE_DATA_DIR) { [IO.Path]::GetFullPath($env:COYOTE_DATA_DIR) } else { Join-Path $workspace 'data' }
 $recordFile = Join-Path $recordDirectory 'service.json'
 $runtimeRoot = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies'
 $stdoutFile = Join-Path $recordDirectory 'service.stdout.log'
@@ -59,6 +60,11 @@ function Test-PortOccupied([int]$ServicePort) {
 }
 
 function Find-Node {
+    if ($portable) {
+        $bundledNode = Join-Path $workspace 'runtime\node.exe'
+        if (-not (Test-Path -LiteralPath $bundledNode)) { throw '免安装包缺少 runtime/node.exe，请完整解压或重新下载。' }
+        return $bundledNode
+    }
     $candidates = @()
     $systemNode = Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($systemNode) { $candidates += $systemNode.Source }
@@ -94,6 +100,11 @@ function Get-ProjectBuildState([string]$NodePath) {
 function Prepare-Project {
     $node = Find-Node
     $env:PATH = (Split-Path -Parent $node) + ';' + $env:PATH
+    if ($portable) {
+        Write-Host '正在校验免安装版程序文件…'
+        $state = Get-PortableBuildState $node
+        return [pscustomobject]@{ nodePath = $node; sourceFingerprint = $state.sourceFingerprint }
+    }
     $fallbackDirectory = Join-Path $runtimeRoot 'bin\fallback'
     if (Test-Path -LiteralPath $fallbackDirectory) { $env:PATH = $fallbackDirectory + ';' + $env:PATH }
     $buildState = Get-ProjectBuildState $node
@@ -127,6 +138,12 @@ function Prepare-Project {
     }
     if ($buildState.needsInstall -or $buildState.needsBuild) { throw '项目构建版本尚未就绪，未启动后台。' }
     return [pscustomobject]@{ nodePath = $node; sourceFingerprint = $buildState.sourceFingerprint }
+}
+
+function Get-PortableBuildState([string]$NodePath) {
+    $json = & $NodePath (Join-Path $PSScriptRoot 'verify-package.mjs')
+    if ($LASTEXITCODE -ne 0) { throw '免安装包文件不完整或校验失败，请查看上方诊断并重新完整解压。' }
+    return ($json | ConvertFrom-Json)
 }
 
 function Wait-ServiceReady($Record) {
@@ -177,7 +194,7 @@ try {
 
     if ($null -ne $ownedProcess) {
         if ([int]$record.port -ne $Port) { throw ('后台已在端口 {0} 运行。请先停止，或使用相同端口启动。' -f $record.port) }
-        $currentBuild = Get-ProjectBuildState (Find-Node)
+        $currentBuild = if ($portable) { Get-PortableBuildState (Find-Node) } else { Get-ProjectBuildState (Find-Node) }
         if ($currentBuild.needsInstall -or $currentBuild.needsBuild -or $record.sourceFingerprint -ne $currentBuild.sourceFingerprint) {
             throw '代码已有更新，当前后台尚未加载最新版。请先运行 Stop-Coyote.cmd，再运行 Start-Coyote.cmd；启动器会自动完成重建。'
         }
@@ -190,7 +207,9 @@ try {
     $node = $prepared.nodePath
     $null = New-Item -ItemType Directory -Path $recordDirectory -Force
     $env:COYOTE_PORT = [string]$Port
-    $serviceProcess = Start-Process -FilePath $node -ArgumentList @('--import', 'tsx', ('"{0}"' -f $serverFile)) -WorkingDirectory $workspace -WindowStyle Hidden -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru
+    $env:COYOTE_DATA_DIR = $recordDirectory
+    $serviceArguments = if ($portable) { @(('"{0}"' -f $serverFile)) } else { @('--import', 'tsx', ('"{0}"' -f $serverFile)) }
+    $serviceProcess = Start-Process -FilePath $node -ArgumentList $serviceArguments -WorkingDirectory $workspace -WindowStyle Hidden -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru
     $processInfo = Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId = {0}' -f $serviceProcess.Id)
     if ($null -eq $processInfo) { throw '后台进程启动后立即退出，请检查 data/service.stderr.log。' }
     $record = [pscustomobject]@{

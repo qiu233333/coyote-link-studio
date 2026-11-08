@@ -1,6 +1,6 @@
 {
   "name": "coyote-link-studio",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -9,6 +9,8 @@
   "scripts": {
     "dev": "tsx watch server/index.ts --dev",
     "build": "tsc --noEmit && vite build && node scripts/build-agent.mjs",
+    "package:windows": "node scripts/package-windows.mjs",
+    "verify:portable": "node scripts/verify-portable.mjs",
     "start": "tsx server/index.ts",
     "test": "tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit",

@@ -1,0 +1,62 @@
+name: Windows portable release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: portable-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.22.2"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "11.25.0"
+      - name: Check version tag
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag must match package.json version' }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm exec playwright install chromium
+      - name: Package and verify extracted release
+        shell: pwsh
+        run: |
+          pnpm package:windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:COYOTE_BROWSER_PATH = node -e "console.log(require('playwright').chromium.executablePath())"
+          pnpm verify:portable
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-portable-and-verification
+          path: |
+            artifacts/release/*.zip
+            artifacts/release/*.sha256
+            artifacts/portable/
+          retention-days: 14
+      - name: Publish verified release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = @(Get-ChildItem artifacts/release/*.zip,artifacts/release/*.sha256 | ForEach-Object FullName)
+          gh release create $env:GITHUB_REF_NAME @assets --verify-tag --draft --title "星涟联动 $env:GITHUB_REF_NAME · Windows 免安装版" --notes-file docs/RELEASE-NOTES.md
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release edit $env:GITHUB_REF_NAME --draft=false --latest
+          exit $LASTEXITCODE

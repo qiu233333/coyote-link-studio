@@ -17,6 +17,8 @@ A/B 独立控制 · 波形编排 · AI 自主控制 · AI 上锁任务
 
 <br /><br />
 
+[**⬇ 下载 Windows 免安装版**](https://github.com/qiu233333/coyote-link-studio/releases/latest) · 无需安装 Node.js / pnpm / Codex
+
 [快速启动](#quick-start) · [功能介绍](#features) · [波形导入](#waveforms) · [常见问题](#faq) · [开发与验证](#development)
 
 ---
@@ -29,7 +31,7 @@ A/B 独立控制 · 波形编排 · AI 自主控制 · AI 上锁任务
 
 <a id="features"></a>
 
-## ✨ 四个工作区，各司其职
+## ✨ 五个工作区，各司其职
 
 | 工作区             | 你可以做什么                                                                                           |
 | :----------------- | :----------------------------------------------------------------------------------------------------- |
@@ -64,7 +66,19 @@ A/B 独立控制 · 波形编排 · AI 自主控制 · AI 上锁任务
 
 ## 🚀 快速启动
 
-### Windows：双击进入工作台
+### Windows 免安装版（推荐）
+
+1. 打开 [最新版下载页](https://github.com/qiu233333/coyote-link-studio/releases/latest)，下载 **`Coyote-Link-v版本号-windows-x64.zip`**，不要选 `Source code`。
+2. **完整解压**到可写目录，双击 `Start-Coyote.cmd`。无需安装 Node.js、pnpm、Git 或 Codex，首次启动无需下载依赖或编译。
+3. 等待「控制台与 AI 运行时已就绪」，浏览器自动打开。使用 AI 时在设置中填写自己的 API Key，实机在官方 APP 中扫码配对。
+
+支持 Windows 10/11 x64、中文和空格路径。退出后台用 `Stop-Coyote.cmd`；关闭浏览器后后台仍继续运行。在线 AI 和设备中继需要网络。
+
+**升级：停止旧版 → 备份整个 `data/` → 新版解压到新目录 → 复制旧版整个 `data/` → 启动新版。** 数据库与 `installation.key` 要一起保留。发布包不含作者的配置、密钥、角色或故事。
+
+详细说明、数据迁移与排错见 [免安装版使用说明](docs/PORTABLE.md)。下载附件同时提供 SHA256 校验文件。
+
+### 源码版：双击进入工作台
 
 准备 **Node.js 24+** 与 **pnpm 11.5+**。如果本机已有 Codex 自带的相应运行时，启动器也会自动查找，无需修改全局 PATH。
 
