@@ -121,10 +121,18 @@ export const memorySchema = z
   })
   .strict();
 export type StoryMemory = z.infer<typeof memorySchema> & { throughSeq: number };
+export const replyOptionsSchema = z
+  .array(z.string().trim().min(1).max(300))
+  .length(3)
+  .refine((options) => new Set(options).size === 3, "快捷回复不能重复")
+  .describe(
+    "恰好三个不同的玩家下一句回复，贴合本轮剧情，以玩家口吻写完整、简短、可直接发送的话语或行动；不是角色台词或已经发生的事实",
+  );
 export const replySchema = z
   .object({
     narration: z.string().max(12000),
     dialogue: z.string().max(12000),
+    replyOptions: replyOptionsSchema,
     memory: memorySchema,
     control: outputPatchSchema,
     controlReason: z.string().trim().min(1).max(500).optional(),
@@ -155,6 +163,7 @@ export interface StoryMessage {
   role: "user" | "assistant";
   text: string;
   narration?: string;
+  replyOptions?: string[];
   turnId?: string;
   control?: RoleplayPatch;
   output?: RoleplayOutputState;

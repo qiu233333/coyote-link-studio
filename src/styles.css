@@ -7983,6 +7983,49 @@ button:disabled {
 .story-thinking button {
   margin-left: auto;
 }
+.story-quick-replies {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  min-width: 0;
+}
+.story-quick-replies p {
+  margin: 0 0 2px;
+  color: #526c94;
+  font-size: 12px;
+}
+.story-quick-replies p span {
+  display: inline-block;
+  margin-left: 8px;
+  color: #7385a3;
+  font-size: 11px;
+}
+.story-quick-replies button {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 10px 14px;
+  border: 1px solid #d6e3fb;
+  border-radius: 14px;
+  background: linear-gradient(120deg, #eef6ffeb, #fff0f8c9);
+  color: #405e86;
+  text-align: left;
+  overflow-wrap: anywhere;
+  min-width: 0;
+  line-height: 1.6;
+}
+.story-quick-replies button:hover:not(:disabled) {
+  border-color: #8baeea;
+  background: #eef3ff;
+}
+.story-quick-replies button:focus-visible {
+  outline: 2px solid #7399e8;
+  outline-offset: 2px;
+}
+.story-quick-replies button > span {
+  color: #7a93c8;
+  flex-shrink: 0;
+}
 .story-compose {
   display: flex;
   gap: 10px;

@@ -9,6 +9,11 @@ import type { AiProfile } from "../shared/types.ts";
 const reply = {
   narration: "她递来一杯茶。",
   dialogue: "接下来想去哪里？",
+  replyOptions: [
+    "我想去花园看看。",
+    "先在这里休息一下吧。",
+    "你有什么推荐的地方吗？",
+  ],
   memory: {
     recentPlot: "喝茶",
     plotBackground: "客厅",
@@ -38,6 +43,26 @@ test("story result accepts strict single documents and semantically identical du
     JSON.stringify({ name: "submit_roleplay", arguments: reply }),
   ])
     assert.deepEqual(parse([], text), reply);
+});
+
+test("story result requires exactly three distinct nonempty bounded player replies", () => {
+  for (const replyOptions of [
+    undefined,
+    [],
+    ["一", "二"],
+    ["一", "二", "三", "四"],
+    ["一", " ", "三"],
+    ["一", " 一 ", "三"],
+    ["一", 2, "三"],
+    ["一", "二", "字".repeat(301)],
+  ]) {
+    assert.throws(() => parse([call({ ...reply, replyOptions })]));
+  }
+  assert.deepEqual(
+    parse([call({ ...reply, replyOptions: [" 一 ", "二", "三"] })])
+      .replyOptions,
+    ["一", "二", "三"],
+  );
 });
 
 test("story result rejects conflicting proposals, prose, unexpected tools and coerced device values", () => {

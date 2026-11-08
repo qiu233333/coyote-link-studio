@@ -141,6 +141,11 @@ export default function RoleplayPage({
       : null;
   const run = activeRun?.roleplay?.sessionId === session?.id ? activeRun : null;
   const locked = state.locked;
+  const latestMessage = messages.at(-1);
+  const replyOptions =
+    latestMessage?.role === "assistant"
+      ? (latestMessage.replyOptions ?? [])
+      : [];
   async function loadLists() {
     const [c, s] = await Promise.all([
       request<CharacterCard[]>(base + "/cards", undefined, "GET"),
@@ -307,10 +312,11 @@ export default function RoleplayPage({
       }
     });
   }
-  async function send() {
+  async function send(text = input) {
     if (
       !session ||
-      !input.trim() ||
+      selected.current !== session.id ||
+      !text.trim() ||
       busy ||
       sending.current ||
       locked ||
@@ -318,13 +324,13 @@ export default function RoleplayPage({
     )
       return;
     sending.current = true;
-    const text = input;
     try {
       await task(async () => {
         const result = await action<RoleplayTurn>(
           `${base}/sessions/${session.id}/messages`,
           { text, requestId: crypto.randomUUID(), revision: session.revision },
         );
+        if (selected.current !== session.id) return;
         if (result) {
           setInput("");
           setTurn(result);
@@ -860,6 +866,33 @@ export default function RoleplayPage({
               {turn?.error && (
                 <div role="status" className="notice notice-pink">
                   {turn.error} · 输入仍可重新发送。
+                </div>
+              )}
+              {replyOptions.length === 3 && (
+                <div
+                  className="story-quick-replies"
+                  role="group"
+                  aria-label="快捷回复"
+                >
+                  <p>
+                    试试这样回复 <span>点击即发送，也可在下方自由输入</span>
+                  </p>
+                  {replyOptions.map((option, index) => (
+                    <button
+                      type="button"
+                      key={`${latestMessage!.id}-${index}`}
+                      disabled={
+                        busy ||
+                        locked ||
+                        turn?.status === "pending" ||
+                        !!(activeRun && !run)
+                      }
+                      onClick={() => void send(option)}
+                    >
+                      <span aria-hidden="true">{index + 1}</span>
+                      {option}
+                    </button>
+                  ))}
                 </div>
               )}
               <form

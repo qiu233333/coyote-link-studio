@@ -86,6 +86,16 @@ const provider = createServer(async (req, res) => {
                     : {
                         narration: "星涟递来一本新的旅行手记。",
                         dialogue: "准备好出发了吗？",
+                        ...(body.tools[0].function.parameters.properties
+                          .replyOptions
+                          ? {
+                              replyOptions: [
+                                "我准备好了，现在就出发。",
+                                "先给我看看旅行手记吧。",
+                                "能说说我们要去的地方吗？",
+                              ],
+                            }
+                          : {}),
                         memory: {
                           recentPlot: "收到手记",
                           plotBackground: "星城",

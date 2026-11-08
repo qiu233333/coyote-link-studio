@@ -73,6 +73,10 @@ const provider = createServer(async (req, res) => {
       assert.ok(system.includes("玩家要求保持或休息时尊重其表达"));
       assert.ok(!String(prompt).includes("仅在必要时"));
       assert.ok(body.tools[0].function.parameters.properties.controlReason);
+      assert.ok(
+        body.tools[0].function.parameters.required.includes("replyOptions"),
+      );
+      assert.ok(system.includes("玩家点击前没有发生"));
       latest = context.memory.recentDialogue.at(-1)?.text ?? "";
       if (latest === "持续错误") {
         res.writeHead(503, { "content-type": "application/json" });
@@ -90,6 +94,11 @@ const provider = createServer(async (req, res) => {
       input = {
         narration: "星涟推开试炼馆的门，一条新的线索出现在你面前。",
         dialogue: "沿着蓝色灯光走，还是先研究手中的徽章？",
+        replyOptions: [
+          "我沿着蓝色灯光往前走。",
+          "我先仔细研究手中的徽章。",
+          "先休息一下，和我聊聊试炼馆的来历吧。",
+        ],
         memory,
         controlReason: !context.authorization
           ? "当前未授权或已暂停，只推进文字剧情。"
@@ -490,6 +499,66 @@ try {
         .locator(".story-message.assistant")
         .filter({ hasText: "蓝色灯光" })
         .waitFor();
+      const choices = page.getByRole("group", {
+        name: "快捷回复",
+        exact: true,
+      });
+      await choices.waitFor();
+      assert.equal(await choices.getByRole("button").count(), 3);
+      const choicesBefore = await choices.getByRole("button").allTextContents();
+      const beforeChoice = calls;
+      await page.reload();
+      await page
+        .getByRole("navigation", { name: "主要模块" })
+        .getByRole("button", { name: /^情景演绎/ })
+        .click();
+      await page.getByRole("button", { name: /浏览器向导的故事/ }).click();
+      await choices.waitFor();
+      assert.deepEqual(
+        await choices.getByRole("button").allTextContents(),
+        choicesBefore,
+        "reload restores persisted choices without inference",
+      );
+      assert.equal(calls, beforeChoice);
+      const chosenText = "我沿着蓝色灯光往前走。";
+      await choices
+        .getByRole("button")
+        .first()
+        .evaluate((button) => {
+          (button as HTMLButtonElement).click();
+          (button as HTMLButtonElement).click();
+        });
+      await until(
+        async () => calls === beforeChoice + 1 && !app.controller.roleplayBusy,
+      );
+      await page
+        .locator(".story-message.user")
+        .filter({ hasText: chosenText })
+        .waitFor();
+      assert.equal(
+        await page
+          .locator(".story-message.user")
+          .filter({ hasText: chosenText })
+          .count(),
+        1,
+      );
+      await choices.waitFor();
+      assert.equal(await choices.getByRole("button").count(), 3);
+      for (const width of [375, 390]) {
+        await page.setViewportSize({ width, height: 900 });
+        await choices.scrollIntoViewIfNeeded();
+        assert.ok(await choices.getByRole("button").first().isVisible());
+        assert.ok(
+          await page.evaluate(
+            () => document.documentElement.scrollWidth <= innerWidth + 1,
+          ),
+        );
+        await page.screenshot({
+          path: resolve(artifacts, `quick-replies-${width}.png`),
+          fullPage: true,
+        });
+      }
+      await page.setViewportSize({ width: 1512, height: 1000 });
       await page
         .getByRole("button", { name: "启用设备联动", exact: true })
         .click();
@@ -765,6 +834,7 @@ try {
           "native JSON editor/save",
           "third-party upload/AI parse/preview/save",
           "create story and pure dialogue",
+          "three contextual quick replies, reload persistence, one-click send without double submission and narrow screens",
           "authorize A/B",
           "new link defaults to all channels/waves/permissions, 0-device limits and 5/s",
           "cancelled new link restores defaults on reopening",

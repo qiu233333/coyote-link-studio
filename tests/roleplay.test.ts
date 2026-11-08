@@ -37,6 +37,11 @@ const answer = (
 ): RoleplayReply => ({
   narration: "她推开通往下一幕的门。",
   dialogue: "你准备怎样探索？",
+  replyOptions: [
+    "我仔细看看手中的徽章。",
+    "我跟着你走进下一间屋子。",
+    "先等等，能告诉我这里的来历吗？",
+  ],
   memory: {
     recentPlot: "进入试炼",
     plotBackground: "城市与试炼馆",
@@ -125,6 +130,65 @@ async function fixture() {
     },
   };
 }
+test("reply choices are persisted, remain proposals until selected and use the normal idempotent message path", async () => {
+  const f = await fixture();
+  try {
+    assert.equal(
+      f.service.messages(f.session.id).items[0].replyOptions,
+      undefined,
+      "legacy greetings need no migration",
+    );
+    assert.equal((await f.send()).status, "completed");
+    const message = f.service.messages(f.session.id).items.at(-1)!;
+    assert.deepEqual(message.replyOptions, answer().replyOptions);
+    assert.equal(f.calls(), 1, "options share the narrative request");
+    const reopened = new Store(f.directory);
+    try {
+      assert.deepEqual(
+        reopened.get<StoryMessage>(`story-messages:${f.session.id}`, message.id)
+          ?.replyOptions,
+        answer().replyOptions,
+      );
+    } finally {
+      reopened.close();
+    }
+    const chosen = message.replyOptions![1];
+    f.setReply(async (_op, _profile, context) => {
+      const text = JSON.stringify(context);
+      assert.ok(
+        text.includes(chosen),
+        "chosen text is an ordinary player message",
+      );
+      assert.ok(
+        !text.includes(answer().replyOptions[0]),
+        "unchosen suggestions are not history or memory",
+      );
+      return answer();
+    });
+    const request = { text: chosen, requestId: randomUUID() };
+    const first = f.service.send(f.session.id, request);
+    assert.equal(f.service.send(f.session.id, request).id, first.id);
+    await until(
+      () => f.service.turn(f.session.id, first.id).status !== "pending",
+    );
+    assert.equal(f.service.turn(f.session.id, first.id).status, "completed");
+    assert.equal(
+      f.service
+        .messages(f.session.id)
+        .items.filter((m) => m.role === "user" && m.text === chosen).length,
+      1,
+    );
+    assert.equal(f.calls(), 2);
+    assert.equal(
+      f.controller.isActive(),
+      false,
+      "suggestions do not start device control",
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 test("native template is portable and role/authority fields cannot escape the card schema", () => {
   const value = cardSchema.parse(JSON.parse(JSON.stringify(cardTemplate)));
   assert.deepEqual(value, cardTemplate);

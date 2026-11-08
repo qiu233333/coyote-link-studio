@@ -697,6 +697,9 @@ export class RoleplayService {
         turnId: turn.id,
         control: reply.control,
         controlReason: reply.controlReason,
+        replyOptions: reply.replyOptions.map((text) =>
+          substitute(text, s.card.character.name, s.player.name),
+        ),
         output,
         execution: roleplayExecutionLabel(reply.control, authorized),
       });
