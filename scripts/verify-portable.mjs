@@ -10,6 +10,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   renameSync,
   writeFileSync,
 } from "node:fs";
@@ -22,8 +23,11 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const latest = JSON.parse(
   readFileSync(join(root, "artifacts/release/latest.json"), "utf8"),
 );
-const zip = process.argv[2] ? resolve(process.argv[2]) : latest.zip;
-const temp = mkdtempSync(join(tmpdir(), "Coyote 验收 space-"));
+const zipArg = process.argv.slice(2).find((arg) => !arg.startsWith("--"));
+const zip = zipArg ? resolve(zipArg) : latest.zip;
+const temp = realpathSync.native(
+  mkdtempSync(join(tmpdir(), "Coyote 验收 space-")),
+);
 const profile = join(temp, "empty-user");
 mkdirSync(profile);
 const reportDir = join(root, "artifacts/portable");

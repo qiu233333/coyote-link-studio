@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -80,7 +81,11 @@ setInterval(() => {}, 1000);
 `;
 
 async function fixture(t: TestContext, kind = "offline") {
-  const root = mkdtempSync(join(tmpdir(), "coyote-stop 中文-"));
+  // Hosted Windows may expose TEMP through RUNNER~1; use PowerShell's canonical
+  // spelling without weakening any process ownership checks.
+  const root = realpathSync.native(
+    mkdtempSync(join(tmpdir(), "coyote-stop 中文-")),
+  );
   for (const directory of ["scripts", "server", "data"])
     mkdirSync(join(root, directory));
   copyFileSync(
