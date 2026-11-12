@@ -22,6 +22,7 @@ const reply = {
   },
   control: { action: "update", channels: { A: { target: 3 } } },
   controlReason: "轻微变化",
+  storyStateDelta: {},
 };
 const call = (input: unknown = reply, toolName = "submit_roleplay") => ({
   toolName,
@@ -89,6 +90,35 @@ test("story result rejects conflicting proposals, prose, unexpected tools and co
     assert.throws(() =>
       parseStoryResult(replySchema, "submit_roleplay", result),
     );
+});
+
+test("story state is a required typed patch and cannot supply metadata or device commands", () => {
+  for (const storyStateDelta of [
+    undefined,
+    null,
+    { version: 9 },
+    { scene: { sourceMessageId: "forged" } },
+    { items: [{ id: "badge", status: "sold" }] },
+    { items: [{ id: "badge" }, { id: "badge" }] },
+    { items: [{ id: "silver badge" }] },
+    { clues: [{ id: "clue", content: "字".repeat(321) }] },
+    { goals: [{ id: "goal", status: 1 }] },
+    { relationships: [{ id: "guide", affinity: 100 }] },
+    { control: { action: "keep" } },
+    {
+      goals: Array.from({ length: 7 }, (_, n) => ({ id: "goal" + n })),
+      items: Array.from({ length: 6 }, (_, n) => ({ id: "item" + n })),
+    },
+  ])
+    assert.throws(() => parse([call({ ...reply, storyStateDelta })]));
+  const patch = {
+    scene: { chapter: null },
+    goals: [{ id: "entry", status: "completed" }],
+  };
+  assert.deepEqual(
+    parse([call({ ...reply, storyStateDelta: patch })]).storyStateDelta,
+    patch,
+  );
 });
 
 test("SDK named-tool and DeepSeek thinking responses recover complete text JSON without exposing reasoning", async () => {

@@ -12,7 +12,9 @@ import {
   cardTemplate,
   type RoleplaySession,
   type RoleplayTurn,
+  type StoryMessage,
 } from "../shared/roleplay.ts";
+import type { StoryStateDelta } from "../shared/storyState.ts";
 import type { AppSnapshot } from "../shared/types.ts";
 
 const directory = await mkdtemp(resolve(tmpdir(), "coyote-story-http-"));
@@ -30,6 +32,36 @@ const memory = {
   plotBackground: "星城试炼馆",
   longPlot: "玩家接受徽章，选择探索",
   longDialogue: "向导承诺按玩家节奏推进",
+};
+const entranceState: StoryStateDelta = {
+  scene: { location: "试炼馆前厅", situation: "旅人收下了向导给的银色徽章。" },
+  goals: [
+    {
+      id: "entry",
+      title: "找到内门",
+      description: "沿蓝灯找到试炼馆内门。",
+      status: "active",
+    },
+  ],
+  relationships: [
+    {
+      id: "guide",
+      name: "星涟",
+      description: "刚认识的向导",
+      reason: "在前厅初次相遇。",
+    },
+  ],
+  items: [
+    {
+      id: "badge",
+      name: "银色徽章",
+      description: "徽章刻着一枚星纹。",
+      status: "held",
+    },
+  ],
+  clues: [
+    { id: "lock", content: "门锁的凹槽与徽章形状一致。", status: "open" },
+  ],
 };
 const provider = createServer(async (req, res) => {
   try {
@@ -77,6 +109,11 @@ const provider = createServer(async (req, res) => {
         body.tools[0].function.parameters.required.includes("replyOptions"),
       );
       assert.ok(system.includes("玩家点击前没有发生"));
+      assert.ok(system.includes("不能暗中推进未描述的事件"));
+      assert.ok(
+        body.tools[0].function.parameters.required.includes("storyStateDelta"),
+      );
+      assert.ok(context.storyState);
       latest = context.memory.recentDialogue.at(-1)?.text ?? "";
       if (latest === "持续错误") {
         res.writeHead(503, { "content-type": "application/json" });
@@ -91,8 +128,35 @@ const provider = createServer(async (req, res) => {
         });
         await new Promise((r) => setTimeout(r, 1800));
       }
+      let storyStateDelta: StoryStateDelta = {};
+      let narration = "星涟推开试炼馆的门，一条新的线索出现在你面前。";
+      if (latest === "状态开场，我接过徽章并同意找门") {
+        narration =
+          "试炼馆前厅里，初次见面的星涟递给你银色徽章。你收下徽章，发现门锁的凹槽与徽章形状一致。";
+        storyStateDelta = entranceState;
+      }
+      if (latest === "延迟状态推进，我用徽章开门") {
+        assert.equal(context.storyState.items[0].id, "badge");
+        assert.equal(context.storyState.goals[0].status, "active");
+        assert.ok(!prompt.includes("我沿着蓝色灯光往前走。"));
+        narration =
+          "你把徽章压进凹槽，内门应声开启。星涟收起戒心，开始信任你。";
+        storyStateDelta = {
+          scene: { situation: "旅人打开了内门。" },
+          goals: [{ id: "entry", status: "completed" }],
+          relationships: [
+            {
+              id: "guide",
+              description: "初步信任",
+              reason: "旅人用徽章开启了内门。",
+            },
+          ],
+          items: [{ id: "badge", status: "used" }],
+          clues: [{ id: "lock", status: "solved" }],
+        };
+      }
       input = {
-        narration: "星涟推开试炼馆的门，一条新的线索出现在你面前。",
+        narration,
         dialogue: "沿着蓝色灯光走，还是先研究手中的徽章？",
         replyOptions: [
           "我沿着蓝色灯光往前走。",
@@ -100,6 +164,7 @@ const provider = createServer(async (req, res) => {
           "先休息一下，和我聊聊试炼馆的来历吧。",
         ],
         memory,
+        storyStateDelta,
         controlReason: !context.authorization
           ? "当前未授权或已暂停，只推进文字剧情。"
           : latest.includes("保持")
@@ -277,8 +342,15 @@ try {
     );
     return api<RoleplayTurn>(root + "/turns/" + turn.id);
   }
-  assert.equal((await send("我接过徽章")).status, "completed");
+  assert.equal(
+    (await send("状态开场，我接过徽章并同意找门")).status,
+    "completed",
+  );
   assert.equal(app.controller.run, null);
+  assert.deepEqual(
+    (await api<RoleplaySession>(root)).storyState.items,
+    entranceState.items,
+  );
   await api("/api/device/connect", { protocol: "simulator" });
   const state = await api<AppSnapshot>("/api/state");
   const bounds = {
@@ -369,6 +441,7 @@ try {
       "native template",
       "third-party AI preview",
       "pure dialogue",
+      "typed state delta persisted in pure dialogue",
       "independent continuous A/B",
       "keep and delayed inference no zero",
       "complete JSON and duplicate tools are recovered",
@@ -827,6 +900,173 @@ try {
       await until(async () => !app.controller.roleplayBusy);
       assert.equal(app.controller.run!.id, newRun);
       await page.getByRole("button", { name: "结束联动", exact: true }).click();
+      await page
+        .getByRole("button", { name: "启用设备联动", exact: true })
+        .waitFor();
+
+      const stateStory = await api<RoleplaySession>("/api/roleplay/sessions", {
+        cardId: card.id,
+        title: "状态面板验收故事",
+        player: { name: "旅人", identity: "", relationship: "" },
+        scenario: "试炼馆",
+      });
+      const { storyState: _emptyState, ...legacyStory } = stateStory;
+      app.store.set("stories", stateStory.id, legacyStory);
+      const openStateStory = async () => {
+        await page.reload();
+        await page
+          .getByRole("navigation", { name: "主要模块" })
+          .getByRole("button", { name: /^情景演绎/ })
+          .click();
+        await page.getByRole("button", { name: /状态面板验收故事/ }).click();
+      };
+      const stateButton = page.getByRole("button", {
+        name: "剧情状态",
+        exact: true,
+      });
+      const panel = page.getByRole("complementary", { name: "剧情状态" });
+      const stateRoot = `/api/roleplay/sessions/${stateStory.id}`;
+      const callsBeforeOpen = calls;
+      await openStateStory();
+      await panel
+        .getByText("下一次剧情回复后更新状态。", { exact: true })
+        .waitFor();
+      await panel.getByText("地点 · 尚未明确", { exact: true }).waitFor();
+      assert.equal(calls, callsBeforeOpen);
+      await input.fill("状态开场，我接过徽章并同意找门");
+      await input.press("Enter");
+      await panel.getByText("地点 · 试炼馆前厅", { exact: true }).waitFor();
+      await panel.getByText("找到内门", { exact: true }).waitFor();
+      const stateAtOpening = await api<RoleplaySession>(stateRoot);
+      assert.equal(stateAtOpening.storyState.version, 1);
+      assert.equal(calls, callsBeforeOpen + 1);
+      const unchanged = await api<Partial<RoleplaySession>>(
+        stateRoot + "?status=1&stateVersion=1",
+      );
+      assert.equal(unchanged.storyState, undefined);
+      assert.equal(
+        JSON.stringify(await api<AppSnapshot>("/api/state")).includes(
+          "试炼馆前厅",
+        ),
+        false,
+      );
+      const paneBox = (await panel.boundingBox())!;
+      const chatBox = (await page
+        .locator(".story-conversation")
+        .boundingBox())!;
+      assert.ok(
+        chatBox.x + chatBox.width <= paneBox.x + 1,
+        "desktop panel sits right of chat",
+      );
+
+      await input.fill("延迟状态推进，我用徽章开门");
+      await input.press("Enter");
+      await panel
+        .getByText("正在生成，等待本轮更新。", { exact: true })
+        .waitFor();
+      assert.ok(await panel.getByText("找到内门", { exact: true }).isVisible());
+      await panel.getByRole("button", { name: /目标完成.*找到内门/ }).waitFor();
+      const latestState = (await api<RoleplaySession>(stateRoot)).storyState;
+      assert.equal(latestState.version, 2);
+      assert.equal(latestState.items[0].status, "used");
+      const endedGoals = panel.getByText("已结束目标（1）", { exact: true });
+      assert.equal(
+        await endedGoals.evaluate(
+          (node) => (node.parentElement as HTMLDetailsElement).open,
+        ),
+        false,
+      );
+      await endedGoals.click();
+      await panel.getByText("已完成", { exact: true }).waitFor();
+      await panel.getByText("角色关系（1）", { exact: true }).click();
+      await panel.getByText("初步信任", { exact: true }).waitFor();
+      await panel.getByText("持有物品（0）", { exact: true }).click();
+      await panel.getByText("已使用、交出或失去（1）", { exact: true }).click();
+      await panel.getByText("银色徽章", { exact: true }).waitFor();
+      await panel.getByText("剧情线索（0 条未解）", { exact: true }).click();
+      await panel.getByText("已解线索（1）", { exact: true }).click();
+      await panel
+        .getByText("门锁的凹槽与徽章形状一致。", { exact: false })
+        .last()
+        .waitFor();
+      await page.screenshot({
+        path: resolve(artifacts, "story-state-desktop.png"),
+        fullPage: true,
+      });
+
+      // Place the last successful reply outside the default 50-message page.
+      const source = latestState.lastUpdate!;
+      for (let index = 1; index <= 51; index++) {
+        const id = randomUUID();
+        app.store.set(`story-messages:${stateStory.id}`, id, {
+          id,
+          sessionId: stateStory.id,
+          seq: source.seq + index,
+          at: Date.now(),
+          role: "user",
+          text: `后续历史消息 ${index}`,
+        } satisfies StoryMessage);
+      }
+      await stateButton.click();
+      await openStateStory();
+      assert.equal(await stateButton.getAttribute("aria-expanded"), "false");
+      await page.setViewportSize({ width: 390, height: 900 });
+      await stateButton.press("Enter");
+      await panel.getByText("地点 · 试炼馆前厅", { exact: true }).waitFor();
+      assert.equal(await page.locator(".story-message.assistant").count(), 0);
+      const sourceUrl = stateRoot + "/messages/" + source.messageId;
+      const sourceResponse = page.waitForResponse(
+        (res) => res.url().endsWith(sourceUrl) && res.ok(),
+      );
+      await panel
+        .getByRole("button", { name: /目标完成.*找到内门/ })
+        .press("Enter");
+      await sourceResponse;
+      const sourceArticle = page.getByRole("article", {
+        name: `第 ${source.seq} 条助手回复`,
+      });
+      await sourceArticle.getByText(/内门应声开启/).waitFor();
+      await until(async () =>
+        sourceArticle.evaluate((element) => document.activeElement === element),
+      );
+      await page
+        .getByRole("button", { name: "返回最新剧情", exact: true })
+        .click();
+      await page.getByText("后续历史消息 51", { exact: true }).waitFor();
+      const viewport = page.locator(".story-messages");
+      await viewport.evaluate((element) => {
+        element.scrollTop = 0;
+      });
+      await page
+        .getByRole("button", { name: "返回最新剧情", exact: true })
+        .waitFor();
+      await api(stateRoot + "/messages", {
+        text: "我在门前静静等待",
+        requestId: randomUUID(),
+      });
+      await panel.getByText("本轮剧情状态无变化", { exact: true }).waitFor();
+      assert.ok(
+        await viewport.evaluate((element) => element.scrollTop < 48),
+        "new replies do not move a history reader",
+      );
+      await stateButton.click();
+      assert.ok(await input.isVisible());
+      assert.ok(
+        await page
+          .getByRole("button", { name: "紧急停止", exact: true })
+          .isVisible(),
+      );
+      await stateButton.click();
+      assert.ok(
+        await page.evaluate(
+          () => document.documentElement.scrollWidth <= innerWidth + 1,
+        ),
+      );
+      await page.screenshot({
+        path: resolve(artifacts, "story-state-390.png"),
+        fullPage: true,
+      });
+
       assert.deepEqual(errors, []);
       const browserReport = {
         checks: [
@@ -849,6 +1089,8 @@ try {
           "new story starts linked without a second enable action",
           "Enter sends, Shift+Enter inserts newline and IME confirmation does not send",
           "format exhaustion and resend leave continuous device linkage active",
+          "story state empty/loaded/pending, grouping, desktop placement and 390px collapse",
+          "state persists across refresh, on-demand source lookup and keyboard return",
         ],
         errors,
       };

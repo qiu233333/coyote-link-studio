@@ -27,6 +27,11 @@ import { Controller } from "./controller.js";
 import { Store } from "./store.js";
 import { assert } from "./errors.js";
 import { extractCharacter } from "./characterImport.js";
+import {
+  emptyStoryState,
+  mergeStoryState,
+  storyFactsForPrompt,
+} from "../shared/storyState.js";
 
 export interface StoryAi {
   status: { ready: boolean };
@@ -209,6 +214,7 @@ export class RoleplayService {
   session(id: string) {
     const s = this.store.get<RoleplaySession>("stories", id);
     assert(s, "故事不存在", "NOT_FOUND", 404);
+    s.storyState ??= emptyStoryState();
     return s;
   }
   create(input: unknown) {
@@ -236,6 +242,7 @@ export class RoleplayService {
       updatedAt: now,
       revision: 0,
       memory: emptyMemory(),
+      storyState: emptyStoryState(),
     };
     session.memory.plotBackground = card.character.worldInfo;
     const greeting =
@@ -284,6 +291,15 @@ export class RoleplayService {
     this.session(id);
     const p = this.store.page<StoryMessage>(`story-messages:${id}`, 50, before);
     return { items: p.items.reverse(), cursor: p.cursor };
+  }
+  message(id: string, messageId: string) {
+    this.session(id);
+    const message = this.store.get<StoryMessage>(
+      `story-messages:${id}`,
+      messageId,
+    );
+    assert(message, "消息不存在", "NOT_FOUND", 404);
+    return message;
   }
   export(id: string) {
     const s = this.session(id),
@@ -523,10 +539,12 @@ export class RoleplayService {
       !signal.aborted &&
       this.work === unit &&
       this.session(s.id).revision === turn.revision;
-    const request = async (
+    let repairReason = "";
+    const request = async <T>(
       operation: "roleplay" | "summarize",
       context: unknown,
-    ): Promise<unknown> => {
+      validate: (raw: unknown) => T,
+    ): Promise<T> => {
       for (;;) {
         signal.throwIfAborted();
         try {
@@ -534,10 +552,18 @@ export class RoleplayService {
             ? {
                 ...(context as Record<string, unknown>),
                 responseFormatRepair:
-                  "上一次回复未通过结构校验。请只调用本轮指定工具一次，完整提交所有必填字段；不能将剧情与设备补丁拆成多次调用。不要输出额外字段或 JSON 之外的文字。",
+                  "上一次回复未通过校验。请只调用本轮指定工具一次，完整提交所有必填字段，不添加额外字段或 JSON 之外的文字。" +
+                  repairReason,
               }
             : context;
-          return await this.ai.story(operation, profile, retryContext, signal);
+          const raw = await this.ai.story(
+            operation,
+            profile,
+            retryContext,
+            signal,
+          );
+          signal.throwIfAborted();
+          return validate(raw);
         } catch (error) {
           if (signal.aborted) throw error;
           if (formatError(error)) {
@@ -570,6 +596,7 @@ export class RoleplayService {
       .page<StoryMessage>(`story-messages:${s.id}`, 100)
       .items.reverse();
     const budget = Math.max(1024, (profile.contextWindow - 6000) * 1.5);
+    const storyState = storyFactsForPrompt(s.storyState);
     // Fold old messages into archival ranges before each turn. Full text stays
     // in SQLite; the model receives only compact memory and recent dialogue.
     const fixed = () => ({
@@ -591,7 +618,10 @@ export class RoleplayService {
     });
     let keep = 20;
     recent = recent.slice(-keep);
-    while (keep > 1 && JSON.stringify(fixed()).length > budget * 0.8) {
+    while (
+      keep > 1 &&
+      JSON.stringify({ memory: fixed(), storyState }).length > budget * 0.8
+    ) {
       keep = Math.ceil(keep / 2);
       recent = recent.slice(-keep);
     }
@@ -623,8 +653,8 @@ export class RoleplayService {
         "摘要上下文超过模型窗口，请增加上下文窗口",
         "AI_CONTEXT_TOO_LARGE",
       );
-      const memory = memorySchema.parse(
-        await request("summarize", compactContext()),
+      const memory = await request("summarize", compactContext(), (raw) =>
+        memorySchema.parse(raw),
       );
       if (!valid()) return;
       const throughSeq = older.at(-1)!.seq;
@@ -650,6 +680,7 @@ export class RoleplayService {
     );
     const context = {
       memory: fixed(),
+      storyState,
       authorization: authorized ? current!.roleplay!.bounds : null,
       output: authorized ? current!.roleplay!.output : null,
       device: {
@@ -668,7 +699,26 @@ export class RoleplayService {
       "角色与剧情上下文超过模型窗口，请精简设定或增加上下文窗口",
       "AI_CONTEXT_TOO_LARGE",
     );
-    const reply = replySchema.parse(await request("roleplay", context));
+    const { reply, facts, changes } = await request(
+      "roleplay",
+      context,
+      (raw) => {
+        try {
+          const reply = replySchema.parse(raw);
+          return {
+            reply,
+            ...mergeStoryState(s.storyState, reply.storyStateDelta),
+          };
+        } catch {
+          repairReason =
+            "请检查 storyStateDelta：省略未变化字段，沿用已有 ID，新实体提交完整字段，核对状态转换和条目上限。无可确认的变化时用 {}。";
+          throw new AiServiceError(
+            "AI_INVALID_TOOL_RESULT",
+            "剧情状态更新未通过校验",
+          );
+        }
+      },
+    );
     if (!valid()) return;
     if (!authorized)
       assert(
@@ -676,35 +726,63 @@ export class RoleplayService {
         "纯文字或暂停状态不能改变设备输出",
       );
     const now = Date.now();
-    this.store.transaction(() => {
-      const output = authorized
-        ? this.controller.applyRoleplay(link!.id, link!.version, reply.control)
-        : undefined;
-      s.memory = { ...reply.memory, throughSeq: s.memory.throughSeq };
-      s.updatedAt = now;
-      s.title = this.session(s.id).title;
-      turn.status = "completed";
-      delete turn.retryKind;
-      if (link) this.recovery = { runId: link.id, attempt: 0 };
-      this.addMessage(s, {
-        role: "assistant",
-        text: substitute(reply.dialogue, s.card.character.name, s.player.name),
-        narration: substitute(
-          reply.narration,
-          s.card.character.name,
-          s.player.name,
-        ),
-        turnId: turn.id,
-        control: reply.control,
-        controlReason: reply.controlReason,
-        replyOptions: reply.replyOptions.map((text) =>
-          substitute(text, s.card.character.name, s.player.name),
-        ),
-        output,
-        execution: roleplayExecutionLabel(reply.control, authorized),
+    const completed: RoleplayTurn = { ...turn, status: "completed" };
+    delete completed.retryKind;
+    const runLink = authorized ? current!.roleplay : undefined;
+    const previousOutput = runLink?.output;
+    try {
+      this.store.transaction(() => {
+        const output = authorized
+          ? this.controller.applyRoleplay(
+              link!.id,
+              link!.version,
+              reply.control,
+            )
+          : undefined;
+        const message = this.addMessage(s, {
+          role: "assistant",
+          text: substitute(
+            reply.dialogue,
+            s.card.character.name,
+            s.player.name,
+          ),
+          narration: substitute(
+            reply.narration,
+            s.card.character.name,
+            s.player.name,
+          ),
+          turnId: turn.id,
+          control: reply.control,
+          controlReason: reply.controlReason,
+          replyOptions: reply.replyOptions.map((text) =>
+            substitute(text, s.card.character.name, s.player.name),
+          ),
+          storyChanges: changes,
+          output,
+          execution: roleplayExecutionLabel(reply.control, authorized),
+        });
+        this.store.set("stories", s.id, {
+          ...s,
+          memory: { ...reply.memory, throughSeq: s.memory.throughSeq },
+          updatedAt: now,
+          title: this.session(s.id).title,
+          storyState: {
+            ...facts,
+            version: s.storyState.version + 1,
+            updatedAt: message.at,
+            lastUpdate: { messageId: message.id, seq: message.seq, changes },
+          },
+        } satisfies RoleplaySession);
+        this.store.set("story-turns", turn.id, completed);
       });
-      this.store.set("stories", s.id, s);
-      this.store.set("story-turns", turn.id, turn);
-    });
+    } catch (error) {
+      // A failed write rolls back the run record as well. The scheduler can
+      // only observe the new parameters after this synchronous commit.
+      if (runLink && previousOutput) runLink.output = previousOutput;
+      throw error;
+    }
+    turn.status = completed.status;
+    delete turn.retryKind;
+    if (link) this.recovery = { runId: link.id, attempt: 0 };
   }
 }

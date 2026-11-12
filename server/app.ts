@@ -277,9 +277,19 @@ export async function createApplication(
   route("get", "/api/roleplay/sessions/:id", (req) =>
     req.query.status === "1"
       ? (() => {
-          const { id, title, revision, updatedAt, memory, turnId } =
+          const { id, title, revision, updatedAt, memory, turnId, storyState } =
             roleplay.session(String(req.params.id));
-          return { id, title, revision, updatedAt, memory, turnId };
+          return {
+            id,
+            title,
+            revision,
+            updatedAt,
+            memory,
+            turnId,
+            ...(req.query.stateVersion === String(storyState.version)
+              ? {}
+              : { storyState }),
+          };
         })()
       : roleplay.session(String(req.params.id)),
   );
@@ -299,6 +309,9 @@ export async function createApplication(
     );
     return roleplay.messages(String(req.params.id), before);
   });
+  route("get", "/api/roleplay/sessions/:id/messages/:messageId", (req) =>
+    roleplay.message(String(req.params.id), String(req.params.messageId)),
+  );
   route("get", "/api/roleplay/sessions/:id/export", (req) =>
     roleplay.export(String(req.params.id)),
   );

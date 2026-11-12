@@ -20,8 +20,15 @@ import {
   roleplayExecutionLabel,
   type RoleplayReply,
   type RoleplayBounds,
+  type RoleplaySession,
   type StoryMessage,
 } from "../shared/roleplay.ts";
+import {
+  emptyStoryState,
+  mergeStoryState,
+  STORY_ENTITIES_PER_GROUP,
+  type StoryStateDelta,
+} from "../shared/storyState.ts";
 
 const tick = (c: Controller) => (c as unknown as { tick(): void }).tick();
 const flush = () => new Promise<void>((r) => setImmediate(r));
@@ -49,8 +56,9 @@ const answer = (
     longDialogue: "约定由玩家选择下一步",
   },
   control,
+  storyStateDelta: {},
 });
-async function fixture() {
+async function fixture({ simulate = true } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "coyote-roleplay-")),
     store = new Store(directory);
   store.saveSettings({
@@ -80,7 +88,7 @@ async function fixture() {
       { name: "波形一", frames: ["0A0A0A0A00000000", "0B0B0B0B10101010"] },
       { name: "波形二", frames: ["0C0C0C0C20202020"] },
     ]);
-  await controller.connect({ protocol: "simulator" });
+  if (simulate) await controller.connect({ protocol: "simulator" });
   const waves = controller.snapshot().waveforms;
   const bounds: RoleplayBounds = {
     channels: ["A", "B"],
@@ -185,6 +193,300 @@ test("reply choices are persisted, remain proposals until selected and use the n
       "suggestions do not start device control",
     );
   } finally {
+    await f.close();
+  }
+});
+
+const openingFacts: StoryStateDelta = {
+  scene: {
+    chapter: "星城入口",
+    location: "试炼馆前厅",
+    situation: "向导交给旅人一枚徽章。",
+  },
+  goals: [
+    {
+      id: "entry",
+      title: "找到入口",
+      description: "定位试炼馆内门。",
+      status: "active",
+    },
+  ],
+  relationships: [
+    {
+      id: "guide",
+      name: "星涟",
+      description: "互相试探",
+      reason: "在前厅初次相见。",
+    },
+  ],
+  items: [
+    {
+      id: "badge",
+      name: "银色徽章",
+      description: "向导交给旅人的徽章。",
+      status: "held",
+    },
+  ],
+  clues: [
+    { id: "pattern", content: "徽章上的星纹与门锁相似。", status: "open" },
+  ],
+};
+
+test("story state rejects illegal transitions and total capacity without mutating confirmed facts", () => {
+  const initial = mergeStoryState(emptyStoryState(), openingFacts).facts;
+  const terminal = mergeStoryState(initial, {
+    goals: [{ id: "entry", status: "completed" }],
+    items: [{ id: "badge", status: "used" }],
+    clues: [{ id: "pattern", status: "solved" }],
+  }).facts;
+  const confirmed = structuredClone(terminal);
+  for (const delta of [
+    { goals: [{ id: "entry", status: "active" }] },
+    { items: [{ id: "badge", status: "lost" }] },
+    { clues: [{ id: "pattern", status: "open" }] },
+    { relationships: [{ id: "guide", description: "信任" }] },
+  ] satisfies StoryStateDelta[]) {
+    assert.throws(() =>
+      mergeStoryState(terminal, {
+        ...delta,
+        scene: { location: "不得部分更新" },
+      }),
+    );
+    assert.deepEqual(terminal, confirmed);
+  }
+  const full = {
+    ...initial,
+    items: Array.from({ length: STORY_ENTITIES_PER_GROUP }, (_, index) => ({
+      ...initial.items[0],
+      id: `item${index}`,
+      name: `物品${index}`,
+    })),
+  };
+  assert.throws(
+    () => mergeStoryState(full, { items: openingFacts.items }),
+    /上限/,
+  );
+  assert.equal(mergeStoryState(terminal, {}).facts.items[0].status, "used");
+  assert.deepEqual(
+    mergeStoryState(terminal, { items: [{ id: "badge", status: "held" }] })
+      .facts.items,
+    [{ ...terminal.items[0], status: "held" }],
+  );
+});
+
+test("old pure-text stories initialize from accepted replies and preserve distinct facts and sources", async () => {
+  const f = await fixture({ simulate: false });
+  try {
+    const { storyState: _state, ...legacy } = f.session;
+    f.store.set("stories", legacy.id, legacy);
+    assert.deepEqual(
+      f.service.session(legacy.id).storyState,
+      emptyStoryState(),
+    );
+    assert.equal(
+      f.service.messages(legacy.id).items[0].storyChanges,
+      undefined,
+    );
+    assert.equal(f.calls(), 0);
+    f.setReply(async () => ({
+      ...answer(),
+      narration: "前厅里，星涟将银色徽章交给旅人，并指了指带星纹的门锁。",
+      storyStateDelta: openingFacts,
+    }));
+    assert.equal(
+      (await f.send("我接受徽章，答应寻找入口。")).status,
+      "completed",
+    );
+    const first = f.service.session(legacy.id).storyState;
+    assert.equal(first.version, 1);
+    assert.equal(f.calls(), 1);
+    const source = f.service.message(legacy.id, first.lastUpdate!.messageId);
+    assert.equal(first.updatedAt, source.at);
+    assert.equal(source.seq, first.lastUpdate!.seq);
+    assert.deepEqual(source.storyChanges, first.lastUpdate!.changes);
+    assert.ok(source.storyChanges!.some((change) => change.label === "获得"));
+    assert.equal(first.items[0].status, "held");
+
+    f.setReply(async (_op, _profile, context) => {
+      const snapshot = context as { storyState: typeof first };
+      assert.deepEqual(snapshot.storyState.items, first.items);
+      assert.ok(!JSON.stringify(context).includes(source.replyOptions![2]));
+      return {
+        ...answer(),
+        narration: "旅人用徽章打开内门，星涟因此开始信任旅人。",
+        storyStateDelta: {
+          scene: { situation: "内门已打开。" },
+          goals: [{ id: "entry", status: "completed" }],
+          relationships: [
+            {
+              id: "guide",
+              description: "初步信任",
+              reason: "旅人用徽章打开了内门。",
+            },
+          ],
+          items: [{ id: "badge", status: "used" }],
+          clues: [{ id: "pattern", status: "solved" }],
+        },
+      };
+    });
+    assert.equal((await f.send("我把徽章对准门锁。")).status, "completed");
+    const second = f.service.session(legacy.id).storyState;
+    assert.deepEqual(second.scene, {
+      ...first.scene,
+      situation: "内门已打开。",
+    });
+    assert.deepEqual(second.goals, [
+      { ...first.goals[0], status: "completed" },
+    ]);
+    assert.equal(second.relationships.length, 1);
+    assert.equal(second.relationships[0].description, "初步信任");
+    assert.deepEqual(second.items, [{ ...first.items[0], status: "used" }]);
+    assert.deepEqual(second.clues, [{ ...first.clues[0], status: "solved" }]);
+    assert.deepEqual(
+      second.lastUpdate!.changes.map((change) => change.label),
+      ["局势变化", "目标完成", "关系变化", "物品已使用", "线索解决"],
+    );
+    f.setReply(async (_op, _profile, context) => {
+      const snapshot = context as { storyState: typeof second };
+      assert.deepEqual(snapshot.storyState.items, [
+        { id: "badge", name: "银色徽章", status: "used" },
+      ]);
+      return {
+        ...answer(),
+        storyStateDelta: {
+          scene: { situation: "内门已打开。" },
+          items: [{ id: "badge", status: "used" }],
+        },
+      };
+    });
+    assert.equal((await f.send("我点点头。")).status, "completed");
+    const third = f.service.session(legacy.id).storyState;
+    assert.equal(third.version, 3);
+    assert.deepEqual(third.lastUpdate!.changes, []);
+    assert.deepEqual(third.items, second.items);
+    assert.deepEqual(third.goals, second.goals);
+    assert.deepEqual(
+      f.service.message(legacy.id, source.id).storyChanges,
+      first.lastUpdate!.changes,
+    );
+
+    const other = f.service.create({
+      cardId: f.card.id,
+      player: legacy.player,
+      scenario: "",
+    });
+    assert.deepEqual(f.service.session(other.id).storyState, emptyStoryState());
+    assert.throws(() => f.service.message(other.id, source.id));
+    const reopened = new Store(f.directory);
+    try {
+      assert.deepEqual(
+        reopened.get<RoleplaySession>("stories", legacy.id)?.storyState,
+        third,
+      );
+      assert.deepEqual(
+        reopened.get<RoleplaySession>("stories", other.id)?.storyState,
+        emptyStoryState(),
+      );
+    } finally {
+      reopened.close();
+    }
+    assert.equal(f.controller.isActive(), false);
+  } finally {
+    await f.close();
+  }
+});
+
+test("invalid deltas use the format retry budget and idempotent acceptance applies only once", async () => {
+  const f = await fixture({ simulate: false });
+  try {
+    const request = {
+      text: "我接过徽章",
+      requestId: randomUUID(),
+      revision: 0,
+    };
+    let attempts = 0;
+    f.setReply(async (_op, _profile, context) => {
+      attempts++;
+      if (attempts === 1)
+        return {
+          ...answer(),
+          storyStateDelta: { items: [{ id: "badge", status: "held" }] },
+        };
+      assert.match(
+        (context as { responseFormatRepair: string }).responseFormatRepair,
+        /storyStateDelta/,
+      );
+      assert.equal(f.service.session(f.session.id).storyState.version, 0);
+      return { ...answer(), storyStateDelta: openingFacts };
+    });
+    const turn = f.service.send(f.session.id, request);
+    assert.equal(f.service.send(f.session.id, request).id, turn.id);
+    await until(
+      () => f.service.turn(f.session.id, turn.id).status === "completed",
+    );
+    assert.equal(f.service.send(f.session.id, request).id, turn.id);
+    const accepted = f.service.session(f.session.id).storyState;
+    assert.equal(accepted.version, 1);
+    assert.equal(accepted.items.length, 1);
+    assert.equal(attempts, 2);
+    assert.equal(
+      f.service.messages(f.session.id).items.filter((m) => m.storyChanges)
+        .length,
+      1,
+    );
+
+    f.setReply(async () => ({
+      ...answer(),
+      storyStateDelta: {
+        items: [
+          { ...openingFacts.items![0], id: "duplicate", name: "银色 徽章" },
+        ],
+      },
+    }));
+    const failed = await f.send("拿起桌上的东西");
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.formatAttempt, 3);
+    assert.deepEqual(f.service.session(f.session.id).storyState, accepted);
+    assert.throws(
+      () =>
+        f.service.send(f.session.id, { ...request, requestId: randomUUID() }),
+      /更新/,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("state and assistant reply roll back together when saving the accepted turn fails", async (t) => {
+  const f = await fixture({ simulate: false });
+  const original = f.store.set.bind(f.store);
+  const write = t.mock.method(
+    f.store,
+    "set",
+    (collection: string, id: string, value: unknown) => {
+      if (
+        collection === "story-turns" &&
+        (value as { status: string }).status === "completed"
+      )
+        throw Error("fixture write failure");
+      return original(collection, id, value);
+    },
+  );
+  try {
+    f.setReply(async () => ({ ...answer(), storyStateDelta: openingFacts }));
+    assert.equal((await f.send()).status, "failed");
+    assert.deepEqual(
+      f.service.session(f.session.id).storyState,
+      emptyStoryState(),
+    );
+    assert.equal(
+      f.service
+        .messages(f.session.id)
+        .items.filter((m) => m.role === "assistant").length,
+      1,
+    );
+  } finally {
+    write.mock.restore();
     await f.close();
   }
 });
@@ -484,9 +786,10 @@ test("new messages discard old inference without zero and duplicate messages exe
   const f = await fixture();
   try {
     await f.service.startLink(f.session.id, f.bounds, randomUUID());
-    f.setReply(async () =>
-      answer({ action: "update", channels: { A: { target: 6 } } }),
-    );
+    f.setReply(async () => ({
+      ...answer({ action: "update", channels: { A: { target: 6 } } }),
+      storyStateDelta: openingFacts,
+    }));
     await f.send();
     let resolve!: (v: unknown) => void;
     f.setReply(() => new Promise((r) => (resolve = r)));
@@ -501,13 +804,21 @@ test("new messages discard old inference without zero and duplicate messages exe
     const requestId = randomUUID(),
       next = f.service.send(f.session.id, { text: "第二回答", requestId });
     assert.equal(f.controller.run!.roleplay!.output.A.target, 6);
-    resolve(answer({ action: "update", channels: { A: { target: 19 } } }));
+    resolve({
+      ...answer({ action: "update", channels: { A: { target: 19 } } }),
+      storyStateDelta: { scene: { location: "过期回复的地点" } },
+    });
     await until(
       () => f.service.turn(f.session.id, next.id).status === "completed",
     );
     assert.equal(f.service.turn(f.session.id, old.id).status, "cancelled");
     assert.equal(f.controller.run!.roleplay!.output.A.target, 6);
     assert.equal(f.controller.run!.roleplay!.output.B.target, 4);
+    assert.equal(
+      f.service.session(f.session.id).storyState.scene.location,
+      "试炼馆前厅",
+    );
+    assert.equal(f.service.session(f.session.id).storyState.version, 2);
     const count = f.calls();
     assert.equal(
       f.service.send(f.session.id, { text: "第二回答", requestId }).id,
@@ -680,7 +991,9 @@ test("pause/range/resume cannot replay output; late inference after emergency is
 test("memory compaction covers old ranges without deleting raw messages and stories remain isolated", async () => {
   const f = await fixture();
   try {
-    for (let i = 1; i <= 130; i++)
+    f.setReply(async () => ({ ...answer(), storyStateDelta: openingFacts }));
+    assert.equal((await f.send()).status, "completed");
+    for (let i = 4; i <= 130; i++)
       f.store.set(`story-messages:${f.session.id}`, "old" + i, {
         id: "old" + i,
         sessionId: f.session.id,
@@ -697,14 +1010,20 @@ test("memory compaction covers old ranges without deleting raw messages and stor
       }
       const ctx = context as {
         memory: { recentDialogue: unknown[]; longPlot: string };
+        storyState: { scene: { location: string } };
       };
       assert.equal(ctx.memory.recentDialogue.length, 20);
       assert.match(ctx.memory.longPlot, /线索1/);
+      assert.equal(ctx.storyState.scene.location, "试炼馆前厅");
       return answer();
     });
     assert.equal((await f.send("回顾线索")).status, "completed");
     assert.ok(summarized >= 5);
     assert.ok(f.service.session(f.session.id).memory.throughSeq >= 111);
+    assert.equal(
+      f.service.session(f.session.id).storyState.items[0].name,
+      "银色徽章",
+    );
     assert.ok(f.service.export(f.session.id).includes("线索1"));
     const other = f.service.create({
       cardId: f.card.id,
@@ -786,10 +1105,12 @@ test("restart marks pending turns interrupted and never schedules old roleplay o
   const f = await fixture();
   try {
     await f.service.startLink(f.session.id, f.bounds, randomUUID());
-    f.setReply(async () =>
-      answer({ action: "update", channels: { A: { target: 8 } } }),
-    );
+    f.setReply(async () => ({
+      ...answer({ action: "update", channels: { A: { target: 8 } } }),
+      storyStateDelta: openingFacts,
+    }));
     await f.send();
+    const confirmed = f.service.session(f.session.id).storyState;
     const saved = structuredClone(f.controller.run!);
     await f.service.close();
     await f.controller.close();
@@ -827,6 +1148,7 @@ test("restart marks pending turns interrupted and never schedules old roleplay o
       tick(restarted);
       assert.equal(driver.state.intensities.A, 0);
       assert.ok(story.export(f.session.id).includes("我接过徽章"));
+      assert.deepEqual(story.session(f.session.id).storyState, confirmed);
     } finally {
       await story.close();
       await restarted.close();

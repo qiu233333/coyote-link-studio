@@ -1,5 +1,10 @@
 import { z } from "zod";
 import type { Channel, ChannelValues } from "./types.js";
+import {
+  storyStateDeltaSchema,
+  type StoryChange,
+  type StoryState,
+} from "./storyState.js";
 
 export const CARD_SPEC = "coyote_roleplay_card" as const;
 export const MAX_CARD_BYTES = 20 * 1024 * 1024;
@@ -133,6 +138,7 @@ export const replySchema = z
     narration: z.string().max(12000),
     dialogue: z.string().max(12000),
     replyOptions: replyOptionsSchema,
+    storyStateDelta: storyStateDeltaSchema,
     memory: memorySchema,
     control: outputPatchSchema,
     controlReason: z.string().trim().min(1).max(500).optional(),
@@ -153,6 +159,7 @@ export interface RoleplaySession {
   updatedAt: number;
   revision: number;
   memory: StoryMemory;
+  storyState: StoryState;
   turnId?: string;
 }
 export interface StoryMessage {
@@ -164,6 +171,7 @@ export interface StoryMessage {
   text: string;
   narration?: string;
   replyOptions?: string[];
+  storyChanges?: StoryChange[];
   turnId?: string;
   control?: RoleplayPatch;
   output?: RoleplayOutputState;

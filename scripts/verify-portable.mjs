@@ -102,6 +102,10 @@ const provider = createServer(async (req, res) => {
                           longPlot: "开始旅程",
                           longDialogue: "约定一起旅行",
                         },
+                        ...(body.tools[0].function.parameters.properties
+                          .storyStateDelta
+                          ? { storyStateDelta: {} }
+                          : {}),
                         control: { action: "keep" },
                         controlReason: "本轮仅进行文字验收。",
                       },

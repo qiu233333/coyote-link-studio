@@ -13,6 +13,7 @@ import {
   Play,
   Square,
   X,
+  PanelRight,
 } from "lucide-react";
 import type { AppSnapshot, Channel } from "../shared/types";
 import {
@@ -32,6 +33,8 @@ import {
 import { request, type Action } from "./api";
 import { Badge, Field, Modal, NumberInput } from "./ui";
 import { STORY_FORMAT_MAX_RETRIES } from "../shared/executionPolicy";
+import type { StorySource } from "../shared/storyState";
+import { StoryStatePanel } from "./StoryStatePanel";
 
 const base = "/api/roleplay";
 const fieldNames: Record<string, string> = {
@@ -54,6 +57,12 @@ type StoryList = {
   characterName: string;
   updatedAt: number;
 }[];
+type StoryStatus = Pick<
+  RoleplaySession,
+  "id" | "title" | "revision" | "updatedAt" | "memory" | "turnId"
+> &
+  Partial<Pick<RoleplaySession, "storyState">>;
+const panelPreference = "coyote.story-state-open";
 function download(name: string, value: unknown, text = false) {
   const url = URL.createObjectURL(
     new Blob([text ? String(value) : JSON.stringify(value, null, 2)], {
@@ -132,9 +141,31 @@ export default function RoleplayPage({
     [busy, setBusy] = useState(false),
     [notice, setNotice] = useState("");
   const selected = useRef<string | null>(null),
-    bottom = useRef<HTMLDivElement>(null),
+    viewport = useRef<HTMLDivElement>(null),
+    sourceArticle = useRef<HTMLElement>(null),
+    stateVersion = useRef(0),
+    openRequest = useRef(0),
+    sourceRequest = useRef(0),
+    followLatest = useRef(true),
     sending = useRef(false),
     composing = useRef(false);
+  const [sourceMessage, setSourceMessage] = useState<StoryMessage>();
+  const [following, setFollowing] = useState(true);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [wide, setWide] = useState(
+    () => matchMedia("(min-width: 1024px)").matches,
+  );
+  const [panelOpen, setPanelOpen] = useState<boolean | undefined>(() => {
+    const saved = localStorage.getItem(panelPreference);
+    return saved === null ? undefined : saved === "true";
+  });
+  const showPanel = panelOpen ?? wide;
+  useEffect(() => {
+    const media = matchMedia("(min-width: 1024px)");
+    const change = () => setWide(media.matches);
+    media.addEventListener("change", change);
+    return () => media.removeEventListener("change", change);
+  }, []);
   const activeRun =
     state.run && ["running", "paused"].includes(state.run.status)
       ? state.run
@@ -162,34 +193,76 @@ export default function RoleplayPage({
       })
       .catch((e) => setNotice(e.message));
   }, []);
-  useEffect(() => {
-    selected.current = session?.id ?? null;
-  }, [session?.id]);
   async function open(id: string) {
-    selected.current = id;
-    const s = await request<RoleplaySession>(
-        `${base}/sessions/${id}`,
-        undefined,
-        "GET",
-      ),
-      m = await request<{ items: StoryMessage[]; cursor?: number }>(
+    const requestNumber = ++openRequest.current;
+    const [s, m] = await Promise.all([
+      request<RoleplaySession>(`${base}/sessions/${id}`, undefined, "GET"),
+      request<{ items: StoryMessage[]; cursor?: number }>(
         `${base}/sessions/${id}/messages`,
         undefined,
         "GET",
+      ),
+    ]);
+    const latestTurn = s.turnId
+      ? await request<RoleplayTurn>(
+          `${base}/sessions/${id}/turns/${s.turnId}`,
+          undefined,
+          "GET",
+        )
+      : undefined;
+    if (openRequest.current !== requestNumber) return;
+    const switching = selected.current !== id;
+    selected.current = id;
+    if (switching) {
+      sourceRequest.current++;
+      setSourceMessage(undefined);
+      setLibraryOpen(false);
+      followLatest.current = true;
+      setFollowing(true);
+      stateVersion.current = s.storyState.version;
+      setSession(s);
+      setMessages(m.items);
+      setCursor(m.items.length === 50 ? m.cursor : undefined);
+      setTurn(latestTurn);
+    } else {
+      updateStory(s, m.items, latestTurn);
+    }
+  }
+  function updateStory(
+    s: StoryStatus,
+    items: StoryMessage[],
+    latestTurn?: RoleplayTurn,
+  ) {
+    if (s.storyState)
+      stateVersion.current = Math.max(
+        stateVersion.current,
+        s.storyState.version,
       );
-    if (selected.current !== id) return;
-    setSession(s);
-    setMessages(m.items);
-    setCursor(m.items.length === 50 ? m.cursor : undefined);
-    setTurn(
-      s.turnId
-        ? await request<RoleplayTurn>(
-            `${base}/sessions/${id}/turns/${s.turnId}`,
-            undefined,
-            "GET",
-          )
-        : undefined,
-    );
+    setSession((old) => {
+      if (old?.id !== s.id) return old;
+      return {
+        ...(old.revision > s.revision ? old : { ...old, ...s }),
+        storyState:
+          s.storyState && s.storyState.version >= old.storyState.version
+            ? s.storyState
+            : old.storyState,
+      };
+    });
+    if (latestTurn)
+      setTurn((old) =>
+        old?.sessionId === s.id &&
+        (old.revision > latestTurn.revision ||
+          (old.id === latestTurn.id &&
+            old.status !== "pending" &&
+            latestTurn.status === "pending"))
+          ? old
+          : latestTurn,
+      );
+    setMessages((old) => {
+      const merged = new Map(old.map((message) => [message.seq, message]));
+      for (const message of items) merged.set(message.seq, message);
+      return [...merged.values()].sort((a, b) => a.seq - b.seq);
+    });
   }
   useEffect(() => {
     if (!session) return;
@@ -200,23 +273,21 @@ export default function RoleplayPage({
       if (pending) return;
       pending = true;
       try {
-        const s = await request<RoleplaySession>(
-          `${base}/sessions/${id}?status=1`,
+        const s = await request<StoryStatus>(
+          `${base}/sessions/${id}?status=1&stateVersion=${stateVersion.current}`,
           undefined,
           "GET",
           abort.signal,
         );
         if (selected.current !== id || abort.signal.aborted) return;
-        setSession((old) => (old?.id === id ? { ...old, ...s } : old));
-        if (s.turnId)
-          setTurn(
-            await request(
+        const latestTurn = s.turnId
+          ? await request<RoleplayTurn>(
               `${base}/sessions/${id}/turns/${s.turnId}`,
               undefined,
               "GET",
               abort.signal,
-            ),
-          );
+            )
+          : undefined;
         const m = await request<{ items: StoryMessage[] }>(
           `${base}/sessions/${id}/messages`,
           undefined,
@@ -224,11 +295,7 @@ export default function RoleplayPage({
           abort.signal,
         );
         if (!abort.signal.aborted && selected.current === id)
-          setMessages((old) => {
-            const merged = new Map(old.map((m) => [m.seq, m]));
-            for (const item of m.items) merged.set(item.seq, item);
-            return [...merged.values()].sort((a, b) => a.seq - b.seq);
-          });
+          updateStory(s, m.items, latestTurn);
       } catch (e) {
         if (!abort.signal.aborted) setNotice((e as Error).message);
       } finally {
@@ -242,8 +309,48 @@ export default function RoleplayPage({
     };
   }, [session?.id]);
   useEffect(() => {
-    bottom.current?.scrollIntoView({ block: "nearest", behavior: "instant" });
-  }, [messages.length]);
+    if (!sourceMessage && followLatest.current && viewport.current) {
+      viewport.current.scrollTop = viewport.current.scrollHeight;
+    }
+  }, [session?.id, latestMessage?.id, sourceMessage]);
+  useEffect(() => {
+    if (!sourceMessage) return;
+    if (viewport.current) viewport.current.scrollTop = 0;
+    sourceArticle.current?.scrollIntoView({ block: "nearest" });
+    sourceArticle.current?.focus({ preventScroll: true });
+  }, [sourceMessage]);
+  async function locateSource(source: StorySource) {
+    if (!session) return;
+    const id = session.id;
+    const requestNumber = ++sourceRequest.current;
+    try {
+      const message =
+        messages.find((message) => message.id === source.messageId) ??
+        (await request<StoryMessage>(
+          `${base}/sessions/${id}/messages/${encodeURIComponent(source.messageId)}`,
+          undefined,
+          "GET",
+        ));
+      if (selected.current !== id || requestNumber !== sourceRequest.current)
+        return;
+      if (message.seq !== source.seq || message.role !== "assistant")
+        throw new Error("找不到对应的剧情回复");
+      setSourceMessage({ ...message });
+    } catch (error) {
+      if (selected.current === id && requestNumber === sourceRequest.current)
+        setNotice((error as Error).message);
+    }
+  }
+  function returnToLatest() {
+    sourceRequest.current++;
+    setSourceMessage(undefined);
+    followLatest.current = true;
+    setFollowing(true);
+    if (viewport.current) {
+      viewport.current.focus({ preventScroll: true });
+      viewport.current.scrollTop = viewport.current.scrollHeight;
+    }
+  }
   async function task(fn: () => Promise<void>) {
     setBusy(true);
     setNotice("");
@@ -481,8 +588,10 @@ export default function RoleplayPage({
           AI 上锁任务占用设备。请在原任务中反馈或急停后，再开始演绎。
         </div>
       )}
-      <div className="story-workspace">
-        <aside className="glass-card story-library">
+      <div
+        className={`story-workspace${session ? " has-story" : ""}${libraryOpen ? " library-open" : ""}`}
+      >
+        <aside className="glass-card story-library" id="story-library">
           <h2>
             <BookOpen size={19} />
             角色与故事
@@ -678,6 +787,7 @@ export default function RoleplayPage({
                             "DELETE",
                           );
                           if (r) {
+                            openRequest.current++;
                             setSession(null);
                             selected.current = null;
                             await loadLists();
@@ -689,282 +799,369 @@ export default function RoleplayPage({
                   </button>
                 </div>
               </div>
-              <div className="story-link-strip">
-                <Badge>
-                  {run
-                    ? run.status === "paused"
-                      ? "联动已暂停"
-                      : "持续联动中"
-                    : "纯文字演绎"}
-                </Badge>
-                {run && (
-                  <span>
-                    联动 {elapsed(run.startedAt)} · A{" "}
-                    {state.device.intensities.A} / B{" "}
-                    {state.device.intensities.B}
-                  </span>
-                )}
-                {!run ? (
-                  <button
-                    className="button small primary"
-                    disabled={
-                      !!activeRun ||
-                      locked ||
-                      busy ||
-                      turn?.status === "pending"
-                    }
-                    onClick={() => {
-                      setBounds(initialBounds());
-                      setLinkDialog(true);
+              <div className="story-view-actions">
+                <button
+                  type="button"
+                  className="button small secondary story-library-toggle"
+                  aria-expanded={libraryOpen}
+                  aria-controls="story-library"
+                  onClick={() => setLibraryOpen(!libraryOpen)}
+                >
+                  <BookOpen size={15} aria-hidden="true" />
+                  角色与故事
+                </button>
+                <button
+                  type="button"
+                  className="button small secondary"
+                  aria-expanded={showPanel}
+                  aria-controls="story-state"
+                  onClick={() => {
+                    setPanelOpen(!showPanel);
+                    localStorage.setItem(panelPreference, String(!showPanel));
+                  }}
+                >
+                  <PanelRight size={15} aria-hidden="true" />
+                  剧情状态
+                </button>
+              </div>
+              <div className="story-content">
+                <div id="story-state" hidden={!showPanel}>
+                  {showPanel && (
+                    <StoryStatePanel
+                      state={session.storyState}
+                      pending={turn?.status === "pending"}
+                      onSource={(source) => void locateSource(source)}
+                    />
+                  )}
+                </div>
+                <div className="story-conversation">
+                  <div className="story-link-strip">
+                    <Badge>
+                      {run
+                        ? run.status === "paused"
+                          ? "联动已暂停"
+                          : "持续联动中"
+                        : "纯文字演绎"}
+                    </Badge>
+                    {run && (
+                      <span>
+                        联动 {elapsed(run.startedAt)} · A{" "}
+                        {state.device.intensities.A} / B{" "}
+                        {state.device.intensities.B}
+                      </span>
+                    )}
+                    {!run ? (
+                      <button
+                        className="button small primary"
+                        disabled={
+                          !!activeRun ||
+                          locked ||
+                          busy ||
+                          turn?.status === "pending"
+                        }
+                        onClick={() => {
+                          setBounds(initialBounds());
+                          setLinkDialog(true);
+                        }}
+                      >
+                        启用设备联动
+                      </button>
+                    ) : (
+                      <>
+                        <button
+                          className="button small"
+                          disabled={state.stopping}
+                          onClick={() =>
+                            void link(
+                              run.status === "paused" ? "resume" : "pause",
+                            )
+                          }
+                        >
+                          {run.status === "paused" ? (
+                            <Play size={14} />
+                          ) : (
+                            <Pause size={14} />
+                          )}{" "}
+                          {run.status === "paused" ? "恢复联动" : "暂停输出"}
+                        </button>
+                        <button
+                          className="button small secondary"
+                          onClick={() => {
+                            setBounds(structuredClone(run.roleplay!.bounds));
+                            setLinkDialog(true);
+                          }}
+                        >
+                          修改范围
+                        </button>
+                        <button
+                          className="button small secondary"
+                          onClick={() => void link("stop")}
+                        >
+                          <Square size={14} />
+                          结束联动
+                        </button>
+                      </>
+                    )}
+                  </div>
+                  {activeRun && !run && (
+                    <p className="notice">
+                      设备由其他模式或故事占用，请先停止该运行。
+                    </p>
+                  )}
+                  <details className="story-device">
+                    <summary>设备详情与授权范围</summary>
+                    {run ? (
+                      <>
+                        <p>
+                          无限时保持输出。聊天和等待 AI
+                          不会强制归零；以设备回传为准。
+                        </p>
+                        {(["A", "B"] as Channel[]).map((c) => (
+                          <p key={c}>
+                            通道 {c}：目标 {run.roleplay!.output[c].target} ·
+                            回传 {state.device.intensities[c]} · 设备上限{" "}
+                            {state.device.limits[c]} · 授权{" "}
+                            {run.roleplay!.bounds.minIntensity[c]}–
+                            {run.roleplay!.bounds.maxIntensity[c]} · 速率{" "}
+                            {run.roleplay!.output[c].rampPerSecond}/s ·{" "}
+                            {state.waveforms.find(
+                              (w) =>
+                                w.id === run.roleplay!.output[c].waveformId,
+                            )?.name || "快照波形"}
+                          </p>
+                        ))}
+                      </>
+                    ) : (
+                      <p>当前故事没有设备授权，回复只推进剧情。</p>
+                    )}
+                  </details>
+                  <div className="story-history-actions">
+                    {sourceMessage && (
+                      <span>正在查看第 {sourceMessage.seq} 条回复</span>
+                    )}
+                    {(sourceMessage || !following) && (
+                      <button
+                        type="button"
+                        className="button small secondary"
+                        onClick={returnToLatest}
+                      >
+                        返回最新剧情
+                      </button>
+                    )}
+                  </div>
+                  <div
+                    className="story-messages"
+                    ref={viewport}
+                    tabIndex={0}
+                    aria-label={sourceMessage ? "变化来源回复" : "剧情对话"}
+                    aria-live={sourceMessage ? "off" : "polite"}
+                    onScroll={(event) => {
+                      if (sourceMessage) return;
+                      const { scrollHeight, scrollTop, clientHeight } =
+                        event.currentTarget;
+                      const nearLatest =
+                        scrollHeight - scrollTop - clientHeight < 48;
+                      followLatest.current = nearLatest;
+                      setFollowing(nearLatest);
                     }}
                   >
-                    启用设备联动
-                  </button>
-                ) : (
-                  <>
-                    <button
-                      className="button small"
-                      disabled={state.stopping}
-                      onClick={() =>
-                        void link(run.status === "paused" ? "resume" : "pause")
-                      }
-                    >
-                      {run.status === "paused" ? (
-                        <Play size={14} />
-                      ) : (
-                        <Pause size={14} />
-                      )}{" "}
-                      {run.status === "paused" ? "恢复联动" : "暂停输出"}
-                    </button>
-                    <button
-                      className="button small secondary"
-                      onClick={() => {
-                        setBounds(structuredClone(run.roleplay!.bounds));
-                        setLinkDialog(true);
-                      }}
-                    >
-                      修改范围
-                    </button>
-                    <button
-                      className="button small secondary"
-                      onClick={() => void link("stop")}
-                    >
-                      <Square size={14} />
-                      结束联动
-                    </button>
-                  </>
-                )}
-              </div>
-              {activeRun && !run && (
-                <p className="notice">
-                  设备由其他模式或故事占用，请先停止该运行。
-                </p>
-              )}
-              <details className="story-device">
-                <summary>设备详情与授权范围</summary>
-                {run ? (
-                  <>
-                    <p>
-                      无限时保持输出。聊天和等待 AI
-                      不会强制归零；以设备回传为准。
-                    </p>
-                    {(["A", "B"] as Channel[]).map((c) => (
-                      <p key={c}>
-                        通道 {c}：目标 {run.roleplay!.output[c].target} · 回传{" "}
-                        {state.device.intensities[c]} · 设备上限{" "}
-                        {state.device.limits[c]} · 授权{" "}
-                        {run.roleplay!.bounds.minIntensity[c]}–
-                        {run.roleplay!.bounds.maxIntensity[c]} · 速率{" "}
-                        {run.roleplay!.output[c].rampPerSecond}/s ·{" "}
-                        {state.waveforms.find(
-                          (w) => w.id === run.roleplay!.output[c].waveformId,
-                        )?.name || "快照波形"}
-                      </p>
+                    {cursor && !sourceMessage && (
+                      <button
+                        className="button small secondary"
+                        onClick={() =>
+                          void task(async () => {
+                            const page = await request<{
+                              items: StoryMessage[];
+                              cursor?: number;
+                            }>(
+                              `${base}/sessions/${session.id}/messages?before=${cursor}`,
+                              undefined,
+                              "GET",
+                            );
+                            if (selected.current !== session.id) return;
+                            followLatest.current = false;
+                            setFollowing(false);
+                            setMessages((old) => [
+                              ...page.items,
+                              ...old.filter(
+                                (m) => !page.items.some((p) => p.id === m.id),
+                              ),
+                            ]);
+                            setCursor(
+                              page.items.length === 50
+                                ? page.cursor
+                                : undefined,
+                            );
+                          })
+                        }
+                      >
+                        加载更早对话
+                      </button>
+                    )}
+                    {(sourceMessage ? [sourceMessage] : messages).map((m) => (
+                      <article
+                        className={`story-message ${m.role}`}
+                        key={m.id}
+                        ref={sourceMessage ? sourceArticle : undefined}
+                        tabIndex={sourceMessage ? -1 : undefined}
+                        aria-label={
+                          sourceMessage ? `第 ${m.seq} 条助手回复` : undefined
+                        }
+                      >
+                        <strong>
+                          {m.role === "user"
+                            ? session.player.name
+                            : session.card.character.name}
+                        </strong>
+                        {m.narration && (
+                          <p className="story-narration">{m.narration}</p>
+                        )}
+                        {m.text && <p>{m.text}</p>}
+                        {m.control && (
+                          <details>
+                            <summary>
+                              {roleplayExecutionLabel(m.control, !!m.output)}
+                            </summary>
+                            {m.controlReason && (
+                              <p>联动说明：{m.controlReason}</p>
+                            )}
+                            {m.control.action === "keep" && m.output && (
+                              <p>
+                                keep 只保留原参数；原目标为 0
+                                时会继续保持零输出。
+                              </p>
+                            )}
+                            <pre>{JSON.stringify(m.control, null, 2)}</pre>
+                            {m.output && (
+                              <small>
+                                当时目标 A {m.output.A.target} / B{" "}
+                                {m.output.B.target}；实际执行请查看设备回传。
+                              </small>
+                            )}
+                          </details>
+                        )}
+                      </article>
                     ))}
-                  </>
-                ) : (
-                  <p>当前故事没有设备授权，回复只推进剧情。</p>
-                )}
-              </details>
-              <div className="story-messages" aria-live="polite">
-                {cursor && (
-                  <button
-                    className="button small secondary"
-                    onClick={() =>
-                      void task(async () => {
-                        const page = await request<{
-                          items: StoryMessage[];
-                          cursor?: number;
-                        }>(
-                          `${base}/sessions/${session.id}/messages?before=${cursor}`,
-                          undefined,
-                          "GET",
-                        );
-                        setMessages((old) => [
-                          ...page.items,
-                          ...old.filter(
-                            (m) => !page.items.some((p) => p.id === m.id),
-                          ),
-                        ]);
-                        setCursor(
-                          page.items.length === 50 ? page.cursor : undefined,
-                        );
-                      })
-                    }
-                  >
-                    加载更早对话
-                  </button>
-                )}
-                {messages.map((m) => (
-                  <article className={`story-message ${m.role}`} key={m.id}>
-                    <strong>
-                      {m.role === "user"
-                        ? session.player.name
-                        : session.card.character.name}
-                    </strong>
-                    {m.narration && (
-                      <p className="story-narration">{m.narration}</p>
-                    )}
-                    {m.text && <p>{m.text}</p>}
-                    {m.control && (
-                      <details>
-                        <summary>
-                          {roleplayExecutionLabel(m.control, !!m.output)}
-                        </summary>
-                        {m.controlReason && <p>联动说明：{m.controlReason}</p>}
-                        {m.control.action === "keep" && m.output && (
-                          <p>
-                            keep 只保留原参数；原目标为 0 时会继续保持零输出。
-                          </p>
-                        )}
-                        <pre>{JSON.stringify(m.control, null, 2)}</pre>
-                        {m.output && (
-                          <small>
-                            当时目标 A {m.output.A.target} / B{" "}
-                            {m.output.B.target}；实际执行请查看设备回传。
-                          </small>
-                        )}
-                      </details>
-                    )}
-                  </article>
-                ))}
-                <div ref={bottom} />
-              </div>
-              {turn?.status === "pending" && (
-                <div className="story-thinking">
-                  <Sparkles size={16} />{" "}
-                  {turn.retryKind === "format" && turn.formatAttempt
-                    ? `正在调整回复格式 ${turn.formatAttempt}/${STORY_FORMAT_MAX_RETRIES}${run?.status === "running" ? "，保持当前输出" : ""}`
-                    : turn.attempt
-                      ? `模型暂时不可用，保持输出并重试 ${turn.attempt}/20`
-                      : "角色正在构思下一幕…"}
-                  <button onClick={() => void action(base + "/cancel", {})}>
-                    取消生成
-                  </button>
-                </div>
-              )}
-              {turn?.error && (
-                <div role="status" className="notice notice-pink">
-                  {turn.error} · 输入仍可重新发送。
-                </div>
-              )}
-              {replyOptions.length === 3 && (
-                <div
-                  className="story-quick-replies"
-                  role="group"
-                  aria-label="快捷回复"
-                >
-                  <p>
-                    试试这样回复 <span>点击即发送，也可在下方自由输入</span>
-                  </p>
-                  {replyOptions.map((option, index) => (
-                    <button
-                      type="button"
-                      key={`${latestMessage!.id}-${index}`}
-                      disabled={
-                        busy ||
-                        locked ||
-                        turn?.status === "pending" ||
-                        !!(activeRun && !run)
-                      }
-                      onClick={() => void send(option)}
+                  </div>
+                  {turn?.status === "pending" && (
+                    <div className="story-thinking">
+                      <Sparkles size={16} />{" "}
+                      {turn.retryKind === "format" && turn.formatAttempt
+                        ? `正在调整回复格式 ${turn.formatAttempt}/${STORY_FORMAT_MAX_RETRIES}${run?.status === "running" ? "，保持当前输出" : ""}`
+                        : turn.attempt
+                          ? `模型暂时不可用，保持输出并重试 ${turn.attempt}/20`
+                          : "角色正在构思下一幕…"}
+                      <button onClick={() => void action(base + "/cancel", {})}>
+                        取消生成
+                      </button>
+                    </div>
+                  )}
+                  {turn?.error && (
+                    <div role="status" className="notice notice-pink">
+                      {turn.error} · 输入仍可重新发送。
+                    </div>
+                  )}
+                  {replyOptions.length === 3 && (
+                    <div
+                      className="story-quick-replies"
+                      role="group"
+                      aria-label="快捷回复"
                     >
-                      <span aria-hidden="true">{index + 1}</span>
-                      {option}
-                    </button>
-                  ))}
-                </div>
-              )}
-              <form
-                className="story-compose"
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  void send();
-                }}
-              >
-                <textarea
-                  aria-label="回复剧情"
-                  placeholder="正常回复剧情，例如：我接过徽章，问她下一步去哪里。"
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onCompositionStart={() => {
-                    composing.current = true;
-                  }}
-                  onCompositionEnd={() => {
-                    composing.current = false;
-                  }}
-                  onKeyDown={(e) => {
-                    if (
-                      e.key === "Enter" &&
-                      !e.shiftKey &&
-                      !composing.current &&
-                      !e.nativeEvent.isComposing &&
-                      e.nativeEvent.keyCode !== 229
-                    ) {
+                      <p>
+                        试试这样回复 <span>点击即发送，也可在下方自由输入</span>
+                      </p>
+                      {replyOptions.map((option, index) => (
+                        <button
+                          type="button"
+                          key={`${latestMessage!.id}-${index}`}
+                          disabled={
+                            busy ||
+                            locked ||
+                            turn?.status === "pending" ||
+                            !!(activeRun && !run)
+                          }
+                          onClick={() => void send(option)}
+                        >
+                          <span aria-hidden="true">{index + 1}</span>
+                          {option}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <form
+                    className="story-compose"
+                    onSubmit={(e) => {
                       e.preventDefault();
                       void send();
-                    }
-                  }}
-                  maxLength={8000}
-                />
-                <button
-                  className="button primary"
-                  disabled={
-                    busy || locked || !input.trim() || !!(activeRun && !run)
-                  }
-                >
-                  <Send size={17} />
-                  发送
-                </button>
-              </form>
-              <p className="field-hint">Enter 发送 · Shift+Enter 换行</p>
-              <details className="story-memory">
-                <summary>六部分故事记忆</summary>
-                <h4>角色与玩家设定</h4>
-                <p>
-                  {session.card.character.personality} · {session.player.name}：
-                  {session.player.identity} · {session.player.relationship}
-                </p>
-                <h4>近期剧情</h4>
-                <p>{session.memory.recentPlot || "尚无"}</p>
-                <h4>近期对话</h4>
-                <p>
-                  默认保留最近 20 条原文，按模型预算调整；完整历史存于本机。
-                </p>
-                <h4>剧情背景</h4>
-                <p>
-                  {session.scenario}
-                  {"\n"}
-                  {session.memory.plotBackground}
-                </p>
-                <h4>长期剧情摘要</h4>
-                <p>{session.memory.longPlot || "尚无"}</p>
-                <h4>长期对话摘要</h4>
-                <p>{session.memory.longDialogue || "尚无"}</p>
-                <small>
-                  已归档至消息 {session.memory.throughSeq}；摘要不改变设备权限。
-                </small>
-              </details>
+                    }}
+                  >
+                    <textarea
+                      aria-label="回复剧情"
+                      placeholder="正常回复剧情，例如：我接过徽章，问她下一步去哪里。"
+                      value={input}
+                      onChange={(e) => setInput(e.target.value)}
+                      onCompositionStart={() => {
+                        composing.current = true;
+                      }}
+                      onCompositionEnd={() => {
+                        composing.current = false;
+                      }}
+                      onKeyDown={(e) => {
+                        if (
+                          e.key === "Enter" &&
+                          !e.shiftKey &&
+                          !composing.current &&
+                          !e.nativeEvent.isComposing &&
+                          e.nativeEvent.keyCode !== 229
+                        ) {
+                          e.preventDefault();
+                          void send();
+                        }
+                      }}
+                      maxLength={8000}
+                    />
+                    <button
+                      className="button primary"
+                      disabled={
+                        busy || locked || !input.trim() || !!(activeRun && !run)
+                      }
+                    >
+                      <Send size={17} />
+                      发送
+                    </button>
+                  </form>
+                  <p className="field-hint">Enter 发送 · Shift+Enter 换行</p>
+                  <details className="story-memory">
+                    <summary>六部分故事记忆</summary>
+                    <h4>角色与玩家设定</h4>
+                    <p>
+                      {session.card.character.personality} ·{" "}
+                      {session.player.name}：{session.player.identity} ·{" "}
+                      {session.player.relationship}
+                    </p>
+                    <h4>近期剧情</h4>
+                    <p>{session.memory.recentPlot || "尚无"}</p>
+                    <h4>近期对话</h4>
+                    <p>
+                      默认保留最近 20 条原文，按模型预算调整；完整历史存于本机。
+                    </p>
+                    <h4>剧情背景</h4>
+                    <p>
+                      {session.scenario}
+                      {"\n"}
+                      {session.memory.plotBackground}
+                    </p>
+                    <h4>长期剧情摘要</h4>
+                    <p>{session.memory.longPlot || "尚无"}</p>
+                    <h4>长期对话摘要</h4>
+                    <p>{session.memory.longDialogue || "尚无"}</p>
+                    <small>
+                      已归档至消息 {session.memory.throughSeq}
+                      ；摘要不改变设备权限。
+                    </small>
+                  </details>
+                </div>
+              </div>
             </>
           ) : (
             <div className="story-empty">
