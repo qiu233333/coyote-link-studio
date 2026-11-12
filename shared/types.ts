@@ -185,6 +185,7 @@ interface ControlSessionBase {
   waveformSnapshots: Record<string, Waveform>;
   feedback: Feedback[];
   lastDecision?: AiDecision;
+  lastAction?: import("./actionRecord.js").ActionRecord;
   thinking: boolean;
 }
 export type TimedControlSession = ControlSessionBase & {
@@ -220,6 +221,7 @@ export interface AiProfile extends AiSettings {
   apiKey: string;
 }
 export interface AppSnapshot {
+  actionExecution?: import("./actionRecord.js").ActionExecution;
   roleplay?: {
     activeSessionId?: string;
     turn?: import("./roleplay.js").RoleplayTurn;

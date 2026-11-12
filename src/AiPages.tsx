@@ -1,3 +1,5 @@
+import { ActionCard } from "./ActionCard";
+import { sessionAction } from "./actionCardModel";
 import { useEffect, useRef, useState } from "react";
 import {
   ArrowRight,
@@ -1088,28 +1090,8 @@ function RunSummary({
           </div>
         </div>
       )}
-      {run?.lastDecision && (
-        <>
-          <div className="summary-line decision-targets">
-            <span>最近 AI 动作</span>
-            <strong>
-              {run.lastDecision.action === "adjust"
-                ? run.lastDecision.channels
-                    .map(
-                      (channel) =>
-                        `${channel} ${run.lastDecision!.intensity[channel]}`,
-                    )
-                    .join(" · ")
-                : run.lastDecision.action === "rest"
-                  ? "A 0 · B 0 · 休息"
-                  : "A 0 · B 0 · 结束"}
-            </strong>
-          </div>
-          <div className="decision-note">
-            <Sparkles size={15} />
-            <p>{run.lastDecision.reason}</p>
-          </div>
-        </>
+      {run && sessionAction(run) && (
+        <ActionCard record={sessionAction(run)!} state={state} />
       )}
     </Card>
   );

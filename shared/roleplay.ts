@@ -198,6 +198,7 @@ export interface StoryMessage {
   };
   turnId?: string;
   control?: RoleplayPatch;
+  actionRecord?: import("./actionRecord.js").ActionRecord;
   output?: RoleplayOutputState;
   execution?: string;
   controlReason?: string;

@@ -1,3 +1,5 @@
+import { ActionCard } from "./ActionCard";
+import { storyAction } from "./actionCardModel";
 import { useEffect, useRef, useState } from "react";
 import {
   BookOpen,
@@ -1142,7 +1144,7 @@ export default function RoleplayPage({
                           <p className="story-narration">{m.narration}</p>
                         )}
                         {m.text && <p>{m.text}</p>}
-                        {m.historicalControl && (
+                        {m.historicalControl && !m.actionRecord && (
                           <details>
                             <summary>来源故事联动记录</summary>
                             <p>
@@ -1160,28 +1162,11 @@ export default function RoleplayPage({
                             )}
                           </details>
                         )}
-                        {m.control && (
-                          <details>
-                            <summary>
-                              {roleplayExecutionLabel(m.control, !!m.output)}
-                            </summary>
-                            {m.controlReason && (
-                              <p>联动说明：{m.controlReason}</p>
-                            )}
-                            {m.control.action === "keep" && m.output && (
-                              <p>
-                                keep 只保留原参数；原目标为 0
-                                时会继续保持零输出。
-                              </p>
-                            )}
-                            <pre>{JSON.stringify(m.control, null, 2)}</pre>
-                            {m.output && (
-                              <small>
-                                当时目标 A {m.output.A.target} / B{" "}
-                                {m.output.B.target}；实际执行请查看设备回传。
-                              </small>
-                            )}
-                          </details>
+                        {(m.control || m.actionRecord) && (
+                          <ActionCard
+                            record={storyAction(m)!}
+                            state={m.inheritedFrom ? undefined : state}
+                          />
                         )}
                         {m.nodeRound ? (
                           <div

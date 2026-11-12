@@ -1499,3 +1499,39 @@ test("restart preserves bookmarks and branches, marks pending turns interrupted 
     await f.close();
   }
 });
+test("action records freeze targets and names, persist with messages and lose live identity on pause", async () => {
+  const f = await fixture();
+  try {
+    await f.service.startLink(f.session.id, f.bounds, randomUUID());
+    f.setReply(async () => ({
+      ...answer({ action: "update", channels: { A: { target: 8 } } }),
+      controlReason: "只调整 A",
+    }));
+    assert.equal((await f.send()).status, "completed");
+    const message = f.service.messages(f.session.id).items.at(-1)!;
+    const r = message.actionRecord!;
+    assert.equal(r.channels.A.before!.target, 0);
+    assert.equal(r.channels.A.after!.target, 8);
+    assert.equal(r.channels.B.after!.target, 0);
+    assert.equal(r.channels.B.participating, false);
+    assert.equal(r.channels.A.after!.waveformName, f.waves[0].name);
+    assert.equal(r.reason, "只调整 A");
+    assert.deepEqual(
+      f.store.get<StoryMessage>(`story-messages:${f.session.id}`, message.id)!
+        .actionRecord,
+      r,
+    );
+    assert.equal(f.controller.snapshot().actionExecution?.id, r.id);
+    const frozen = structuredClone(r);
+    f.setReply(async () => answer({ action: "rest", channels: ["A"] }));
+    assert.equal((await f.send()).status, "completed");
+    assert.notEqual(f.controller.snapshot().actionExecution?.id, r.id);
+    assert.deepEqual(message.actionRecord, frozen);
+    await f.controller.pause("roleplay");
+    assert.equal(f.controller.snapshot().actionExecution, undefined);
+    await f.controller.resume("roleplay");
+    assert.equal(f.controller.snapshot().actionExecution, undefined);
+  } finally {
+    await f.close();
+  }
+});

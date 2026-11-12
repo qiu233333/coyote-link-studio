@@ -228,6 +228,7 @@ export class StoryBranches {
               storyTitle: source.title,
               messageId: message.id,
             },
+            actionRecord: message.actionRecord,
             historicalControl:
               message.historicalControl ??
               (message.control && message.output

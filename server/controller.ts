@@ -1,3 +1,4 @@
+import { recordAction, type ActionExecution } from "../shared/actionRecord.js";
 import {
   applyOutputPatch,
   roleplayBoundsSchema,
@@ -87,6 +88,35 @@ export class Controller extends EventEmitter {
   private history: AppSnapshot["history"] = [];
   private timer: ReturnType<typeof setInterval>;
   private epoch = 0;
+  private actionEpoch = -1;
+  private actionId?: string;
+  private observedOutput?: { runId: string; epoch: number; desired: Desired };
+  private actionObservation?: ActionExecution;
+  private currentActionExecution(): ActionExecution | undefined {
+    const run = this.run,
+      record = run?.lastAction;
+    if (
+      !run ||
+      !record ||
+      run.status !== "running" ||
+      this.stopping ||
+      this.actionEpoch !== this.epoch ||
+      this.actionId !== record.id ||
+      run.inferenceRecovery
+    )
+      return;
+    if (
+      run.owner !== "roleplay" &&
+      (!this.aiAction ||
+        this.aiAction.decision !== run.lastDecision ||
+        this.aiAction.expiresAt <= Date.now() ||
+        this.aiAction.stageIndex !== run.stageIndex)
+    )
+      return;
+    return this.actionObservation?.id === record.id
+      ? this.actionObservation
+      : { id: record.id, runId: run.id };
+  }
   private emitAt = 0;
   private persistedAt = 0;
   private tickAt = Date.now();
@@ -346,6 +376,7 @@ export class Controller extends EventEmitter {
   }
   snapshot(): AppSnapshot {
     return {
+      actionExecution: this.currentActionExecution(),
       roleplay: this.roleplaySummary?.(),
       device: this.device.state,
       channels: this.config,
@@ -898,7 +929,12 @@ export class Controller extends EventEmitter {
     }
     for (const id of bounds.waveformIds) this.requireWave(id);
   }
-  applyRoleplay(runId: string, version: number, patch: RoleplayPatch) {
+  applyRoleplay(
+    runId: string,
+    version: number,
+    patch: RoleplayPatch,
+    reason?: string,
+  ) {
     const run = this.run;
     assert(
       run?.id === runId &&
@@ -917,6 +953,25 @@ export class Controller extends EventEmitter {
         next[c].target <= this.device.state.limits[c],
         c + " 目标超过设备当前上限",
       );
+    run.lastAction = recordAction(
+      run,
+      {
+        id: randomUUID(),
+        kind: patch.action,
+        reason,
+        raw: patch,
+      },
+      link.output,
+      next,
+      patch.action === "keep"
+        ? []
+        : patch.action === "rest"
+          ? patch.channels
+          : channels.filter((c) => patch.channels[c] !== undefined),
+      this.device.state,
+    );
+    this.actionEpoch = this.epoch;
+    this.actionId = run.lastAction.id;
     link.output = next;
     this.persist();
     return structuredClone(next);
@@ -1830,6 +1885,40 @@ export class Controller extends EventEmitter {
         }
         if (decision.action === "rest")
           assert(bounds.allowRest, "AI 未获得休息控制权限。");
+        const before =
+          this.observedOutput?.runId === this.run.id &&
+          this.observedOutput.epoch === this.epoch
+            ? this.observedOutput.desired
+            : {};
+        const advance =
+          this.run.owner === "locked-task" &&
+          decision.phaseComplete &&
+          decision.action !== "finish";
+        const after = this.actionDesired(decision);
+        this.run.lastAction = recordAction(
+          this.run,
+          {
+            id: randomUUID(),
+            kind: advance ? "advance" : decision.action,
+            reason: decision.reason,
+            raw: decision,
+          },
+          before,
+          advance
+            ? {}
+            : {
+                A: { ...after.A, rampPerSecond: bounds.rampPerSecond.A },
+                B: { ...after.B, rampPerSecond: bounds.rampPerSecond.B },
+              },
+          advance
+            ? []
+            : decision.action === "adjust"
+              ? decision.channels
+              : bounds.channels,
+          this.device.state,
+        );
+        this.actionEpoch = this.epoch;
+        this.actionId = this.run.lastAction.id;
         this.run.lastDecision = decision;
         this.run.thinking = false;
         this.run.inferenceRecovery = undefined;
@@ -2059,6 +2148,25 @@ export class Controller extends EventEmitter {
     }
     if (this.stopping || run.status !== "running" || this.epoch !== epoch)
       return;
+    // Read-only observations for action cards; never feed them into scheduling.
+    this.observedOutput = {
+      runId: run.id,
+      epoch,
+      desired: structuredClone(desired),
+    };
+    const action = this.currentActionExecution();
+    const observation: ActionExecution | undefined = action
+      ? {
+          id: action.id,
+          runId: run.id,
+          evaluatedAt: now,
+          channels: {
+            A: { target: 0, ramping: false },
+            B: { target: 0, ramping: false },
+          },
+        }
+      : undefined;
+    this.actionObservation = observation;
     for (const channel of channels) {
       const output = desired[channel],
         maximum = this.effectiveLimit(channel);
@@ -2094,12 +2202,20 @@ export class Controller extends EventEmitter {
               ? 20
               : this.config[channel].rampPerSecond,
       );
+      this.observedOutput!.desired[channel] = { ...output };
       const difference = output.target - this.levels[channel];
       this.levels[channel] =
         output.target === 0
           ? 0
           : this.levels[channel] +
             Math.sign(difference) * Math.min(Math.abs(difference), rate * dt);
+      if (observation?.channels)
+        observation.channels[channel] = {
+          target: output.target,
+          ramping:
+            output.target > 0 &&
+            Math.abs(output.target - this.levels[channel]) > 0.0001,
+        };
       const target = Math.min(
         maximum,
         Math.floor(this.levels[channel] + 0.0001),

@@ -743,6 +743,7 @@ export class RoleplayService {
     delete completed.retryKind;
     const runLink = authorized ? current!.roleplay : undefined;
     const previousOutput = runLink?.output;
+    const previousAction = current?.lastAction;
     try {
       this.store.transaction(() => {
         const round =
@@ -753,6 +754,7 @@ export class RoleplayService {
               link!.id,
               link!.version,
               reply.control,
+              reply.controlReason,
             )
           : undefined;
         const message = this.addMessage(s, {
@@ -770,6 +772,9 @@ export class RoleplayService {
           turnId: turn.id,
           control: reply.control,
           controlReason: reply.controlReason,
+          actionRecord: authorized
+            ? structuredClone(current!.lastAction)
+            : undefined,
           replyOptions: reply.replyOptions.map((text) =>
             substitute(text, s.card.character.name, s.player.name),
           ),
@@ -799,6 +804,7 @@ export class RoleplayService {
       // A failed write rolls back the run record as well. The scheduler can
       // only observe the new parameters after this synchronous commit.
       if (runLink && previousOutput) runLink.output = previousOutput;
+      if (current) current.lastAction = previousAction;
       throw error;
     }
     turn.status = completed.status;
