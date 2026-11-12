@@ -40,6 +40,11 @@ export class Store {
       .get(collection, id) as { payload: string } | undefined;
     return row ? (JSON.parse(row.payload) as T) : undefined;
   }
+  has(collection: string, id: string) {
+    return !!this.db
+      .prepare("SELECT 1 FROM documents WHERE collection=? AND id=?")
+      .get(collection, id);
+  }
   list<T>(collection: string): T[] {
     return (
       this.db
@@ -103,6 +108,14 @@ export class Store {
         )
         .all(collection, afterSeq, beforeSeq, limit) as { payload: string }[]
     ).map((r) => JSON.parse(r.payload) as T);
+  }
+  completedStoryRounds(collection: string) {
+    const row = this.db
+      .prepare(
+        "SELECT count(*) AS count FROM documents WHERE collection=? AND json_extract(payload,'$.role')='assistant' AND json_type(payload,'$.turnId')='text'",
+      )
+      .get(collection) as { count: number };
+    return row.count;
   }
   clear(collection: string) {
     this.db.prepare("DELETE FROM documents WHERE collection=?").run(collection);

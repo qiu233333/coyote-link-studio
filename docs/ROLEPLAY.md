@@ -88,6 +88,20 @@
 
 下一轮会把结构化状态和原有六部分记忆一起纳入上下文预算。已结束目标、非持有物品和已解线索在提示词中精简，完整条目仍保存在本机。摘要不会清空状态，未发送的快捷回复不进入剧情事实。事实是否符合剧情由模型按提示词判断，后端校验字段、条目和状态转换。面板不产生设备动作，设备继续按已确认授权和回传工作。
 
+## 剧情存档与分支
+
+成功生成的助手回复下方有「保存这一刻」和「创建分支」。保存时可以修改默认名称。聊天顶部的「剧情存档」显示当前故事的书签、保存时间和片段，支持重命名、删除和创建分支。同一节点只保存一个书签。删除书签后，消息上的节点仍可创建分支，已有分支也会保留。
+
+从消息或存档创建分支时，确认来源故事、回复轮次和名称。新故事继承从开场到所选回复的全部消息，包括所选回复的三个快捷选项。可以重新选择或自由输入。来源故事的后续内容保留，分支标题区可以返回来源。刷新后会恢复当前标签页所选的故事。删除来源故事会清理其自身的存档和历史，已有分支仍可继续，并显示保存下来的来源名称和轮次。
+
+只有启用功能后成功提交的助手回复会建立节点。开场白、旧版回复、失败或取消的轮次不能用来创建节点。旧故事仍可阅读、聊天和导出，从下一次成功回复开始支持存档。打开旧故事时不会生成历史快照或触发推理。
+
+节点采用版本化 SQLite 记录，保存当时的四个记忆字段、归档边界 `throughSeq` 和结构化剧情状态，引用故事自己的不可变角色卡、玩家设定和场景。书签只引用节点。创建分支时，事务内为消息前缀分配新 ID，复制可用的节点快照并映射状态面板的来源消息。分支使用节点处冻结的记忆和状态，从自己的消息继续生成。分支不会读取来源故事当前的摘要、后续消息或任务记录。普通存档不复制聊天和头像，分支会占用与继承历史相应的本地空间。
+
+在 `/api/roleplay/sessions/:id` 下，`GET /bookmarks` 分页读取存档，`PUT/PATCH/DELETE /bookmarks/:messageId` 分别保存、重命名和删除书签。两种分支入口都调用 `POST /messages/:messageId/branch`，用同一个 `requestId` 重试会返回已创建的故事。
+
+保存、创建和切换分支不调用模型。新分支默认纯文字，原故事正在联动时仍保持控制权，界面会提供返回该故事的入口。继承消息的联动信息以「来源故事联动记录」显示。启用分支的联动仍需走独立确认流程。
+
 ## 接口与开发验证
 
 新增 `/api/roleplay`：`/cards` 管理角色；`/cards/import/extract` 接收 `application/octet-stream` 文件，`/cards/import/convert` 生成转换预览；`/card-format` 返回统一模板；`/sessions` 管理故事，创建时可附带 `link: { bounds, requestId }` 一并启动联动，失败会清理尚未启动的新故事；`/sessions/:id/messages` 幂等提交或分页读取；`/turns/:turnId` 查询生成状态；`/link/start|pause|resume|bounds|stop` 管理设备授权。写接口继续使用同源会话和 `X-Coyote-Request`，急停沿用 `/api/emergency-stop`。
@@ -101,6 +115,7 @@ pnpm build
 pnpm exec tsx scripts/verify-roleplay.ts --browser
 pnpm exec tsx scripts/verify-roleplay.ts --deepseek --browser
 pnpm exec tsx scripts/verify-roleplay.ts --deepseek --thinking --browser
+pnpm exec tsx scripts/verify-story-branches.ts
 ```
 
 验收脚本使用临时数据库、独立 eve 工作目录、本地 HTTP 模型桩和模拟设备，监听随机端口，不读取或修改主工作区生产配置。结果及截图位于 Git 忽略的 `artifacts/roleplay/`。`--serve` 可保持隔离验收环境供人工检查，结束时清理临时目录。

@@ -14,6 +14,8 @@ import {
   Square,
   X,
   PanelRight,
+  Bookmark,
+  GitBranch,
 } from "lucide-react";
 import type { AppSnapshot, Channel } from "../shared/types";
 import {
@@ -35,6 +37,7 @@ import { Badge, Field, Modal, NumberInput } from "./ui";
 import { STORY_FORMAT_MAX_RETRIES } from "../shared/executionPolicy";
 import type { StorySource } from "../shared/storyState";
 import { StoryStatePanel } from "./StoryStatePanel";
+import { StorySaves, type StorySaveView } from "./StorySaves";
 
 const base = "/api/roleplay";
 const fieldNames: Record<string, string> = {
@@ -57,12 +60,29 @@ type StoryList = {
   characterName: string;
   updatedAt: number;
 }[];
+type StoryDetails = RoleplaySession & { sourceAvailable?: boolean };
 type StoryStatus = Pick<
-  RoleplaySession,
-  "id" | "title" | "revision" | "updatedAt" | "memory" | "turnId"
+  StoryDetails,
+  | "id"
+  | "title"
+  | "revision"
+  | "updatedAt"
+  | "memory"
+  | "turnId"
+  | "sourceAvailable"
 > &
   Partial<Pick<RoleplaySession, "storyState">>;
 const panelPreference = "coyote.story-state-open";
+const storySelection = "coyote.selected-story";
+function defaultBranchName(title: string, stories: StoryList) {
+  const names = new Set(stories.map((story) => story.title));
+  let index = 1;
+  for (;;) {
+    const suffix = ` · 分支 ${index++}`;
+    const name = title.slice(0, 100 - suffix.length).trimEnd() + suffix;
+    if (!names.has(name)) return name;
+  }
+}
 function download(name: string, value: unknown, text = false) {
   const url = URL.createObjectURL(
     new Blob([text ? String(value) : JSON.stringify(value, null, 2)], {
@@ -101,7 +121,7 @@ export default function RoleplayPage({
   const [cards, setCards] = useState<CharacterCard[]>([]),
     [stories, setStories] = useState<StoryList>([]),
     [search, setSearch] = useState("");
-  const [session, setSession] = useState<RoleplaySession | null>(null),
+  const [session, setSession] = useState<StoryDetails | null>(null),
     [messages, setMessages] = useState<StoryMessage[]>([]),
     [cursor, setCursor] = useState<number>(),
     [turn, setTurn] = useState<RoleplayTurn>();
@@ -150,6 +170,8 @@ export default function RoleplayPage({
     sending = useRef(false),
     composing = useRef(false);
   const [sourceMessage, setSourceMessage] = useState<StoryMessage>();
+  const [saveView, setSaveView] = useState<StorySaveView>();
+  const [saveFeedback, setSaveFeedback] = useState("");
   const [following, setFollowing] = useState(true);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [wide, setWide] = useState(
@@ -184,10 +206,15 @@ export default function RoleplayPage({
     ]);
     setCards(c);
     setStories(s);
+    return s;
   }
   useEffect(() => {
     void loadLists()
-      .then(() => {
+      .then((stories) => {
+        if (openRequest.current) return;
+        const last = sessionStorage.getItem(storySelection);
+        if (last && stories.some((story) => story.id === last))
+          return open(last);
         if (state.roleplay?.activeSessionId)
           return open(state.roleplay.activeSessionId);
       })
@@ -196,7 +223,7 @@ export default function RoleplayPage({
   async function open(id: string) {
     const requestNumber = ++openRequest.current;
     const [s, m] = await Promise.all([
-      request<RoleplaySession>(`${base}/sessions/${id}`, undefined, "GET"),
+      request<StoryDetails>(`${base}/sessions/${id}`, undefined, "GET"),
       request<{ items: StoryMessage[]; cursor?: number }>(
         `${base}/sessions/${id}/messages`,
         undefined,
@@ -214,8 +241,12 @@ export default function RoleplayPage({
     const switching = selected.current !== id;
     selected.current = id;
     if (switching) {
+      sessionStorage.setItem(storySelection, id);
       sourceRequest.current++;
       setSourceMessage(undefined);
+      setInput("");
+      setSaveView(undefined);
+      setSaveFeedback("");
       setLibraryOpen(false);
       followLatest.current = true;
       setFollowing(true);
@@ -351,6 +382,23 @@ export default function RoleplayPage({
       viewport.current.scrollTop = viewport.current.scrollHeight;
     }
   }
+  function openNodeAction(kind: "save" | "branch", message: StoryMessage) {
+    if (!session || !message.nodeRound) return;
+    const summary = (message.narration?.trim() || message.text.trim())
+      .replace(/\s+/gu, " ")
+      .slice(0, 120);
+    setSaveView({
+      kind,
+      node: {
+        storyId: session.id,
+        storyTitle: session.title,
+        messageId: message.id,
+        round: message.nodeRound,
+        seq: message.seq,
+        summary,
+      },
+    });
+  }
   async function task(fn: () => Promise<void>) {
     setBusy(true);
     setNotice("");
@@ -430,6 +478,7 @@ export default function RoleplayPage({
       (activeRun && !run)
     )
       return;
+    const navigationAtSend = openRequest.current;
     sending.current = true;
     try {
       await task(async () => {
@@ -437,7 +486,11 @@ export default function RoleplayPage({
           `${base}/sessions/${session.id}/messages`,
           { text, requestId: crypto.randomUUID(), revision: session.revision },
         );
-        if (selected.current !== session.id) return;
+        if (
+          selected.current !== session.id ||
+          openRequest.current !== navigationAtSend
+        )
+          return;
         if (result) {
           setInput("");
           setTurn(result);
@@ -579,6 +632,14 @@ export default function RoleplayPage({
         <div role="alert" className="notice notice-pink">
           {notice}
           <button aria-label="关闭提示" onClick={() => setNotice("")}>
+            <X size={15} />
+          </button>
+        </div>
+      )}
+      {saveFeedback && (
+        <div role="status" className="notice">
+          {saveFeedback}
+          <button aria-label="关闭存档提示" onClick={() => setSaveFeedback("")}>
             <X size={15} />
           </button>
         </div>
@@ -748,7 +809,12 @@ export default function RoleplayPage({
                             { title: value },
                             "PATCH",
                           );
-                          if (r) setSession(r);
+                          if (r && selected.current === session.id)
+                            setSession((old) =>
+                              old?.id === r.id
+                                ? { ...old, title: r.title }
+                                : old,
+                            );
                           await loadLists();
                         });
                     }}
@@ -790,6 +856,7 @@ export default function RoleplayPage({
                             openRequest.current++;
                             setSession(null);
                             selected.current = null;
+                            sessionStorage.removeItem(storySelection);
                             await loadLists();
                           }
                         });
@@ -799,6 +866,31 @@ export default function RoleplayPage({
                   </button>
                 </div>
               </div>
+              {session.origin && (
+                <div className="story-branch-origin">
+                  <Badge color="pink">分支</Badge>
+                  <span>
+                    {session.origin.storyTitle} · 第 {session.origin.round}{" "}
+                    轮之后
+                  </span>
+                  {session.sourceAvailable ? (
+                    <button
+                      type="button"
+                      className="button small secondary"
+                      onClick={() =>
+                        void task(() => open(session.origin!.storyId))
+                      }
+                    >
+                      返回来源故事
+                    </button>
+                  ) : (
+                    <small>
+                      来源故事已删除
+                      {session.origin.summary && ` · ${session.origin.summary}`}
+                    </small>
+                  )}
+                </div>
+              )}
               <div className="story-view-actions">
                 <button
                   type="button"
@@ -809,6 +901,15 @@ export default function RoleplayPage({
                 >
                   <BookOpen size={15} aria-hidden="true" />
                   角色与故事
+                </button>
+                <button
+                  type="button"
+                  className="button small secondary"
+                  aria-haspopup="dialog"
+                  onClick={() => setSaveView({ kind: "list" })}
+                >
+                  <Bookmark size={15} aria-hidden="true" />
+                  剧情存档
                 </button>
                 <button
                   type="button"
@@ -904,9 +1005,33 @@ export default function RoleplayPage({
                     )}
                   </div>
                   {activeRun && !run && (
-                    <p className="notice">
-                      设备由其他模式或故事占用，请先停止该运行。
-                    </p>
+                    <div className="notice story-branch-origin">
+                      {activeRun.roleplay ? (
+                        <>
+                          <span>
+                            设备由「
+                            {stories.find(
+                              (story) =>
+                                story.id === activeRun.roleplay!.sessionId,
+                            )?.title ?? "另一则故事"}
+                            」占用。
+                          </span>
+                          <button
+                            type="button"
+                            className="button small secondary"
+                            onClick={() =>
+                              void task(() =>
+                                open(activeRun.roleplay!.sessionId),
+                              )
+                            }
+                          >
+                            返回占用设备的故事
+                          </button>
+                        </>
+                      ) : (
+                        <span>设备由其他模式占用，请先停止该运行。</span>
+                      )}
+                    </div>
                   )}
                   <details className="story-device">
                     <summary>设备详情与授权范围</summary>
@@ -1017,6 +1142,24 @@ export default function RoleplayPage({
                           <p className="story-narration">{m.narration}</p>
                         )}
                         {m.text && <p>{m.text}</p>}
+                        {m.historicalControl && (
+                          <details>
+                            <summary>来源故事联动记录</summary>
+                            <p>
+                              {m.inheritedFrom?.storyTitle} ·{" "}
+                              {m.historicalControl.label}
+                            </p>
+                            {m.historicalControl.reason && (
+                              <p>{m.historicalControl.reason}</p>
+                            )}
+                            {m.historicalControl.targets && (
+                              <small>
+                                当时目标 A {m.historicalControl.targets.A} / B{" "}
+                                {m.historicalControl.targets.B}
+                              </small>
+                            )}
+                          </details>
+                        )}
                         {m.control && (
                           <details>
                             <summary>
@@ -1039,6 +1182,46 @@ export default function RoleplayPage({
                               </small>
                             )}
                           </details>
+                        )}
+                        {m.nodeRound ? (
+                          <div
+                            className="story-message-tools"
+                            role="group"
+                            aria-label={`第 ${m.nodeRound} 轮节点操作`}
+                          >
+                            <button
+                              type="button"
+                              className="button small secondary"
+                              disabled={locked && !m.bookmarked}
+                              aria-haspopup="dialog"
+                              onClick={() =>
+                                m.bookmarked
+                                  ? setSaveView({ kind: "list" })
+                                  : openNodeAction("save", m)
+                              }
+                            >
+                              <Bookmark size={13} aria-hidden="true" />
+                              {m.bookmarked ? "已存档" : "保存这一刻"}
+                            </button>
+                            <button
+                              type="button"
+                              className="button small secondary"
+                              disabled={locked}
+                              aria-haspopup="dialog"
+                              onClick={() => openNodeAction("branch", m)}
+                            >
+                              <GitBranch size={13} aria-hidden="true" />
+                              创建分支
+                            </button>
+                          </div>
+                        ) : (
+                          m.role === "assistant" && (
+                            <small className="story-node-unavailable">
+                              {m.seq === 1
+                                ? "开场白不能作为存档节点。"
+                                : "此回复创建于存档功能启用前。"}
+                            </small>
+                          )
                         )}
                       </article>
                     ))}
@@ -1183,6 +1366,34 @@ export default function RoleplayPage({
           )}
         </section>
       </div>
+      {session && saveView && (
+        <StorySaves
+          view={saveView}
+          onView={setSaveView}
+          storyId={session.id}
+          title={session.title}
+          branchName={defaultBranchName(session.title, stories)}
+          locked={locked}
+          onBookmarkChange={(messageId, bookmarked, feedback) => {
+            if (selected.current !== session.id) return;
+            setMessages((old) =>
+              old.map((message) =>
+                message.id === messageId ? { ...message, bookmarked } : message,
+              ),
+            );
+            setSourceMessage((old) =>
+              old?.id === messageId ? { ...old, bookmarked } : old,
+            );
+            setSaveFeedback(feedback);
+          }}
+          onBranch={async (id) => {
+            if (selected.current !== session.id) return;
+            await open(id);
+            if (selected.current === id) setSaveFeedback("已创建分支");
+            void loadLists().catch((error: Error) => setNotice(error.message));
+          }}
+        />
+      )}
       {editor && (
         <Modal
           title={editor.id ? "编辑角色卡" : "创建角色卡"}
@@ -1566,9 +1777,9 @@ export default function RoleplayPage({
                     : {}),
                 });
                 if (r) {
+                  await open(r.id);
                   setNewCard(null);
                   await loadLists();
-                  await open(r.id);
                 }
               })
             }

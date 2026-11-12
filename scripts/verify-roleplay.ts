@@ -565,6 +565,9 @@ try {
         .uncheck();
       await page.getByRole("button", { name: "进入故事", exact: true }).click();
       await page
+        .getByRole("heading", { name: "浏览器向导的故事", exact: true })
+        .waitFor();
+      await page
         .getByRole("textbox", { name: "回复剧情", exact: true })
         .fill("我接过徽章，向她询问下一步");
       await page.getByRole("button", { name: "发送", exact: true }).click();

@@ -27,6 +27,7 @@ import { Controller } from "./controller.js";
 import { Store } from "./store.js";
 import { assert } from "./errors.js";
 import { extractCharacter } from "./characterImport.js";
+import { StoryBranches } from "./storyBranches.js";
 import {
   emptyStoryState,
   mergeStoryState,
@@ -73,6 +74,7 @@ const wait = (signal: AbortSignal) =>
     if (signal.aborted) cancel();
   });
 export class RoleplayService {
+  readonly branches: StoryBranches;
   private work?: Work;
   private closed = false;
   private recovery = { runId: "", attempt: 0 };
@@ -82,6 +84,7 @@ export class RoleplayService {
     private ai: StoryAi,
     private retryWait: (signal: AbortSignal) => Promise<void> = wait,
   ) {
+    this.branches = new StoryBranches(store, () => controller.assertUnlocked());
     for (const turn of store.list<RoleplayTurn>("story-turns"))
       if (turn.status === "pending") {
         turn.status = "interrupted";
@@ -217,6 +220,9 @@ export class RoleplayService {
     s.storyState ??= emptyStoryState();
     return s;
   }
+  sourceAvailable(s: RoleplaySession) {
+    return s.origin ? this.store.has("stories", s.origin.storyId) : undefined;
+  }
   create(input: unknown) {
     this.controller.assertUnlocked();
     const v = z
@@ -241,6 +247,7 @@ export class RoleplayService {
       createdAt: now,
       updatedAt: now,
       revision: 0,
+      completedRounds: 0,
       memory: emptyMemory(),
       storyState: emptyStoryState(),
     };
@@ -283,6 +290,7 @@ export class RoleplayService {
       this.store.clear(`story-messages:${id}`);
       this.store.clear(`story-archive:${id}`);
       this.store.clear(`story-requests:${id}`);
+      this.branches.clear(id);
       for (const t of this.store.list<RoleplayTurn>("story-turns"))
         if (t.sessionId === id) this.store.delete("story-turns", t.id);
     });
@@ -290,7 +298,12 @@ export class RoleplayService {
   messages(id: string, before?: number) {
     this.session(id);
     const p = this.store.page<StoryMessage>(`story-messages:${id}`, 50, before);
-    return { items: p.items.reverse(), cursor: p.cursor };
+    return {
+      items: p.items
+        .reverse()
+        .map((message) => this.branches.withBookmark(message)),
+      cursor: p.cursor,
+    };
   }
   message(id: string, messageId: string) {
     this.session(id);
@@ -299,7 +312,7 @@ export class RoleplayService {
       messageId,
     );
     assert(message, "消息不存在", "NOT_FOUND", 404);
-    return message;
+    return this.branches.withBookmark(message);
   }
   export(id: string) {
     const s = this.session(id),
@@ -319,7 +332,7 @@ export class RoleplayService {
       all
         .map(
           (m) =>
-            `${m.role === "user" ? s.player.name : s.card.character.name}：${m.narration ? m.narration + "\n" : ""}${m.text}${m.execution ? "\n[" + m.execution + "]" : ""}`,
+            `${m.role === "user" ? s.player.name : s.card.character.name}：${m.narration ? m.narration + "\n" : ""}${m.text}${m.historicalControl ? "\n[来源故事联动记录 · " + m.historicalControl.label + "]" : m.execution ? "\n[" + m.execution + "]" : ""}`,
         )
         .join("\n\n")
     );
@@ -732,6 +745,9 @@ export class RoleplayService {
     const previousOutput = runLink?.output;
     try {
       this.store.transaction(() => {
+        const round =
+          (s.completedRounds ??
+            this.store.completedStoryRounds(`story-messages:${s.id}`)) + 1;
         const output = authorized
           ? this.controller.applyRoleplay(
               link!.id,
@@ -758,11 +774,13 @@ export class RoleplayService {
             substitute(text, s.card.character.name, s.player.name),
           ),
           storyChanges: changes,
+          nodeRound: round,
           output,
           execution: roleplayExecutionLabel(reply.control, authorized),
         });
-        this.store.set("stories", s.id, {
+        const accepted: RoleplaySession = {
           ...s,
+          completedRounds: round,
           memory: { ...reply.memory, throughSeq: s.memory.throughSeq },
           updatedAt: now,
           title: this.session(s.id).title,
@@ -772,7 +790,9 @@ export class RoleplayService {
             updatedAt: message.at,
             lastUpdate: { messageId: message.id, seq: message.seq, changes },
           },
-        } satisfies RoleplaySession);
+        };
+        this.store.set("stories", s.id, accepted);
+        this.branches.record(accepted, message, round);
         this.store.set("story-turns", turn.id, completed);
       });
     } catch (error) {

@@ -8163,6 +8163,77 @@ button:disabled {
   align-items: center;
   gap: 8px;
 }
+.story-branch-origin,
+.story-message-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.story-branch-origin {
+  margin: 8px 0 12px;
+  color: #42577d;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.story-message-tools {
+  margin-top: 9px;
+}
+.story-message-tools .button {
+  min-height: 30px;
+  font-size: 12px;
+}
+.story-node-unavailable {
+  display: block;
+  margin-top: 7px;
+  color: #57698a;
+}
+.story-saves-content {
+  color: #344569;
+  overflow-wrap: anywhere;
+}
+.story-save-form,
+.story-bookmarks {
+  display: grid;
+  gap: 12px;
+}
+.story-bookmarks {
+  list-style: none;
+  padding: 0;
+}
+.story-bookmarks li,
+.story-save-node {
+  padding: 12px;
+  border: 1px solid #dce6f7;
+  border-radius: 13px;
+  background: linear-gradient(145deg, #f1f7ff, #fff6fa);
+}
+.story-bookmarks small {
+  display: block;
+  margin-top: 4px;
+}
+.story-bookmarks p,
+.story-save-node p {
+  margin: 6px 0;
+}
+.story-save-story-title {
+  font-weight: 650;
+}
+.modal:has(.story-saves-content) {
+  max-height: calc(100dvh - 160px);
+}
+@media (min-width: 721px) {
+  .modal-backdrop:has(.story-bookmarks-content) {
+    justify-content: flex-end;
+    align-items: flex-start;
+  }
+  .modal:has(.story-bookmarks-content) {
+    width: min(430px, 100%);
+  }
+}
+body:has(.story-saves-content) .emergency-bar {
+  z-index: 75;
+}
 .story-history-actions {
   justify-content: space-between;
   font-size: 13px;

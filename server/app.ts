@@ -274,25 +274,25 @@ export async function createApplication(
   route("post", "/api/roleplay/sessions", (req) =>
     roleplay.createWithLink(req.body),
   );
-  route("get", "/api/roleplay/sessions/:id", (req) =>
-    req.query.status === "1"
-      ? (() => {
-          const { id, title, revision, updatedAt, memory, turnId, storyState } =
-            roleplay.session(String(req.params.id));
-          return {
-            id,
-            title,
-            revision,
-            updatedAt,
-            memory,
-            turnId,
-            ...(req.query.stateVersion === String(storyState.version)
-              ? {}
-              : { storyState }),
-          };
-        })()
-      : roleplay.session(String(req.params.id)),
-  );
+  route("get", "/api/roleplay/sessions/:id", (req) => {
+    const story = roleplay.session(String(req.params.id));
+    const sourceAvailable = roleplay.sourceAvailable(story);
+    if (req.query.status !== "1") return { ...story, sourceAvailable };
+    const { id, title, revision, updatedAt, memory, turnId, storyState } =
+      story;
+    return {
+      id,
+      title,
+      revision,
+      updatedAt,
+      memory,
+      turnId,
+      sourceAvailable,
+      ...(req.query.stateVersion === String(storyState.version)
+        ? {}
+        : { storyState }),
+    };
+  });
   route("patch", "/api/roleplay/sessions/:id", (req) =>
     roleplay.rename(String(req.params.id), req.body.title),
   );
@@ -311,6 +311,47 @@ export async function createApplication(
   });
   route("get", "/api/roleplay/sessions/:id/messages/:messageId", (req) =>
     roleplay.message(String(req.params.id), String(req.params.messageId)),
+  );
+  route("get", "/api/roleplay/sessions/:id/bookmarks", (req) => {
+    const before =
+      req.query.before === undefined ? undefined : Number(req.query.before);
+    assert(
+      before === undefined || Number.isSafeInteger(before),
+      "分页游标无效",
+    );
+    return roleplay.branches.list(String(req.params.id), before);
+  });
+  route("put", "/api/roleplay/sessions/:id/bookmarks/:messageId", (req) =>
+    roleplay.branches.save(
+      String(req.params.id),
+      String(req.params.messageId),
+      req.body,
+    ),
+  );
+  route("patch", "/api/roleplay/sessions/:id/bookmarks/:messageId", (req) =>
+    roleplay.branches.rename(
+      String(req.params.id),
+      String(req.params.messageId),
+      req.body,
+    ),
+  );
+  route("delete", "/api/roleplay/sessions/:id/bookmarks/:messageId", (req) => {
+    roleplay.branches.remove(
+      String(req.params.id),
+      String(req.params.messageId),
+    );
+    return { deleted: true };
+  });
+  route(
+    "post",
+    "/api/roleplay/sessions/:id/messages/:messageId/branch",
+    (req) => ({
+      id: roleplay.branches.fork(
+        String(req.params.id),
+        String(req.params.messageId),
+        req.body,
+      ).id,
+    }),
   );
   route("get", "/api/roleplay/sessions/:id/export", (req) =>
     roleplay.export(String(req.params.id)),

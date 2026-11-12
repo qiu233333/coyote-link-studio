@@ -485,8 +485,324 @@ test("state and assistant reply roll back together when saving the accepted turn
         .items.filter((m) => m.role === "assistant").length,
       1,
     );
+    assert.equal(f.store.list(`story-nodes:${f.session.id}`).length, 0);
   } finally {
     write.mock.restore();
+    await f.close();
+  }
+});
+
+test("named nodes preserve exact historical context, reply choices and state through later compaction and source deletion", async () => {
+  const f = await fixture({ simulate: false });
+  const future = "密码是 7319";
+  try {
+    const sourceId = f.session.id;
+    // Existing assistant messages are readable, but cannot be promoted to snapshots.
+    const opening = f.service.messages(sourceId).items[0];
+    assert.equal(opening.nodeRound, undefined);
+    assert.throws(
+      () => f.service.branches.save(sourceId, opening.id, { name: "开场" }),
+      /没有可用/,
+    );
+    const oldReply = {
+      ...opening,
+      id: randomUUID(),
+      seq: 2,
+      turnId: randomUUID(),
+      text: "早期回复",
+    };
+    f.store.set(`story-messages:${sourceId}`, oldReply.id, oldReply);
+    const { completedRounds: _round, ...legacy } = f.session;
+    f.store.set("stories", sourceId, legacy);
+    for (let i = 0; i < 10; i++)
+      assert.equal((await f.send(`我等了片刻 ${i}`)).status, "completed");
+    f.setReply(async (op) =>
+      op === "summarize"
+        ? answer().memory
+        : {
+            ...answer(),
+            narration: "她把徽章交给你。",
+            storyStateDelta: openingFacts,
+          },
+    );
+    assert.equal((await f.send()).status, "completed");
+    const anchor = f.service.session(sourceId);
+    const tip = f.service.messages(sourceId).items.at(-1)!;
+    assert.equal(tip.nodeRound, 12);
+    assert.ok(anchor.memory.throughSeq > 0);
+    const userMessage = f.service.messages(sourceId).items.at(-2)!;
+    assert.throws(
+      () =>
+        f.service.branches.save(sourceId, userMessage.id, { name: "玩家消息" }),
+      /没有可用/,
+    );
+
+    const bookmark = f.service.branches.save(sourceId, tip.id, {
+      name: "收到徽章",
+    });
+    assert.deepEqual(
+      f.service.branches.save(sourceId, tip.id, { name: "重复保存" }),
+      bookmark,
+    );
+    assert.equal(f.service.message(sourceId, tip.id).bookmarked, true);
+    f.service.branches.rename(sourceId, tip.id, { name: "银色徽章节点" });
+    assert.equal(
+      f.service.branches.list(sourceId).items[0].name,
+      "银色徽章节点",
+    );
+    f.service.saveCard(
+      {
+        ...fileOf(f.card),
+        character: { ...f.card.character, name: "后来改名的角色" },
+      },
+      f.card.id,
+    );
+
+    f.setReply(async (op) => {
+      const memory = { ...answer().memory, longPlot: future };
+      return op === "summarize"
+        ? memory
+        : {
+            ...answer(),
+            narration: future,
+            memory,
+            storyStateDelta: {
+              scene: { location: "未来密室", situation: future },
+            },
+          };
+    });
+    for (let i = 0; i < 3; i++)
+      assert.equal((await f.send(`后续剧情 ${i}`)).status, "completed");
+    assert.match(f.service.export(sourceId), /7319/);
+    assert.ok(
+      f.service.session(sourceId).memory.throughSeq > anchor.memory.throughSeq,
+    );
+    const calls = f.calls();
+    const request = { name: "旧节点分支", requestId: randomUUID() };
+    const fork = f.service.branches.fork(sourceId, tip.id, request);
+    assert.equal(
+      f.service.branches.fork(sourceId, tip.id, request).id,
+      fork.id,
+    );
+    assert.throws(
+      () =>
+        f.service.branches.fork(sourceId, tip.id, { ...request, name: "冲突" }),
+      /内容不一致/,
+    );
+    const other = f.service.branches.fork(sourceId, tip.id, {
+      name: "另一个方向",
+      requestId: randomUUID(),
+    });
+    assert.equal(f.calls(), calls);
+    assert.equal(f.service.sessions().length, 3);
+    const inherited = f.service.messages(fork.id).items;
+    assert.deepEqual(
+      inherited.map((m) => m.seq),
+      Array.from({ length: tip.seq }, (_, i) => i + 1),
+    );
+    assert.ok(
+      inherited.every(
+        (m) =>
+          m.sessionId === fork.id &&
+          m.id !== m.inheritedFrom?.messageId &&
+          !m.turnId,
+      ),
+    );
+    const forkTip = inherited.at(-1)!;
+    assert.deepEqual(forkTip.replyOptions, tip.replyOptions);
+    assert.equal(forkTip.inheritedFrom?.messageId, tip.id);
+    assert.deepEqual(fork.memory, anchor.memory);
+    assert.equal(fork.card.character.name, f.card.character.name);
+    assert.equal(fork.storyState.lastUpdate!.messageId, forkTip.id);
+    assert.equal(
+      f.service.message(fork.id, fork.storyState.lastUpdate!.messageId).seq,
+      tip.seq,
+    );
+    assert.deepEqual(fork.storyState.items, anchor.storyState.items);
+    assert.equal(fork.turnId, undefined);
+    assert.doesNotMatch(f.service.export(fork.id), /7319|后续剧情/);
+    f.service.branches.remove(sourceId, tip.id);
+    assert.equal(f.service.branches.list(sourceId).items.length, 0);
+    assert.equal(f.service.message(sourceId, tip.id).bookmarked, false);
+    assert.equal(f.service.sourceAvailable(fork), true);
+    f.service.rename(sourceId, "源故事新名称");
+    assert.equal(f.service.sourceAvailable(fork), true);
+    assert.equal(f.service.session(fork.id).origin?.storyTitle, anchor.title);
+    f.service.remove(sourceId);
+    assert.equal(f.service.sourceAvailable(fork), false);
+    assert.equal(
+      f.service.branches.fork(sourceId, tip.id, request).id,
+      fork.id,
+    );
+    const nested = f.service.branches.fork(fork.id, forkTip.id, {
+      name: "再次分支",
+      requestId: randomUUID(),
+    });
+    assert.equal(nested.origin!.storyId, fork.id);
+
+    const reopened = new Store(f.directory);
+    try {
+      assert.deepEqual(
+        reopened.get<RoleplaySession>("stories", nested.id),
+        nested,
+      );
+      assert.equal(reopened.list(`story-nodes:${nested.id}`).length, 11);
+    } finally {
+      reopened.close();
+    }
+    const continueStory = async (
+      story: RoleplaySession,
+      text: string,
+      location: string,
+    ) => {
+      f.setReply(async (op, _p, context) => {
+        const serialized = JSON.stringify(context);
+        assert.doesNotMatch(
+          serialized,
+          /7319|后续剧情|未来密室|后来改名的角色/,
+        );
+        assert.ok(
+          !serialized.includes(tip.replyOptions![2]),
+          "unchosen option must stay out of every context",
+        );
+        if (op === "summarize") {
+          const { throughSeq: _throughSeq, ...memory } = story.memory;
+          return memory;
+        }
+        assert.ok(serialized.includes(text));
+        return {
+          ...answer(),
+          memory: { ...answer().memory, recentPlot: location },
+          storyStateDelta: { scene: { location } },
+        };
+      });
+      const turn = f.service.send(story.id, {
+        text,
+        requestId: randomUUID(),
+        revision: 0,
+      });
+      await until(() => f.service.turn(story.id, turn.id).status !== "pending");
+      const result = f.service.turn(story.id, turn.id);
+      assert.equal(result.status, "completed", result.error);
+    };
+    await continueStory(fork, tip.replyOptions![1], "花园");
+    await continueStory(other, "我自己决定路线", "钟楼");
+    assert.equal(f.service.session(fork.id).memory.recentPlot, "花园");
+    assert.equal(f.service.session(other.id).storyState.scene.location, "钟楼");
+    assert.equal(f.service.session(fork.id).storyState.scene.location, "花园");
+    assert.equal(f.service.messages(fork.id).items.at(-1)?.nodeRound, 13);
+  } finally {
+    await f.close();
+  }
+});
+
+test("forks use committed nodes during live generation and do not copy device control or cancelled turns", async () => {
+  const f = await fixture();
+  try {
+    const id = f.session.id;
+    await f.service.startLink(id, f.bounds, randomUUID());
+    f.setReply(async () =>
+      answer({ action: "update", channels: { A: { target: 6 } } }),
+    );
+    assert.equal((await f.send()).status, "completed");
+    const tip = f.service.messages(id).items.at(-1)!;
+    const runId = f.controller.run!.id;
+    let resolve!: (value: unknown) => void;
+    f.setReply(
+      () =>
+        new Promise((done) => {
+          resolve = done;
+        }),
+    );
+    const pending = f.service.send(id, {
+      text: "尚未回答的消息",
+      requestId: randomUUID(),
+    });
+    await until(() => !!resolve);
+    const output = structuredClone(f.controller.run!.roleplay!.output);
+    const count = f.calls();
+    f.service.branches.save(id, tip.id, { name: "运行中书签" });
+    const branch = f.service.branches.fork(id, tip.id, {
+      name: "纯文字分支",
+      requestId: randomUUID(),
+    });
+    assert.equal(f.calls(), count);
+    assert.equal(f.controller.run!.id, runId);
+    assert.equal(f.controller.run!.roleplay!.sessionId, id);
+    assert.deepEqual(f.controller.run!.roleplay!.output, output);
+    assert.throws(
+      () =>
+        f.service.send(branch.id, {
+          text: "暂时不可发送",
+          requestId: randomUUID(),
+        }),
+      /AI 请求正在处理/,
+    );
+    const copied = f.service.messages(branch.id).items.at(-1)!;
+    assert.equal(copied.seq, tip.seq);
+    assert.equal(copied.control, undefined);
+    assert.equal(copied.output, undefined);
+    assert.equal(copied.turnId, undefined);
+    assert.equal(copied.historicalControl?.targets?.A, 6);
+    f.service.cancel();
+    resolve(answer({ action: "update", channels: { A: { target: 18 } } }));
+    await until(() => !f.controller.roleplayBusy);
+    assert.equal(f.service.turn(id, pending.id).status, "cancelled");
+    assert.equal(f.store.list(`story-nodes:${id}`).length, 1);
+    assert.equal(f.controller.run!.roleplay!.output.A.target, 6);
+    assert.throws(
+      () =>
+        f.service.send(branch.id, {
+          text: "暂时不可发送",
+          requestId: randomUUID(),
+        }),
+      /其他故事正在联动/,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("failed branch transactions roll back story, prefix, snapshots and idempotency records", async (t) => {
+  const f = await fixture({ simulate: false });
+  try {
+    assert.equal((await f.send()).status, "completed");
+    const tip = f.service.messages(f.session.id).items.at(-1)!;
+    const request = { name: "回滚验证", requestId: randomUUID() };
+    const original = f.store.set.bind(f.store);
+    let rolledBackId = "";
+    const write = t.mock.method(
+      f.store,
+      "set",
+      (collection: string, key: string, value: unknown) => {
+        if (collection === "story-branch-requests") {
+          rolledBackId = (value as { resultId: string }).resultId;
+          throw new Error("fixture branch write failure");
+        }
+        original(collection, key, value);
+      },
+    );
+    try {
+      assert.throws(
+        () => f.service.branches.fork(f.session.id, tip.id, request),
+        /fixture branch write failure/,
+      );
+    } finally {
+      write.mock.restore();
+    }
+    assert.ok(rolledBackId);
+    assert.equal(f.service.sessions().length, 1);
+    assert.equal(f.store.list(`story-messages:${rolledBackId}`).length, 0);
+    assert.equal(f.store.list(`story-nodes:${rolledBackId}`).length, 0);
+    assert.equal(
+      f.store.has("story-branch-requests", request.requestId),
+      false,
+    );
+    assert.notEqual(
+      f.service.branches.fork(f.session.id, tip.id, request).id,
+      rolledBackId,
+    );
+  } finally {
     await f.close();
   }
 });
@@ -1101,7 +1417,7 @@ test("paused story can chat but cannot produce output, revision conflicts cannot
   }
 });
 
-test("restart marks pending turns interrupted and never schedules old roleplay output", async () => {
+test("restart preserves bookmarks and branches, marks pending turns interrupted and never replays old output", async () => {
   const f = await fixture();
   try {
     await f.service.startLink(f.session.id, f.bounds, randomUUID());
@@ -1111,6 +1427,14 @@ test("restart marks pending turns interrupted and never schedules old roleplay o
     }));
     await f.send();
     const confirmed = f.service.session(f.session.id).storyState;
+    const tip = f.service.messages(f.session.id).items.at(-1)!;
+    const bookmark = f.service.branches.save(f.session.id, tip.id, {
+      name: "重启后的书签",
+    });
+    const branch = f.service.branches.fork(f.session.id, tip.id, {
+      name: "重启后的分支",
+      requestId: randomUUID(),
+    });
     const saved = structuredClone(f.controller.run!);
     await f.service.close();
     await f.controller.close();
@@ -1124,6 +1448,7 @@ test("restart marks pending turns interrupted and never schedules old roleplay o
       attempt: 0,
       createdAt: Date.now(),
     });
+    let calls = 0;
     const ai: AiBridge & StoryAi = {
       status: { ready: true },
       decide: async () => {
@@ -1133,12 +1458,14 @@ test("restart marks pending turns interrupted and never schedules old roleplay o
         throw Error("must not infer");
       },
       story: async () => {
-        throw Error("must not infer");
+        calls++;
+        return answer();
       },
     };
+    const reopened = new Store(f.directory);
     const driver = new CoyoteDevice(),
-      restarted = new Controller(f.store, driver, ai),
-      story = new RoleplayService(f.store, restarted, ai);
+      restarted = new Controller(reopened, driver, ai),
+      story = new RoleplayService(reopened, restarted, ai);
     try {
       assert.equal(restarted.run!.status, "interrupted");
       assert.equal(
@@ -1149,9 +1476,24 @@ test("restart marks pending turns interrupted and never schedules old roleplay o
       assert.equal(driver.state.intensities.A, 0);
       assert.ok(story.export(f.session.id).includes("我接过徽章"));
       assert.deepEqual(story.session(f.session.id).storyState, confirmed);
+      assert.deepEqual(story.branches.list(f.session.id).items, [bookmark]);
+      assert.deepEqual(story.session(branch.id), branch);
+      assert.equal(calls, 0);
+      const continued = story.send(branch.id, {
+        text: "分支继续",
+        requestId: randomUUID(),
+        revision: 0,
+      });
+      await until(
+        () => story.turn(branch.id, continued.id).status === "completed",
+      );
+      assert.equal(calls, 1);
+      assert.equal(story.messages(branch.id).items.at(-1)?.nodeRound, 2);
+      assert.equal(driver.state.intensities.A, 0);
     } finally {
       await story.close();
       await restarted.close();
+      reopened.close();
     }
   } finally {
     await f.close();

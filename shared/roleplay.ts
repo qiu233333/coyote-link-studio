@@ -149,6 +149,19 @@ export const replySchema = z
     "剧情回复不能为空",
   );
 export type RoleplayReply = z.infer<typeof replySchema>;
+export interface StoryNodeReference {
+  storyId: string;
+  storyTitle: string;
+  messageId: string;
+  seq: number;
+  round: number;
+  summary: string;
+}
+export interface StoryBookmark {
+  node: StoryNodeReference;
+  name: string;
+  savedAt: number;
+}
 export interface RoleplaySession {
   id: string;
   title: string;
@@ -160,6 +173,8 @@ export interface RoleplaySession {
   revision: number;
   memory: StoryMemory;
   storyState: StoryState;
+  origin?: StoryNodeReference;
+  completedRounds?: number;
   turnId?: string;
 }
 export interface StoryMessage {
@@ -172,6 +187,15 @@ export interface StoryMessage {
   narration?: string;
   replyOptions?: string[];
   storyChanges?: StoryChange[];
+  nodeRound?: number;
+  /** Read projection of the current bookmark, never part of the immutable message. */
+  bookmarked?: boolean;
+  inheritedFrom?: { storyId: string; storyTitle: string; messageId: string };
+  historicalControl?: {
+    label: string;
+    reason?: string;
+    targets?: ChannelValues;
+  };
   turnId?: string;
   control?: RoleplayPatch;
   output?: RoleplayOutputState;
