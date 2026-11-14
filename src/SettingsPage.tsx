@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import {
   Check,
   ChevronRight,
@@ -16,13 +16,15 @@ import {
   X,
 } from "lucide-react";
 import type { AppSnapshot } from "../shared/types";
+import { DraftBar, useDraft } from "./drafts";
+import { settingsDraft } from "./draftSchemas";
 import {
   aiProvider,
   credentialTarget,
   DEEPSEEK_PRESET,
   type AiProvider,
 } from "../shared/aiProvider";
-import { isActive, type Action } from "./api";
+import type { Action } from "./api";
 import { Badge, Card, Field, LoadingButton, NumberInput } from "./ui";
 import {
   AI_TIMEOUT_MIN_SEC,
@@ -30,16 +32,49 @@ import {
   aiTimeoutSeconds,
 } from "../shared/aiTimeouts";
 
-export default function SettingsPage({
-  state,
+const SettingsPage = memo(function SettingsPage({
+  settings,
+  aiRuntime,
+  active,
+  stopping,
+  locked,
   action,
   pending,
 }: {
-  state: AppSnapshot;
+  settings: AppSnapshot["settings"];
+  aiRuntime: AppSnapshot["aiRuntime"];
+  active: boolean;
+  stopping: boolean;
+  locked: boolean;
   action: Action;
   pending: boolean;
 }) {
-  const [form, setForm] = useState({ ...state.settings, apiKey: "" });
+  const draft = useDraft("settings", settingsDraft);
+  const savedFields = useMemo(() => {
+    const { apiKeySet: _apiKeySet, revision: _revision, ...fields } = settings;
+    return fields;
+  }, [settings]);
+  const [credential, setCredential] = useState<{
+    apiKey: string;
+    fields: typeof savedFields;
+    base: string;
+  }>();
+  const remoteBase = settings.revision ?? "";
+  const fields = draft.value?.fields ?? credential?.fields ?? savedFields;
+  const base = draft.value?.base ?? credential?.base ?? remoteBase;
+  const conflict = base !== remoteBase;
+  const form = useMemo(
+    () => ({ ...fields, apiKey: credential?.apiKey ?? "" }),
+    [fields, credential],
+  );
+  const setForm = ({ apiKey, ...fields }: typeof form) => {
+    if (
+      JSON.stringify(fields) !==
+      JSON.stringify(draft.value?.fields ?? savedFields)
+    )
+      draft.cell.write({ fields, base });
+    setCredential(apiKey ? { apiKey, fields, base } : undefined);
+  };
   const [showKey, setShowKey] = useState(false);
   const [result, setResult] = useState<{
     chat: boolean;
@@ -47,25 +82,11 @@ export default function SettingsPage({
     message: string;
   } | null>(null);
   const [testing, setTesting] = useState(false);
-  const active = isActive(state);
-  const disabled = active || state.stopping || pending || testing;
+  const disabled = active || stopping || pending || testing;
+  const canSave = !conflict && draft.status !== "conflict";
   const provider = aiProvider(form);
-  const targetChanged =
-    credentialTarget(form) !== credentialTarget(state.settings);
-  const savedKeyUsable = state.settings.apiKeySet && !targetChanged;
-  useEffect(
-    () => setForm({ ...state.settings, apiKey: "" }),
-    [
-      state.settings.provider,
-      state.settings.deepseekThinking,
-      state.settings.baseUrl,
-      state.settings.model,
-      state.settings.contextWindow,
-      state.settings.timeoutSec,
-      state.settings.draftTimeoutSec,
-      state.settings.apiKeySet,
-    ],
-  );
+  const targetChanged = credentialTarget(form) !== credentialTarget(settings);
+  const savedKeyUsable = settings.apiKeySet && !targetChanged;
   useEffect(() => setResult(null), [form]);
   const chooseProvider = (selected: AiProvider) => {
     setShowKey(false);
@@ -75,17 +96,11 @@ export default function SettingsPage({
         ? DEEPSEEK_PRESET
         : {
             provider: selected,
-            baseUrl:
-              aiProvider(state.settings) === selected
-                ? state.settings.baseUrl
-                : "",
-            model:
-              aiProvider(state.settings) === selected
-                ? state.settings.model
-                : "",
+            baseUrl: aiProvider(settings) === selected ? settings.baseUrl : "",
+            model: aiProvider(settings) === selected ? settings.model : "",
             contextWindow:
-              aiProvider(state.settings) === selected
-                ? state.settings.contextWindow
+              aiProvider(settings) === selected
+                ? settings.contextWindow
                 : 32000,
             deepseekThinking: "disabled" as const,
           }),
@@ -93,6 +108,7 @@ export default function SettingsPage({
     });
   };
   const save = async () => {
+    if (!canSave) return;
     const result = await action(
       "/api/settings",
       {
@@ -103,12 +119,16 @@ export default function SettingsPage({
         contextWindow: form.contextWindow,
         timeoutSec: form.timeoutSec,
         draftTimeoutSec: aiTimeoutSeconds(form, "draft"),
+        expectedRevision: base,
         ...(form.apiKey.trim() ? { apiKey: form.apiKey.trim() } : {}),
       },
       "PUT",
       "AI 配置已保存",
     );
-    if (result !== undefined) setForm((f) => ({ ...f, apiKey: "" }));
+    if (result !== undefined) {
+      if (draft.cell.write(undefined, draft.revision)) draft.cell.flush();
+      setCredential(undefined);
+    }
     return result;
   };
   const test = async () => {
@@ -145,7 +165,7 @@ export default function SettingsPage({
         <div className="notice notice-pink">
           <ShieldCheck size={18} />
           <span>
-            {state.locked
+            {locked
               ? "任务锁定中，设置暂不可修改。"
               : "请先结束当前控制会话，再修改 AI 配置。"}
           </span>
@@ -163,19 +183,59 @@ export default function SettingsPage({
             </span>
             <div>
               <strong>
-                {state.aiRuntime.ready ? "AI 运行时已就绪" : "连接你的 AI 模型"}
+                {aiRuntime.ready ? "AI 运行时已就绪" : "连接你的 AI 模型"}
               </strong>
               <p>
-                {state.aiRuntime.ready
+                {aiRuntime.ready
                   ? "控制范围由后端校验，模型仅能调用授权业务工具。"
-                  : state.aiRuntime.error ||
+                  : aiRuntime.error ||
                     "支持提供聊天与工具调用的 OpenAI 兼容接口。"}
               </p>
             </div>
-            <Badge color={state.aiRuntime.ready ? "blue" : "gray"} dot>
-              {state.aiRuntime.ready ? "可用" : "待配置"}
+            <Badge color={aiRuntime.ready ? "blue" : "gray"} dot>
+              {aiRuntime.ready ? "可用" : "待配置"}
             </Badge>
           </div>
+          <DraftBar
+            draft={draft}
+            label="丢弃设置草稿"
+            disabled={disabled}
+            onDiscard={() => setCredential(undefined)}
+            onReload={() => setCredential(undefined)}
+          />
+          {conflict && (
+            <div className="notice notice-pink" role="status">
+              后台设置已更新（{settings.model || "未配置模型"}
+              ）。当前输入已保留。
+              <button
+                type="button"
+                className="text-button"
+                onClick={() => {
+                  draft.cell.discard();
+                  setCredential(undefined);
+                }}
+              >
+                载入后台设置
+              </button>
+              <button
+                type="button"
+                className="text-button"
+                disabled={disabled}
+                onClick={() => {
+                  if (
+                    !confirm(
+                      "继续编辑本地设置？下次正式保存会覆盖当前后台设置。",
+                    )
+                  )
+                    return;
+                  draft.cell.write({ fields, base: remoteBase });
+                  setCredential(undefined);
+                }}
+              >
+                保留本地设置修改
+              </button>
+            </div>
+          )}
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -241,7 +301,7 @@ export default function SettingsPage({
               <Field
                 label="API Key"
                 hint={
-                  targetChanged && state.settings.apiKeySet
+                  targetChanged && settings.apiKeySet
                     ? "地址或服务已变化：请重新输入此服务的密钥。原配置在成功保存前保持有效。"
                     : savedKeyUsable
                       ? "已加密保存。留空保留现有密钥，填写新值可替换。"
@@ -356,11 +416,11 @@ export default function SettingsPage({
                 </Field>
               </div>
             </fieldset>
-            {state.settings.apiKeySet && (
+            {settings.apiKeySet && (
               <button
                 type="button"
                 className="text-button"
-                disabled={disabled}
+                disabled={disabled || !canSave}
                 onClick={async () => {
                   if (
                     confirm(
@@ -378,12 +438,16 @@ export default function SettingsPage({
                         timeoutSec: form.timeoutSec,
                         draftTimeoutSec: aiTimeoutSeconds(form, "draft"),
                         apiKey: "",
+                        expectedRevision: base,
                       },
                       "PUT",
                       "已清除保存的密钥",
                     );
-                    if (cleared !== undefined)
-                      setForm((f) => ({ ...f, apiKey: "" }));
+                    if (cleared !== undefined) {
+                      if (draft.cell.write(undefined, draft.revision))
+                        draft.cell.flush();
+                      setCredential(undefined);
+                    }
                   }
                 }}
               >
@@ -395,7 +459,10 @@ export default function SettingsPage({
                 type="submit"
                 className="button primary"
                 disabled={
-                  disabled || !form.baseUrl.trim() || !form.model.trim()
+                  disabled ||
+                  !canSave ||
+                  !form.baseUrl.trim() ||
+                  !form.model.trim()
                 }
               >
                 <Save size={16} />
@@ -406,7 +473,10 @@ export default function SettingsPage({
                 className="button secondary"
                 busy={testing}
                 disabled={
-                  disabled || !form.baseUrl.trim() || !form.model.trim()
+                  disabled ||
+                  !canSave ||
+                  !form.baseUrl.trim() ||
+                  !form.model.trim()
                 }
                 onClick={() => void test()}
               >
@@ -491,4 +561,6 @@ export default function SettingsPage({
       </div>
     </div>
   );
-}
+});
+
+export default SettingsPage;

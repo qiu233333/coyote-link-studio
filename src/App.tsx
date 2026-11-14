@@ -27,6 +27,7 @@ import { AiControlPage, LockedTaskPage } from "./AiPages";
 import SettingsPage from "./SettingsPage";
 import { duration, isActive, ownerNames, timeLeft, useAppState } from "./api";
 import { Avatar, Badge, IconButton, Modal } from "./ui";
+import { DraftProvider, useEditorPreference } from "./drafts";
 import { version as appVersion } from "../package.json";
 
 const RoleplayPage = lazy(() => import("./RoleplayPage"));
@@ -46,6 +47,20 @@ const pages = [
 ] as const;
 
 export default function App() {
+  const transport = useAppState();
+  const scope = transport.state?.draftScope ?? "loading";
+  return (
+    <DraftProvider scope={scope} key={scope}>
+      <Workspace transport={transport} />
+    </DraftProvider>
+  );
+}
+
+function Workspace({
+  transport,
+}: {
+  transport: ReturnType<typeof useAppState>;
+}) {
   const {
     state,
     connection,
@@ -55,17 +70,16 @@ export default function App() {
     action,
     refresh,
     dismissToast,
-  } = useAppState();
-  const [page, setPage] = useState<Page>("console");
+  } = transport;
+  const [page, setPage] = useEditorPreference<Page>(
+    "workspace",
+    (value) => pages.find((item) => item.id === value)?.id,
+    "console",
+  );
   const [mobileNav, setMobileNav] = useState(false);
   const [help, setHelp] = useState(false);
   const [systemInfo, setSystemInfo] = useState(false);
-  const [, tick] = useState(0);
   const [emergencyPending, setEmergencyPending] = useState(false);
-  useEffect(() => {
-    const timer = setInterval(() => tick((n) => n + 1), 1000);
-    return () => clearInterval(timer);
-  }, []);
   const navigate = (to: Page) => {
     setPage(to);
     setMobileNav(false);
@@ -282,7 +296,11 @@ export default function App() {
               )}
               {page === "settings" && (
                 <SettingsPage
-                  state={state}
+                  settings={state.settings}
+                  aiRuntime={state.aiRuntime}
+                  active={active}
+                  stopping={state.stopping}
+                  locked={state.locked}
                   action={action}
                   pending={pending > 0}
                 />
@@ -332,11 +350,15 @@ export default function App() {
                   : "当前待机"}
             </strong>
             <span>
-              {active && state?.run
-                ? state.run.deadlineAt === null
-                  ? "无限时联动 · 持续保持输出"
-                  : `剩余 ${duration(timeLeft(state.run.deadlineAt))}`
-                : "设备输出以实际回传为准"}
+              {active && state?.run ? (
+                state.run.deadlineAt === null ? (
+                  "无限时联动 · 持续保持输出"
+                ) : (
+                  <Countdown deadline={state.run.deadlineAt} />
+                )
+              ) : (
+                "设备输出以实际回传为准"
+              )}
             </span>
           </div>
           {state?.locked && <LockKeyhole size={15} />}
@@ -472,4 +494,13 @@ export default function App() {
       )}
     </div>
   );
+}
+
+function Countdown({ deadline }: { deadline: number }) {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  return <>剩余 {duration(timeLeft(deadline))}</>;
 }

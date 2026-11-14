@@ -16,6 +16,7 @@ type Props = {
   onView: (view?: StorySaveView) => void;
   storyId: string;
   title: string;
+  bookmarkVersion: number;
   branchName: string;
   locked: boolean;
   onBookmarkChange: (
@@ -40,35 +41,64 @@ export function StorySaves(props: Props) {
   );
 }
 
-function BookmarkList({ storyId, title, locked, onView }: Props) {
+function BookmarkList({
+  storyId,
+  title,
+  locked,
+  onView,
+  bookmarkVersion,
+}: Props) {
   const [page, setPage] = useState<BookmarkPage>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const count = useRef(30);
+  const generation = useRef(0);
   const path = `/api/roleplay/sessions/${storyId}/bookmarks`;
   useEffect(() => {
     const controller = new AbortController();
-    void request<BookmarkPage>(path, undefined, "GET", controller.signal)
-      .then(setPage)
-      .catch((error: Error) => {
-        if (!controller.signal.aborted) setError(error.message);
-      });
+    ++generation.current;
+    setLoading(false);
+    const load = async () => {
+      const items: StoryBookmark[] = [];
+      let cursor: number | undefined;
+      do {
+        const next: BookmarkPage = await request(
+          cursor === undefined ? path : `${path}?before=${cursor}`,
+          undefined,
+          "GET",
+          controller.signal,
+        );
+        items.push(...next.items);
+        cursor = next.cursor;
+      } while (cursor !== undefined && items.length < count.current);
+      if (!controller.signal.aborted) {
+        setPage({ items, cursor });
+        setError("");
+      }
+    };
+    void load().catch((error: Error) => {
+      if (!controller.signal.aborted) setError(error.message);
+    });
     return () => controller.abort();
-  }, [path]);
+  }, [path, bookmarkVersion]);
   async function loadMore() {
     if (loading || page?.cursor === undefined) return;
     setLoading(true);
     setError("");
+    const current = generation.current;
     try {
       const next = await request<BookmarkPage>(
         `${path}?before=${page.cursor}`,
         undefined,
         "GET",
       );
+      if (current !== generation.current) return;
+      count.current = page.items.length + next.items.length;
       setPage({ items: [...page.items, ...next.items], cursor: next.cursor });
     } catch (error) {
-      setError((error as Error).message);
+      if (current === generation.current) setError((error as Error).message);
     } finally {
-      setLoading(false);
+      if (current === generation.current) setLoading(false);
     }
   }
   return (

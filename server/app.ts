@@ -19,6 +19,8 @@ import { Store } from "./store.js";
 import { AppError, assert } from "./errors.js";
 import type { Protocol } from "../shared/types.js";
 import { MAX_WAVEFORM_IMPORT_BODY_BYTES } from "../shared/waveformImport.js";
+import { STATE_HEARTBEAT_MS, type SyncCursor } from "../shared/stateSync.js";
+import { StatePublisher } from "./stateSync.js";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const secureEqual = (a: string, b: string) => {
@@ -43,7 +45,9 @@ export async function createApplication(
   const device = new CoyoteDevice(),
     ai = new AiService({ runtimeDirectory: options.aiDirectory });
   const controller = new Controller(store, device, ai, getBuiltinWaveforms());
+  const publisher = new StatePublisher(controller);
   const roleplay = new RoleplayService(store, controller, ai);
+  const storyStreams = new Set<Response>();
   const csrf = randomBytes(32).toString("hex");
   let localPort = 0;
   const allowedHosts = () =>
@@ -109,12 +113,19 @@ export async function createApplication(
   app.get("/api/health", (_req, res) =>
     res.json({ ok: true, data: { service: "coyote-link", ai: ai.status } }),
   );
-  app.get("/api/state", (_req, res) => {
+  app.get("/api/state", (req, res) => {
     res.setHeader(
       "Set-Cookie",
       `coyote_session=${csrf}; Path=/; HttpOnly; SameSite=Strict`,
     );
-    res.json({ ok: true, data: controller.snapshot() });
+    const params = new URL(req.originalUrl, "http://localhost").searchParams;
+    res.json({
+      ok: true,
+      data:
+        params.get("sync") === "1"
+          ? publisher.update(publisher.cursor(params), true)
+          : controller.snapshot(),
+    });
   });
   type Action = (req: Request) => unknown | Promise<unknown>;
   const route = (
@@ -130,7 +141,7 @@ export async function createApplication(
           if (method !== "get") controller.broadcast(true);
           res.json({
             ok: true,
-            data: result === undefined ? controller.snapshot() : result,
+            data: result === undefined ? controller.liveState() : result,
           });
         } catch (error) {
           next(error);
@@ -181,15 +192,19 @@ export async function createApplication(
   route("post", "/api/console/stop", () => controller.stop("manual"));
   route("post", "/api/console/next", () => controller.next());
   route("post", "/api/console/takeover", () => controller.takeover());
-  route("post", "/api/waveforms/import", (req) =>
-    controller.importWaveform(
+  route("get", "/api/waveforms/:id", (req) =>
+    controller.requireWave(String(req.params.id)),
+  );
+  route("post", "/api/waveforms/import", (req) => {
+    const wave = controller.importWaveform(
       req.body.content,
       req.body.name === undefined
         ? undefined
         : text(req.body.name, "波形名称", 100),
       req.body.format,
-    ),
-  );
+    );
+    return controller.resource("waveforms").find(({ id }) => id === wave.id)!;
+  });
   route("patch", "/api/waveforms/:id", (req) =>
     controller.updateWaveform(String(req.params.id), req.body),
   );
@@ -217,7 +232,7 @@ export async function createApplication(
   );
   route("post", "/api/ai-control/stop", () => controller.stop("ai-control"));
   route("patch", "/api/ai-control/bounds", (req) =>
-    controller.changeBounds(req.body.bounds),
+    controller.changeBounds(req.body.bounds, req.body.expectedRange),
   );
   route("post", "/api/ai-control/feedback", (req) =>
     controller.feedback(text(req.body.text, "反馈", 4000), "ai-control"),
@@ -226,12 +241,20 @@ export async function createApplication(
     controller.draftTask(text(req.body.prompt, "任务描述")),
   );
   route("patch", "/api/locked-tasks/:id", (req) =>
-    controller.updatePlan(String(req.params.id), req.body.plan),
+    controller.updatePlan(
+      String(req.params.id),
+      req.body.plan,
+      req.body.expectedVersion,
+    ),
+  );
+  route("delete", "/api/locked-tasks/:id", (req) =>
+    controller.deletePlan(String(req.params.id), req.body?.expectedVersion),
   );
   route("post", "/api/locked-tasks/:id/start", (req) =>
     controller.startTask(
       String(req.params.id),
       text(req.body.requestId, "请求标识", 200),
+      req.body.expectedVersion,
     ),
   );
   route("post", "/api/locked-tasks/feedback", (req) =>
@@ -242,6 +265,7 @@ export async function createApplication(
     controller.assertIdle();
     store.saveSettings(req.body);
     controller.log("info", "设置", "AI 接口配置已保存，密钥已加密");
+    return store.settings();
   });
   route("post", "/api/settings/test", async () => {
     controller.assertIdle();
@@ -274,6 +298,53 @@ export async function createApplication(
   route("post", "/api/roleplay/sessions", (req) =>
     roleplay.createWithLink(req.body),
   );
+  route("get", "/api/roleplay/sessions/:id/sync", (req) => {
+    const id = String(req.params.id);
+    if (req.query.initial === "1") return roleplay.bootstrap(id);
+    const number = (key: string) => {
+      const value = req.query[key];
+      if (typeof value !== "string" || !/^\d+$/.test(value)) return undefined;
+      const parsed = Number(value);
+      return Number.isSafeInteger(parsed) ? parsed : undefined;
+    };
+    return roleplay.sync(id, {
+      instance:
+        typeof req.query.instance === "string" ? req.query.instance : undefined,
+      version: number("version"),
+      after: number("after") ?? 0,
+      stateVersion: number("state"),
+      memoryVersion: number("memory"),
+      bookmarkVersion: number("bookmarks"),
+    });
+  });
+  app.get("/api/roleplay/sessions/:id/events", (req, res) => {
+    assert(
+      validCookie(req.headers.cookie),
+      "会话验证失败，请刷新页面。",
+      "SESSION_REQUIRED",
+      403,
+    );
+    assert(
+      storyStreams.size < 4,
+      "故事订阅过多，正在使用轮询。",
+      "STORY_STREAM_BUSY",
+      503,
+    );
+    const id = String(req.params.id);
+    assert(store.has("stories", id), "故事不存在", "NOT_FOUND", 404);
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+    storyStreams.add(res);
+    const detach = roleplay.feed.subscribe(id, (signal) => {
+      if (res.writableLength > 256 * 1024) res.destroy();
+      else res.write(`data: ${JSON.stringify(signal)}\n\n`);
+    });
+    res.on("close", () => {
+      detach();
+      storyStreams.delete(res);
+    });
+  });
   route("get", "/api/roleplay/sessions/:id", (req) => {
     const story = roleplay.session(String(req.params.id));
     const sourceAvailable = roleplay.sourceAvailable(story);
@@ -465,9 +536,53 @@ export async function createApplication(
           .send("前端尚未构建，请运行 pnpm build 或使用 pnpm dev。");
     });
   }
+  const cursors = new Map<WebSocket, SyncCursor>();
+  let lastBroadcast = "";
+  const sendState = (
+    socket: WebSocket,
+    base: ReturnType<StatePublisher["capture"]>,
+    cursor?: SyncCursor,
+  ) => {
+    const data = publisher.update(cursor, false, base);
+    socket.send(JSON.stringify({ type: "state", data }));
+    cursors.set(socket, {
+      instance: data.instance,
+      ...controller.stateOffsets(),
+      resources: {},
+    });
+  };
+  const broadcast = () => {
+    if (!sockets.clients.size) return;
+    const base = publisher.capture();
+    const signature = JSON.stringify([
+      base.live,
+      base.versions,
+      controller.stateOffsets(),
+    ]);
+    if (signature === lastBroadcast) return;
+    lastBroadcast = signature;
+    for (const socket of sockets.clients) {
+      if (socket.readyState !== WebSocket.OPEN) continue;
+      if (socket.bufferedAmount > 4 * 1024 * 1024)
+        socket.close(1013, "请重新连接");
+      else sendState(socket, base, cursors.get(socket));
+    }
+  };
+  const heartbeat = setInterval(() => {
+    for (const response of storyStreams)
+      if (response.writableLength > 256 * 1024) response.destroy();
+      else response.write('data: {"heartbeat":true}\n\n');
+    for (const socket of sockets.clients)
+      if (socket.readyState === WebSocket.OPEN) {
+        if (socket.bufferedAmount > 4 * 1024 * 1024)
+          socket.close(1013, "请重新连接");
+        else socket.send('{"type":"heartbeat"}');
+      }
+  }, STATE_HEARTBEAT_MS);
+  heartbeat.unref();
   server.on("upgrade", (request, socket, head) => {
-    if (new URL(request.url ?? "/", "http://localhost").pathname !== "/ws")
-      return;
+    const url = new URL(request.url ?? "/", "http://localhost");
+    if (url.pathname !== "/ws") return;
     if (
       !allowedHosts().has(request.headers.host ?? "") ||
       !validOrigin(request.headers.origin) ||
@@ -479,21 +594,21 @@ export async function createApplication(
       return;
     }
     sockets.handleUpgrade(request, socket, head, (websocket) => {
-      websocket.send(
-        JSON.stringify({ type: "state", data: controller.snapshot() }),
+      if (sockets.clients.size === 1) {
+        lastBroadcast = "";
+        controller.on("state", broadcast);
+      }
+      sendState(
+        websocket,
+        publisher.capture(),
+        publisher.cursor(url.searchParams),
       );
+      websocket.on("close", () => {
+        cursors.delete(websocket);
+        if (!sockets.clients.size) controller.off("state", broadcast);
+      });
       websocket.on("error", () => websocket.close());
     });
-  });
-  controller.on("state", (snapshot) => {
-    if (!sockets.clients.size) return;
-    const body = JSON.stringify({ type: "state", data: snapshot });
-    for (const socket of sockets.clients)
-      if (socket.readyState === WebSocket.OPEN) {
-        if (socket.bufferedAmount > 4 * 1024 * 1024)
-          socket.close(1013, "请重新连接");
-        else socket.send(body);
-      }
   });
   ai.on("status", () => controller.broadcast(true));
   return {
@@ -526,6 +641,8 @@ export async function createApplication(
       return `http://127.0.0.1:${localPort}`;
     },
     async close() {
+      clearInterval(heartbeat);
+      for (const stream of storyStreams) stream.end();
       await roleplay.close();
       await controller.close();
       await ai.stop();

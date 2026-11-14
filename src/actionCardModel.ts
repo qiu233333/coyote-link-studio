@@ -1,5 +1,5 @@
 import type { ActionChannel, ActionRecord } from "../shared/actionRecord";
-import type { AppSnapshot, Channel, ControlSession } from "../shared/types";
+import type { AppSnapshot, Channel, RunView } from "../shared/types";
 import type { StoryMessage } from "../shared/roleplay";
 import { DEVICE_STATE_STALE_MS } from "../shared/executionPolicy";
 
@@ -27,7 +27,7 @@ export function storyAction(message: StoryMessage): ActionRecord | undefined {
     raw: patch,
   };
 }
-export function sessionAction(run: ControlSession): ActionRecord | undefined {
+export function sessionAction(run: RunView): ActionRecord | undefined {
   if (run.lastAction) return run.lastAction;
   const d = run.lastDecision;
   if (!d) return;

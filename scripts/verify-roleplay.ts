@@ -736,24 +736,18 @@ try {
         .fill("先保持这样，我想继续聊天。");
       await page.getByRole("button", { name: "发送", exact: true }).click();
       const heldZero = page
-        .locator(".story-message.assistant")
+        .locator(".story-message.assistant .ai-action-card")
         .filter({
-          has: page.getByText("保持原参数，未提交新的强度或波形", {
+          has: page.getByText("玩家要求保持当前节奏，本轮保留全部参数。", {
             exact: true,
           }),
         })
         .last();
       await heldZero.waitFor();
-      await heldZero.locator("summary").click();
+      await heldZero.locator(".ai-action-details > summary").click();
       await heldZero
-        .getByText("keep 只保留原参数；原目标为 0 时会继续保持零输出。", {
-          exact: true,
-        })
-        .waitFor();
-      await heldZero
-        .getByText("联动说明：玩家要求保持当前节奏，本轮保留全部参数。", {
-          exact: true,
-        })
+        .getByText("保持零值", { exact: true })
+        .first()
         .waitFor();
       assert.equal(app.controller.run!.roleplay!.output.A.target, 0);
       assert.equal(app.controller.run!.roleplay!.output.B.target, 0);
@@ -767,20 +761,16 @@ try {
           app.device.state.intensities.B === 4,
       );
       const updated = page
-        .locator(".story-message.assistant")
+        .locator(".story-message.assistant .ai-action-card")
         .filter({
-          has: page.getByText("参数更新已提交，设备实际强度以回传为准", {
+          has: page.getByText("根据探索剧情分别调整 A/B 目标，等待设备确认。", {
             exact: true,
           }),
         })
         .last();
       await updated.waitFor();
-      await updated.locator("summary").click();
-      await updated
-        .getByText("联动说明：根据探索剧情分别调整 A/B 目标，等待设备确认。", {
-          exact: true,
-        })
-        .waitFor();
+      await updated.locator(".ai-action-details > summary").click();
+      assert.match(await updated.innerText(), /目标 8/);
       await page.getByText("设备详情与授权范围", { exact: true }).click();
       await page.screenshot({
         path: resolve(artifacts, "roleplay-desktop.png"),

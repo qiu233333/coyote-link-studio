@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useMemo } from "react";
 import type { Channel, ChannelValues, Stage } from "../shared/types";
 
 export const intensityMultiplierRange = { min: 0.1, max: 10, step: 0.1 };
@@ -71,7 +71,12 @@ function needsNewBaseline(current: Stage[], next: Stage[]): boolean {
   });
 }
 
-/** Local editor state only: persist `stages`, never the baseline or multipliers. */
+export interface ScalingDraft {
+  baseline: Pick<Stage, "id" | "intensity" | "startIntensity">[];
+  multipliers: ChannelValues;
+  inputValues: Record<Channel, string>;
+}
+
 export class StageIntensityScalingModel {
   private baseline: Stage[];
   stages: Stage[];
@@ -79,9 +84,50 @@ export class StageIntensityScalingModel {
   inputValues = unitInputs();
   inputIssues: Partial<Record<Channel, string>> = {};
 
-  constructor(stages: Stage[]) {
+  constructor(stages: Stage[], draft?: ScalingDraft) {
     this.stages = cloneStages(stages);
     this.baseline = cloneStages(stages);
+    if (!draft) return;
+    const baseline = new Map(draft.baseline.map((row) => [row.id, row]));
+    if (
+      baseline.size !== stages.length ||
+      stages.some((stage) => !baseline.has(stage.id)) ||
+      channels.some(
+        (channel) =>
+          parseIntensityMultiplier(draft.multipliers[channel]).value ===
+          undefined,
+      )
+    )
+      return;
+    const candidate = stages.map((stage) => ({
+      ...stage,
+      ...baseline.get(stage.id)!,
+    }));
+    const scaled = scaleStageIntensities(candidate, draft.multipliers);
+    if (needsNewBaseline(stages, scaled)) return;
+    this.baseline = cloneStages(candidate);
+    this.multipliers = { ...draft.multipliers };
+    this.inputValues = { ...draft.inputValues };
+    for (const channel of channels) {
+      const { issue, value } = parseIntensityMultiplier(
+        draft.inputValues[channel],
+      );
+      if (issue) this.inputIssues[channel] = issue;
+      else if (value !== this.multipliers[channel])
+        this.inputValues[channel] = this.multipliers[channel].toFixed(1);
+    }
+  }
+
+  snapshot(): ScalingDraft {
+    return {
+      baseline: this.baseline.map(({ id, intensity, startIntensity }) => ({
+        id,
+        intensity,
+        startIntensity,
+      })),
+      multipliers: this.multipliers,
+      inputValues: this.inputValues,
+    };
   }
 
   get inputIssue(): string | undefined {
@@ -155,44 +201,23 @@ export interface StageIntensityScaling {
 
 export function useStageIntensityScaling(
   stages: Stage[],
-  setStages: (next: Stage[]) => void,
+  setStages: (next: Stage[], draft: ScalingDraft) => void,
+  draft?: ScalingDraft,
 ): StageIntensityScaling {
-  const modelRef = useRef<StageIntensityScalingModel | null>(null);
-  if (!modelRef.current)
-    modelRef.current = new StageIntensityScalingModel(stages);
-  const model = modelRef.current;
-  const setter = useRef(setStages);
-  setter.current = setStages;
-  const [, render] = useState(0);
-  const commit = useCallback((next?: Stage[]) => {
-    if (next) setter.current(next);
-    render((version) => version + 1);
-  }, []);
-  const setMultiplier = useCallback(
-    (channel: Channel, input: string | number) =>
-      commit(model.setMultiplier(channel, input)),
-    [commit, model],
+  const model = useMemo(
+    () => new StageIntensityScalingModel(stages, draft),
+    [stages, draft],
   );
-  const updateStages = useCallback(
-    (next: Stage[]) => commit(model.updateStages(next)),
-    [commit, model],
-  );
-  const resetBaseline = useCallback(
-    (next?: Stage[]) => commit(model.resetBaseline(next)),
-    [commit, model],
-  );
-  const resetMultipliers = useCallback(
-    () => commit(model.resetMultipliers()),
-    [commit, model],
-  );
+  const commit = (next = model.stages) => setStages(next, model.snapshot());
   return {
     multipliers: model.multipliers,
     inputValues: model.inputValues,
     inputIssues: model.inputIssues,
     inputIssue: model.inputIssue,
-    setMultiplier,
-    updateStages,
-    resetBaseline,
-    resetMultipliers,
+    setMultiplier: (channel, input) =>
+      commit(model.setMultiplier(channel, input)),
+    updateStages: (next) => commit(model.updateStages(next)),
+    resetBaseline: (next) => commit(model.resetBaseline(next)),
+    resetMultipliers: () => commit(model.resetMultipliers()),
   };
 }

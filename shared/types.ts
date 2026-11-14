@@ -56,6 +56,16 @@ export interface Waveform {
   importNote?: string;
   pulseImport?: PulseImportMetadata;
 }
+export interface WaveformSummary extends Omit<Waveform, "frames"> {
+  frameCount: number;
+  preview: number[];
+  range: {
+    minFrequency: number;
+    maxFrequency: number;
+    minAmplitude: number;
+    maxAmplitude: number;
+  };
+}
 export interface ChannelConfig {
   enabled: boolean;
   limit: number;
@@ -199,6 +209,9 @@ export type RoleplayControlSession = ControlSessionBase & {
   roleplay: import("./roleplay.js").RoleplayLink;
 };
 export type ControlSession = TimedControlSession | RoleplayControlSession;
+export type RunView =
+  | Omit<TimedControlSession, "waveformSnapshots">
+  | Omit<RoleplayControlSession, "waveformSnapshots">;
 export interface LogEntry {
   id: string;
   at: number;
@@ -208,6 +221,7 @@ export interface LogEntry {
   channel?: Channel;
 }
 export interface AiSettings {
+  revision?: string;
   provider?: import("./aiProvider.js").AiProvider;
   deepseekThinking?: import("./aiProvider.js").DeepSeekThinking;
   baseUrl: string;
@@ -221,6 +235,7 @@ export interface AiProfile extends AiSettings {
   apiKey: string;
 }
 export interface AppSnapshot {
+  draftScope?: string;
   actionExecution?: import("./actionRecord.js").ActionExecution;
   roleplay?: {
     activeSessionId?: string;
@@ -230,11 +245,11 @@ export interface AppSnapshot {
   channels: Record<Channel, ChannelConfig>;
   synced: boolean;
   owner: Owner;
-  run: ControlSession | null;
+  run: RunView | null;
   locked: boolean;
   stopUnconfirmed: boolean;
   stopping: boolean;
-  waveforms: Waveform[];
+  waveforms: WaveformSummary[];
   logs: LogEntry[];
   history: { at: number; A: number; B: number }[];
   settings: AiSettings;

@@ -8,7 +8,7 @@ export const isDeepSeek = (profile: AiProfile) =>
 export const thinkingEnabled = (profile: AiProfile) =>
   isDeepSeek(profile) && profile.deepseekThinking === "enabled";
 
-export function model(profile: AiProfile) {
+export function model(profile: AiProfile, request: typeof fetch = fetch) {
   const deepseek = isDeepSeek(profile);
   if (deepseek && !profile.apiKey.trim())
     throw new InferenceError("AI_KEY_REQUIRED");
@@ -45,7 +45,7 @@ export function model(profile: AiProfile) {
         }
       : {}),
     // Never forward an explicitly entered credential to a redirected endpoint.
-    fetch: (url, init) => fetch(url, { ...init, redirect: "error" }),
+    fetch: (url, init) => request(url, { ...init, redirect: "error" }),
   }).chatModel(profile.model);
 }
 

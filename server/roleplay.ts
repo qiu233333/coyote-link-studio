@@ -28,6 +28,13 @@ import { Store } from "./store.js";
 import { assert } from "./errors.js";
 import { extractCharacter } from "./characterImport.js";
 import { StoryBranches } from "./storyBranches.js";
+import { StoryFeed } from "./storyFeed.js";
+import type {
+  StoryBootstrap,
+  StoryInferenceProgress,
+  StoryProgress,
+  StorySync,
+} from "../shared/storyFeed.js";
 import {
   emptyStoryState,
   mergeStoryState,
@@ -42,6 +49,7 @@ export interface StoryAi {
     profile: AiProfile,
     context: unknown,
     signal?: AbortSignal,
+    progress?: (event: StoryInferenceProgress) => void,
   ): Promise<unknown>;
 }
 const title = z.string().trim().min(1).max(100);
@@ -56,7 +64,17 @@ type Work = {
   abort: AbortController;
   promise: Promise<unknown>;
   turn?: RoleplayTurn;
+  progress?: StoryProgress;
 };
+const sameMemory = (
+  a: RoleplaySession["memory"],
+  b: RoleplaySession["memory"],
+) =>
+  a.throughSeq === b.throughSeq &&
+  a.recentPlot === b.recentPlot &&
+  a.plotBackground === b.plotBackground &&
+  a.longPlot === b.longPlot &&
+  a.longDialogue === b.longDialogue;
 const formatError = (error: unknown): error is AiServiceError =>
   error instanceof AiServiceError &&
   ["AI_INVALID_TOOL_RESULT", "AI_INVALID_DECISION"].includes(error.code);
@@ -75,6 +93,7 @@ const wait = (signal: AbortSignal) =>
   });
 export class RoleplayService {
   readonly branches: StoryBranches;
+  readonly feed = new StoryFeed();
   private work?: Work;
   private closed = false;
   private recovery = { runId: "", attempt: 0 };
@@ -84,7 +103,11 @@ export class RoleplayService {
     private ai: StoryAi,
     private retryWait: (signal: AbortSignal) => Promise<void> = wait,
   ) {
-    this.branches = new StoryBranches(store, () => controller.assertUnlocked());
+    this.branches = new StoryBranches(
+      store,
+      () => controller.assertUnlocked(),
+      (id) => this.feed.change(id, { bookmarks: true }),
+    );
     for (const turn of store.list<RoleplayTurn>("story-turns"))
       if (turn.status === "pending") {
         turn.status = "interrupted";
@@ -104,6 +127,7 @@ export class RoleplayService {
     if (work.turn?.status === "pending") {
       work.turn.status = "cancelled";
       this.store.set("story-turns", work.turn.id, work.turn);
+      this.unfinished(work);
     }
     this.controller.broadcast(true);
   };
@@ -111,6 +135,7 @@ export class RoleplayService {
     this.closed = true;
     this.cancel();
     await this.work?.promise.catch(() => undefined);
+    this.feed.close();
     this.controller.off("roleplay-cancel", this.cancel);
   }
   format() {
@@ -271,7 +296,8 @@ export class RoleplayService {
     const s = this.session(id);
     s.title = title.parse(value);
     s.updatedAt = Date.now();
-    this.store.set("stories", id, s);
+    this.store.patchStory(id, { title: s.title, updatedAt: s.updatedAt });
+    this.feed.change(id);
     return s;
   }
   remove(id: string) {
@@ -294,9 +320,91 @@ export class RoleplayService {
       for (const t of this.store.list<RoleplayTurn>("story-turns"))
         if (t.sessionId === id) this.store.delete("story-turns", t.id);
     });
+    this.feed.change(id, { complete: true });
+    this.feed.invalidateOpen();
+  }
+  sync(
+    id: string,
+    cursor: {
+      instance?: string;
+      version?: number;
+      after: number;
+      stateVersion?: number;
+      memoryVersion?: number;
+      bookmarkVersion?: number;
+    },
+  ): StorySync {
+    assert(this.store.has("stories", id), "故事不存在", "NOT_FOUND", 404);
+    const signal = this.feed.signal(id);
+    const sameInstance = signal.instance === cursor.instance;
+    if (sameInstance && signal.version === cursor.version) return { signal };
+    const story = this.store.storyHeader(id)!;
+    const { title, revision, updatedAt, turnId } = story;
+    const tail = this.store.storyTail(id);
+    const reset = cursor.after > tail;
+    const baseline = reset ? this.messages(id) : undefined;
+    const items =
+      baseline?.items ??
+      this.store
+        .storyRange<StoryMessage>(
+          `story-messages:${id}`,
+          cursor.after,
+          Number.MAX_SAFE_INTEGER,
+          100,
+        )
+        .map((message) => this.branches.withBookmark(message));
+    const state = story.storyState ?? emptyStoryState();
+    return {
+      signal,
+      delta: {
+        status: {
+          id,
+          title,
+          revision,
+          updatedAt,
+          turnId,
+          sourceAvailable: story.origin
+            ? this.store.has("stories", story.origin.storyId)
+            : undefined,
+          ...((!sameInstance || cursor.stateVersion !== state.version) && {
+            storyState: state,
+          }),
+          ...((!sameInstance ||
+            cursor.memoryVersion !== signal.memoryVersion) && {
+            memory: story.memory,
+          }),
+        },
+        turn: turnId
+          ? this.store.get<RoleplayTurn>("story-turns", turnId)
+          : undefined,
+        items,
+        more: !reset && (items.at(-1)?.seq ?? cursor.after) < tail,
+        ...(reset && {
+          reset,
+          earlier: baseline?.items.length === 50 ? baseline.cursor : undefined,
+        }),
+        ...((!sameInstance ||
+          cursor.bookmarkVersion !== signal.bookmarkVersion) && {
+          bookmarks: this.store.ids(`story-bookmarks:${id}`),
+        }),
+      },
+    };
+  }
+  bootstrap(id: string): StoryBootstrap {
+    const story = this.session(id);
+    const { items, cursor } = this.messages(id);
+    return {
+      signal: this.feed.signal(id),
+      story: { ...story, sourceAvailable: this.sourceAvailable(story) },
+      turn: story.turnId
+        ? this.store.get<RoleplayTurn>("story-turns", story.turnId)
+        : undefined,
+      items,
+      earlier: items.length === 50 ? cursor : undefined,
+    };
   }
   messages(id: string, before?: number) {
-    this.session(id);
+    assert(this.store.has("stories", id), "故事不存在", "NOT_FOUND", 404);
     const p = this.store.page<StoryMessage>(`story-messages:${id}`, 50, before);
     return {
       items: p.items
@@ -341,12 +449,10 @@ export class RoleplayService {
     s: RoleplaySession,
     item: Omit<StoryMessage, "id" | "seq" | "sessionId" | "at">,
   ) {
-    const last = this.store.page<StoryMessage>(`story-messages:${s.id}`, 1)
-      .items[0];
     const m: StoryMessage = {
       ...item,
       id: randomUUID(),
-      seq: (last?.seq ?? 0) + 1,
+      seq: this.store.storyTail(s.id) + 1,
       sessionId: s.id,
       at: Date.now(),
     };
@@ -358,6 +464,26 @@ export class RoleplayService {
     const t = this.store.get<RoleplayTurn>("story-turns", turnId);
     assert(t?.sessionId === id, "轮次不存在", "NOT_FOUND", 404);
     return t;
+  }
+  private setProgress(unit: Work, progress: StoryProgress) {
+    unit.progress = progress;
+    this.feed.progress(unit.turn!.sessionId, progress);
+  }
+  private phase(
+    unit: Work,
+    phase: StoryProgress["phase"],
+    changes: Partial<StoryProgress> = {},
+  ) {
+    this.setProgress(unit, {
+      ...unit.progress!,
+      ...changes,
+      phase,
+      phaseAt: Date.now(),
+    });
+  }
+  private unfinished(unit: Work) {
+    this.phase(unit, "unfinished", { retry: undefined });
+    this.feed.change(unit.turn!.sessionId);
   }
   async startLink(id: string, bounds: unknown, requestId: string) {
     this.session(id);
@@ -420,6 +546,7 @@ export class RoleplayService {
         text: z.string().trim().min(1).max(8000),
         requestId: z.string().uuid(),
         revision: z.number().int().optional(),
+        retryOf: z.string().uuid().optional(),
       })
       .strict()
       .parse(raw);
@@ -459,6 +586,23 @@ export class RoleplayService {
         "STORY_CONFLICT",
         409,
       );
+    let retryOf: string | undefined;
+    if (input.retryOf) {
+      const original = this.turn(id, input.retryOf);
+      const player = this.store.page<StoryMessage>(`story-messages:${id}`, 1)
+        .items[0];
+      retryOf = original.retryOf ?? original.id;
+      assert(
+        s.turnId === original.id &&
+          ["failed", "cancelled", "interrupted"].includes(original.status) &&
+          player?.role === "user" &&
+          player.turnId === retryOf &&
+          player.text === input.text,
+        "只能重试当前未完成的玩家消息。",
+        "STORY_RETRY_CONFLICT",
+        409,
+      );
+    }
     const old = this.work;
     this.cancel();
     s.revision++;
@@ -467,6 +611,7 @@ export class RoleplayService {
       id: randomUUID(),
       sessionId: id,
       requestId: input.requestId,
+      ...(retryOf && { retryOf }),
       revision: s.revision,
       status: "pending",
       attempt:
@@ -477,8 +622,13 @@ export class RoleplayService {
     };
     s.turnId = turn.id;
     this.store.transaction(() => {
-      this.addMessage(s, { role: "user", text: input.text, turnId: turn.id });
-      this.store.set("stories", id, s);
+      if (!retryOf)
+        this.addMessage(s, { role: "user", text: input.text, turnId: turn.id });
+      this.store.patchStory(id, {
+        revision: s.revision,
+        updatedAt: s.updatedAt,
+        turnId: turn.id,
+      });
       this.store.set("story-turns", turn.id, turn);
       this.store.set(`story-requests:${id}`, input.requestId, {
         turnId: turn.id,
@@ -491,6 +641,14 @@ export class RoleplayService {
       turn,
     };
     this.work = unit;
+    this.setProgress(unit, {
+      turnId: turn.id,
+      attemptId: 0,
+      startedAt: turn.createdAt,
+      phaseAt: turn.createdAt,
+      phase: "history",
+    });
+    this.feed.change(id);
     this.controller.roleplayBusy = true;
     // Capture the authorization before waiting for cancellation. Resume/new bounds
     // can never turn a pure-text request into an output command.
@@ -515,6 +673,7 @@ export class RoleplayService {
               error instanceof Error ? error.message : "演绎失败",
             );
         this.store.set("story-turns", turn.id, turn);
+        this.unfinished(unit);
         if (
           !formatError(error) &&
           link &&
@@ -551,7 +710,7 @@ export class RoleplayService {
     const valid = () =>
       !signal.aborted &&
       this.work === unit &&
-      this.session(s.id).revision === turn.revision;
+      this.store.storyRevision(s.id) === turn.revision;
     let repairReason = "";
     const request = async <T>(
       operation: "roleplay" | "summarize",
@@ -560,6 +719,12 @@ export class RoleplayService {
     ): Promise<T> => {
       for (;;) {
         signal.throwIfAborted();
+        const attemptId = unit.progress!.attemptId + 1;
+        this.phase(unit, operation === "summarize" ? "history" : "generating", {
+          attemptId,
+          preview: undefined,
+          retry: undefined,
+        });
         try {
           const retryContext = turn.formatAttempt
             ? {
@@ -574,8 +739,30 @@ export class RoleplayService {
             profile,
             retryContext,
             signal,
+            operation === "roleplay"
+              ? (event) => {
+                  if (
+                    signal.aborted ||
+                    this.work !== unit ||
+                    turn.status !== "pending" ||
+                    unit.progress?.attemptId !== attemptId
+                  )
+                    return;
+                  if (event.type === "checking") {
+                    if (unit.progress.phase === "generating")
+                      this.phase(unit, "checking");
+                  } else if (unit.progress.phase === "generating") {
+                    this.setProgress(unit, {
+                      ...unit.progress,
+                      preview: event.text,
+                    });
+                  }
+                }
+              : undefined,
           );
           signal.throwIfAborted();
+          if (operation === "roleplay" && unit.progress?.phase !== "checking")
+            this.phase(unit, "checking");
           return validate(raw);
         } catch (error) {
           if (signal.aborted) throw error;
@@ -585,6 +772,13 @@ export class RoleplayService {
             turn.formatAttempt = (turn.formatAttempt ?? 0) + 1;
             turn.retryKind = "format";
             this.store.set("story-turns", turn.id, turn);
+            this.phase(unit, "retrying", {
+              retry: {
+                kind: "format",
+                count: turn.formatAttempt,
+                max: STORY_FORMAT_MAX_RETRIES,
+              },
+            });
             this.controller.broadcast(true);
             await this.retryWait(signal);
             continue;
@@ -600,13 +794,20 @@ export class RoleplayService {
           turn.retryKind = "provider";
           if (link) this.recovery = { runId: link.id, attempt: turn.attempt };
           this.store.set("story-turns", turn.id, turn);
+          this.phase(unit, "retrying", {
+            retry: {
+              kind: "provider",
+              count: turn.attempt,
+              max: AI_MAX_RECOVERY_ATTEMPTS,
+            },
+          });
           this.controller.broadcast(true);
           await this.retryWait(signal);
         }
       }
     };
     let recent = this.store
-      .page<StoryMessage>(`story-messages:${s.id}`, 100)
+      .page<StoryMessage>(`story-messages:${s.id}`, 20)
       .items.reverse();
     const budget = Math.max(1024, (profile.contextWindow - 6000) * 1.5);
     const storyState = storyFactsForPrompt(s.storyState);
@@ -639,14 +840,20 @@ export class RoleplayService {
       recent = recent.slice(-keep);
     }
     const cutoff = recent.slice(-keep)[0]?.seq ?? 1;
-    for (;;) {
+    while (s.memory.throughSeq + 1 < cutoff) {
       let older = this.store.storyRange<StoryMessage>(
         `story-messages:${s.id}`,
         s.memory.throughSeq,
         cutoff,
-        20,
+        64,
       );
       if (!older.length) break;
+      assert(
+        older.every(
+          (message, index) => message.seq === s.memory.throughSeq + index + 1,
+        ),
+        "故事归档范围不连续，已保留原始历史。",
+      );
       const compactContext = () => ({
         memory: s.memory,
         messages: older.map((m) => ({
@@ -656,17 +863,17 @@ export class RoleplayService {
           narration: m.narration,
         })),
       });
-      while (
-        older.length > 1 &&
-        JSON.stringify(compactContext()).length > budget
-      )
+      let compact = compactContext();
+      while (older.length > 1 && JSON.stringify(compact).length > budget) {
         older = older.slice(0, Math.ceil(older.length / 2));
+        compact = compactContext();
+      }
       assert(
-        JSON.stringify(compactContext()).length <= budget,
+        JSON.stringify(compact).length <= budget,
         "摘要上下文超过模型窗口，请增加上下文窗口",
         "AI_CONTEXT_TOO_LARGE",
       );
-      const memory = await request("summarize", compactContext(), (raw) =>
+      const memory = await request("summarize", compact, (raw) =>
         memorySchema.parse(raw),
       );
       if (!valid()) return;
@@ -678,10 +885,10 @@ export class RoleplayService {
           memory,
           at: Date.now(),
         });
-        s.memory = { ...memory, throughSeq };
-        s.title = this.session(s.id).title;
-        this.store.set("stories", s.id, s);
+        this.store.patchStory(s.id, { memory: { ...memory, throughSeq } });
       });
+      s.memory = { ...memory, throughSeq };
+      this.feed.change(s.id, { memory: true });
     }
     recent = recent.slice(-keep);
     const current = this.controller.run;
@@ -744,6 +951,8 @@ export class RoleplayService {
     const runLink = authorized ? current!.roleplay : undefined;
     const previousOutput = runLink?.output;
     const previousAction = current?.lastAction;
+    const memory = { ...reply.memory, throughSeq: s.memory.throughSeq };
+    const memoryChanged = !sameMemory(memory, s.memory);
     try {
       this.store.transaction(() => {
         const round =
@@ -786,9 +995,9 @@ export class RoleplayService {
         const accepted: RoleplaySession = {
           ...s,
           completedRounds: round,
-          memory: { ...reply.memory, throughSeq: s.memory.throughSeq },
+          memory,
           updatedAt: now,
-          title: this.session(s.id).title,
+          title: this.store.storyHeader(s.id)!.title,
           storyState: {
             ...facts,
             version: s.storyState.version + 1,
@@ -796,7 +1005,12 @@ export class RoleplayService {
             lastUpdate: { messageId: message.id, seq: message.seq, changes },
           },
         };
-        this.store.set("stories", s.id, accepted);
+        this.store.patchStory(s.id, {
+          completedRounds: round,
+          updatedAt: now,
+          storyState: accepted.storyState,
+          ...(memoryChanged && { memory }),
+        });
         this.branches.record(accepted, message, round);
         this.store.set("story-turns", turn.id, completed);
       });
@@ -809,6 +1023,7 @@ export class RoleplayService {
     }
     turn.status = completed.status;
     delete turn.retryKind;
+    this.feed.change(s.id, { memory: memoryChanged, complete: true });
     if (link) this.recovery = { runId: link.id, attempt: 0 };
   }
 }

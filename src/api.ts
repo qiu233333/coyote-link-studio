@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ApiEnvelope, AppSnapshot } from "../shared/types";
+import type { ApiEnvelope, AppSnapshot, Waveform } from "../shared/types";
+import { cursorParams, type StateUpdate } from "../shared/stateSync";
 import { AppStateStream, type StateConnection } from "./stateStream";
 
 export async function request<T>(
@@ -43,10 +44,16 @@ export function useAppState() {
 
   useEffect(() => {
     const current = new AppStateStream(
-      (signal) => request<AppSnapshot>("/api/state", undefined, "GET", signal),
-      () =>
+      (signal, cursor) =>
+        request<StateUpdate>(
+          `/api/state?${cursorParams(cursor)}`,
+          undefined,
+          "GET",
+          signal,
+        ),
+      (cursor) =>
         new WebSocket(
-          `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`,
+          `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws?${cursorParams(cursor)}`,
         ),
       setState,
       setConnection,
@@ -76,7 +83,7 @@ export function useAppState() {
       setPending((n) => n + 1);
       try {
         const result = await request<T>(path, body, method);
-        await refresh();
+        await stream.current?.refreshAfterWrite();
         if (success) setToast({ text: success, error: false });
         return result;
       } catch (e) {
@@ -86,7 +93,7 @@ export function useAppState() {
         setPending((n) => Math.max(0, n - 1));
       }
     },
-    [refresh],
+    [],
   );
   return {
     state,
@@ -98,6 +105,33 @@ export function useAppState() {
     refresh,
     dismissToast: () => setToast(null),
   };
+}
+
+// Cache only content. Names and other metadata come from the current summary.
+const waveFrames = new Map<string, Promise<string[]>>();
+export function loadWaveFrames(id: string, hash: string) {
+  const cached = waveFrames.get(hash);
+  if (cached) {
+    waveFrames.delete(hash);
+    waveFrames.set(hash, cached);
+    return cached;
+  }
+  const frames = request<Waveform>(
+    `/api/waveforms/${encodeURIComponent(id)}`,
+    undefined,
+    "GET",
+  )
+    .then((wave) => {
+      if (wave.hash !== hash) throw new Error("波形已变化，请重新打开预览。");
+      return wave.frames;
+    })
+    .catch((error: unknown) => {
+      if (waveFrames.get(hash) === frames) waveFrames.delete(hash);
+      throw error;
+    });
+  waveFrames.set(hash, frames);
+  if (waveFrames.size > 8) waveFrames.delete(waveFrames.keys().next().value!);
+  return frames;
 }
 
 export const requestId = () => crypto.randomUUID();

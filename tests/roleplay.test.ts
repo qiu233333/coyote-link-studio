@@ -1334,7 +1334,11 @@ test("memory compaction covers old ranges without deleting raw messages and stor
       return answer();
     });
     assert.equal((await f.send("回顾线索")).status, "completed");
-    assert.ok(summarized >= 5);
+    assert.equal(
+      summarized,
+      2,
+      "catch-up fills the available context instead of requesting 20 messages at a time",
+    );
     assert.ok(f.service.session(f.session.id).memory.throughSeq >= 111);
     assert.equal(
       f.service.session(f.session.id).storyState.items[0].name,

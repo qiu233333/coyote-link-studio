@@ -72,9 +72,8 @@ export function StageIntensityScale({
         ))}
       </div>
       <p className="stage-intensity-scale-help stage-intensity-scale-baseline">
-        载入草稿后以当前强度为 1
-        倍；手动改强度、增删或复制阶段会以当前结果重新设为 1
-        倍。保存后重新载入也从 1 倍开始。
+        本地草稿会保留倍率和计算基准。载入后台方案、手动改强度、增删或复制阶段时，以当前强度重新设为
+        1 倍。
       </p>
       {scaling.inputIssue && (
         <p id={`${id}-issue`} className="playback-issue" role="alert">

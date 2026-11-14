@@ -1,8 +1,19 @@
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
-import type { AiProfile, AiSettings } from "../shared/types.js";
+import {
+  randomBytes,
+  randomUUID,
+  createCipheriv,
+  createDecipheriv,
+} from "node:crypto";
+import type {
+  AiProfile,
+  AiSettings,
+  ControlSession,
+  RunView,
+} from "../shared/types.js";
+import type { RoleplaySession } from "../shared/roleplay.js";
 import {
   AI_TIMEOUT_DEFAULT_SEC,
   AI_DRAFT_TIMEOUT_DEFAULT_SEC,
@@ -17,8 +28,11 @@ import {
 } from "../shared/aiProvider.js";
 
 export class Store {
+  readonly draftScope: string;
   private db: DatabaseSync;
   private key: Buffer;
+  private revisions = new Map<string, number>();
+  private savedRun?: { id: string; waves: ControlSession["waveformSnapshots"] };
   constructor(directory: string) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const keyPath = join(directory, "installation.key");
@@ -31,8 +45,72 @@ export class Store {
     );
     this.db = new DatabaseSync(join(directory, "coyote.sqlite"));
     this.db.exec(
-      "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS documents (collection TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(collection,id)); PRAGMA user_version=1;",
+      "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS documents (collection TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(collection,id));",
     );
+    const { user_version: version } = this.db
+      .prepare("PRAGMA user_version")
+      .get() as { user_version: number };
+    if (version < 2) {
+      this.transaction(() => {
+        const legacy = this.get<ControlSession>("runtime", "current");
+        if (legacy) this.saveRun(legacy);
+        this.db.exec("PRAGMA user_version=2");
+      });
+    }
+    if (version < 3) {
+      this.transaction(() =>
+        this.db.exec(`
+        CREATE INDEX IF NOT EXISTS story_message_seq
+        ON documents (collection, json_extract(payload,'$.seq'))
+        WHERE collection GLOB 'story-messages:*';
+        PRAGMA user_version=3;
+      `),
+      );
+    }
+    const savedScope = this.get<string>("metadata", "draft-scope");
+    this.draftScope = savedScope ?? randomUUID();
+    if (!savedScope) this.set("metadata", "draft-scope", this.draftScope);
+  }
+  loadRun(): ControlSession | null {
+    const run = this.get<
+      RunView & Partial<Pick<ControlSession, "waveformSnapshots">>
+    >("runtime", "current");
+    if (!run) return null;
+    // Also accept an inline record restored from a legacy backup.
+    if (run.waveformSnapshots) return run as ControlSession;
+    const snapshot = this.get<{
+      id: string;
+      waves: ControlSession["waveformSnapshots"];
+    }>("runtime-waveforms", "current");
+    assert(snapshot?.id === run.id, "当前运行的冻结波形记录缺失。");
+    this.savedRun = snapshot;
+    return { ...run, waveformSnapshots: snapshot.waves };
+  }
+  saveRun(run: ControlSession) {
+    const { waveformSnapshots: waves, ...progress } = run;
+    if (this.savedRun?.id === run.id && this.savedRun.waves === waves) {
+      this.set("runtime", "current", progress);
+      return;
+    }
+    const save = () => {
+      this.set("runtime-waveforms", "current", { id: run.id, waves });
+      this.set("runtime", "current", progress);
+      this.savedRun = { id: run.id, waves };
+    };
+    if (this.db.isTransaction) save();
+    else this.transaction(save);
+  }
+  revision(resource: string) {
+    return this.revisions.get(resource) ?? 0;
+  }
+  private changed(collection: string, id?: string) {
+    const key =
+      collection === "settings" && (id === "ai" || id === undefined)
+        ? "settings"
+        : ["waveforms", "presets", "plans"].includes(collection)
+          ? collection
+          : undefined;
+    if (key) this.revisions.set(key, this.revision(key) + 1);
   }
   get<T>(collection: string, id: string): T | undefined {
     const row = this.db
@@ -60,13 +138,17 @@ export class Store {
         "INSERT INTO documents(collection,id,payload) VALUES(?,?,?) ON CONFLICT(collection,id) DO UPDATE SET payload=excluded.payload",
       )
       .run(collection, id, JSON.stringify(value));
+    this.changed(collection, id);
   }
   delete(collection: string, id: string) {
-    this.db
+    const result = this.db
       .prepare("DELETE FROM documents WHERE collection=? AND id=?")
       .run(collection, id);
+    if (result.changes) this.changed(collection, id);
   }
   transaction<T>(fn: () => T): T {
+    const savedRun = this.savedRun;
+    const revisions = new Map(this.revisions);
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const value = fn();
@@ -74,6 +156,10 @@ export class Store {
       return value;
     } catch (error) {
       this.db.exec("ROLLBACK");
+      this.savedRun = savedRun;
+      // Invalidate any cached read made while the transaction was open.
+      for (const [key, revision] of this.revisions)
+        if (revisions.get(key) !== revision) this.changed(key);
       throw error;
     }
   }
@@ -104,10 +190,61 @@ export class Store {
     return (
       this.db
         .prepare(
-          "SELECT payload FROM documents WHERE collection=? AND json_extract(payload,'$.seq')>? AND json_extract(payload,'$.seq')<? ORDER BY rowid ASC LIMIT ?",
+          "SELECT payload FROM documents WHERE collection GLOB 'story-messages:*' AND collection=? AND json_extract(payload,'$.seq')>? AND json_extract(payload,'$.seq')<? ORDER BY json_extract(payload,'$.seq') ASC LIMIT ?",
         )
         .all(collection, afterSeq, beforeSeq, limit) as { payload: string }[]
     ).map((r) => JSON.parse(r.payload) as T);
+  }
+  storyTail(id: string) {
+    const row = this.db
+      .prepare(
+        "SELECT json_extract(payload,'$.seq') AS seq FROM documents WHERE collection GLOB 'story-messages:*' AND collection=? ORDER BY json_extract(payload,'$.seq') DESC LIMIT 1",
+      )
+      .get(`story-messages:${id}`) as { seq: number } | undefined;
+    return row?.seq ?? 0;
+  }
+  storyHeader(id: string) {
+    const row = this.db
+      .prepare(
+        "SELECT json_remove(payload,'$.card','$.player','$.scenario') AS header FROM documents WHERE collection='stories' AND id=?",
+      )
+      .get(id) as { header: string } | undefined;
+    return row
+      ? (JSON.parse(row.header) as Omit<
+          RoleplaySession,
+          "card" | "player" | "scenario"
+        >)
+      : undefined;
+  }
+  storyRevision(id: string) {
+    return this.db
+      .prepare(
+        "SELECT json_extract(payload,'$.revision') AS revision FROM documents WHERE collection='stories' AND id=?",
+      )
+      .get(id)?.revision;
+  }
+  patchStory(
+    id: string,
+    patch: Partial<
+      Omit<RoleplaySession, "id" | "card" | "player" | "scenario">
+    >,
+  ) {
+    const fields = Object.entries(patch);
+    const args = fields.flatMap(([key, value]) => [
+      `$.${key}`,
+      JSON.stringify(value),
+    ]);
+    this.db
+      .prepare(
+        `UPDATE documents SET payload=json_set(payload,${fields.map(() => "?,json(?)").join(",")}) WHERE collection='stories' AND id=?`,
+      )
+      .run(...args, id);
+  }
+  ids(collection: string) {
+    return this.db
+      .prepare("SELECT id FROM documents WHERE collection=? ORDER BY id")
+      .all(collection)
+      .map((row) => String(row.id));
   }
   completedStoryRounds(collection: string) {
     const row = this.db
@@ -119,6 +256,7 @@ export class Store {
   }
   clear(collection: string) {
     this.db.prepare("DELETE FROM documents WHERE collection=?").run(collection);
+    this.changed(collection);
   }
   private seal(text: string): string {
     const iv = randomBytes(12),
@@ -146,6 +284,7 @@ export class Store {
   profile(): AiProfile {
     const saved = this.get<AiSettings & { secret?: string }>("settings", "ai");
     return {
+      revision: saved?.revision,
       provider: aiProvider({
         baseUrl: saved?.baseUrl ?? "",
         provider: saved?.provider,
@@ -171,6 +310,13 @@ export class Store {
   }
   saveSettings(input: Record<string, unknown>) {
     const previous = this.profile();
+    assert(
+      input.expectedRevision === undefined ||
+        input.expectedRevision === (previous.revision ?? ""),
+      "后台设置已更新，请先核对新版设置。",
+      "SETTINGS_CONFLICT",
+      409,
+    );
     const baseUrl = String(input.baseUrl ?? previous.baseUrl)
       .trim()
       .replace(/\/+$/, "");
@@ -235,6 +381,7 @@ export class Store {
       typeof input.apiKey === "string" ? input.apiKey.trim() : previous.apiKey;
     assert(apiKey.length <= 4096, "API Key 过长。");
     this.set("settings", "ai", {
+      revision: randomUUID(),
       provider,
       deepseekThinking,
       baseUrl,

@@ -207,6 +207,8 @@ export interface RoleplayTurn {
   id: string;
   sessionId: string;
   requestId: string;
+  /** Original player-message turn when a retry reuses the same input. */
+  retryOf?: string;
   revision: number;
   status: "pending" | "completed" | "cancelled" | "failed" | "interrupted";
   attempt: number;

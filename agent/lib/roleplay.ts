@@ -1,4 +1,4 @@
-import { generateText, tool, ToolChoiceViolationError } from "ai";
+import { generateText, streamText, tool, ToolChoiceViolationError } from "ai";
 import { z } from "zod";
 import type { AiProfile } from "../../shared/types.ts";
 import {
@@ -9,6 +9,11 @@ import {
 import { model, businessToolChoice, checkFinish } from "./provider.ts";
 import { InferenceError } from "./errors.ts";
 import { parseStoryResult } from "./storyResult.ts";
+import type {
+  StoryInferenceProgress,
+  StoryPreview,
+} from "../../shared/storyFeed.ts";
+import { redactPreview, storyPreview } from "./storyPreview.ts";
 
 const instructions = `你是中文互动情景演绎助手，一名主角色加旁白。根据玩家的正常回答主动推进情节，引入事件、目标与互动空间，不代替玩家回答，不重复等待式空话。每轮只回复一次。
 每轮剧情回复后，提供 replyOptions：恰好三个不同的、符合当前剧情与玩家身份的下一句快捷回复。用玩家口吻写简短且可直接发送的话语或行动，体现不同的合理选择，不用“选项一”等编号前缀。它们只是候选，玩家点击前没有发生，不能写入 memory、当成反馈或用于本轮 control 决策；仍允许玩家自由输入。
@@ -27,6 +32,7 @@ export async function story(
   profile: AiProfile,
   context: unknown,
   signal: AbortSignal,
+  progress?: (progress: StoryInferenceProgress) => void,
 ) {
   const schema: z.ZodType<Record<string, unknown>> =
     operation === "card"
@@ -54,25 +60,31 @@ export async function story(
       : operation === "summarize"
         ? "压缩故事记忆，合并现有累计摘要与指定消息范围；长期剧情和长期对话分别总结，保留关键事件、约定、未解决线索。不要产生新剧情或任何设备动作。"
         : "根据六部分记忆和最新玩家消息推进下一轮剧情。authorization 非空时，同时自主安排授权内的设备联动，不能因玩家只聊剧情而始终 keep；从零启动时按授权低端选择非零目标，保持或休息需有实际理由。authorization 为空时必须 keep。提交 control 与简短 controlReason，memory 为完整更新后的四个文本记忆部分。";
+  const options = {
+    model: model(profile),
+    system:
+      operation === "roleplay"
+        ? `${instructions}\n${stateInstructions}\n${linkageInstructions}\n只调用 ${name} 一次，在同一个对象内提交旁白、台词、replyOptions（三个快捷回复）、storyStateDelta、memory、control 和 controlReason，不拆成多次调用。若接口仅能返回文本，必须只返回完全符合工具字段定义的单个 JSON 对象，不添加解释、叙事前缀或额外字段。`
+        : `${instructions}\n只调用 ${name} 一次，提交符合工具字段定义的完整对象。`,
+    prompt: `${task}\n${text}`,
+    tools: { [name]: tool({ description: task, inputSchema: schema }) },
+    toolChoice: businessToolChoice(profile, name),
+    abortSignal: signal,
+    maxRetries: 0,
+    maxOutputTokens: profile.deepseekThinking === "enabled" ? 16384 : 7000,
+    telemetry: { isEnabled: false },
+  };
   try {
-    const result = await generateText({
-      model: model(profile),
-      system:
-        operation === "roleplay"
-          ? `${instructions}\n${stateInstructions}\n${linkageInstructions}\n只调用 ${name} 一次，在同一个对象内提交旁白、台词、replyOptions（三个快捷回复）、storyStateDelta、memory、control 和 controlReason，不拆成多次调用。若接口仅能返回文本，必须只返回完全符合工具字段定义的单个 JSON 对象，不添加解释、叙事前缀或额外字段。`
-          : `${instructions}\n只调用 ${name} 一次，提交符合工具字段定义的完整对象。`,
-      prompt: `${task}\n${text}`,
-      tools: { [name]: tool({ description: task, inputSchema: schema }) },
-      toolChoice: businessToolChoice(profile, name),
-      abortSignal: signal,
-      maxRetries: 0,
-      maxOutputTokens: profile.deepseekThinking === "enabled" ? 16384 : 7000,
-      telemetry: { isEnabled: false },
-    });
+    const result =
+      operation === "roleplay" && progress
+        ? await streamStory(options, profile, name, signal, progress)
+        : await generateText(options);
+    progress?.({ type: "checking" });
     checkFinish(result);
     return parseStoryResult(schema, name, result);
   } catch (error) {
     if (!ToolChoiceViolationError.isInstance(error)) throw error;
+    progress?.({ type: "checking" });
     checkFinish(error);
     // Some compatible services put the complete structured reply in text even
     // with a named tool choice. Reasoning parts never become story messages.
@@ -85,5 +97,135 @@ export async function story(
         .map((part) => part.text)
         .join(""),
     });
+  }
+}
+
+const completeOnly = new Map<string, number>();
+async function rejectsStreaming(response: Response) {
+  if (![400, 415, 422, 501].includes(response.status)) return false;
+  const text = (await response.clone().text()).slice(0, 8000);
+  try {
+    const { error } = JSON.parse(text);
+    if (
+      error?.param === "stream" &&
+      /unsupported|not_supported/i.test(error?.code ?? "")
+    )
+      return true;
+  } catch {
+    /* Some compatible gateways use a plain-text error. */
+  }
+  return /(?:stream(?:ing)?\b.{0,50}\b(?:not supported|unsupported|not implemented)|(?:does not support|unsupported)\b.{0,35}\bstream(?:ing)?\b)/i.test(
+    text,
+  );
+}
+
+async function streamStory(
+  options: Parameters<typeof generateText>[0],
+  profile: AiProfile,
+  name: string,
+  signal: AbortSignal,
+  progress: (progress: StoryInferenceProgress) => void,
+) {
+  const provider = JSON.stringify([
+    profile.baseUrl,
+    profile.model,
+    profile.deepseekThinking,
+  ]);
+  if ((completeOnly.get(provider) ?? 0) > Date.now())
+    return generateText(options);
+  let complete: Response | undefined;
+  let rejected = false;
+  const streamingModel = model(profile, async (url, init) => {
+    const response = await fetch(url, init);
+    if (
+      response.ok &&
+      /(?:\/|\+)json\b/i.test(response.headers.get("content-type") ?? "")
+    ) {
+      // Reuse the complete response through the ordinary SDK decoder. There is
+      // no second provider request and no preview for an already complete body.
+      complete = response;
+      return new Response("data: [DONE]\n\n", {
+        headers: { "content-type": "text/event-stream" },
+      });
+    }
+    rejected = await rejectsStreaming(response);
+    return response;
+  });
+  const result = streamText({
+    ...options,
+    model: streamingModel,
+    onError: () => {},
+  });
+  let inputId: string | undefined;
+  let raw = "",
+    lastAt = 0,
+    sent: StoryPreview = { narration: "", dialogue: "" };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const publish = () => {
+    timer = undefined;
+    if (signal.aborted) return;
+    lastAt = Date.now();
+    const parsed = storyPreview(raw);
+    const text = {
+      narration: redactPreview(parsed.narration, profile.apiKey),
+      dialogue: redactPreview(parsed.dialogue, profile.apiKey),
+    };
+    if (text.narration !== sent.narration || text.dialogue !== sent.dialogue) {
+      sent = text;
+      progress({ type: "preview", text });
+    }
+  };
+  const append = (delta: string) => {
+    if (raw.length >= 131072) return;
+    raw += delta.slice(0, 131072 - raw.length);
+    if (timer) return;
+    const remaining = 80 - (Date.now() - lastAt);
+    if (remaining <= 0) publish();
+    else timer = setTimeout(publish, remaining);
+  };
+  try {
+    for await (const part of result.fullStream) {
+      signal.throwIfAborted();
+      if (complete) continue;
+      if (part.type === "error") throw part.error;
+      if (
+        part.type === "tool-input-start" &&
+        part.toolName === name &&
+        !inputId
+      ) {
+        inputId = part.id;
+        raw = "";
+        if (sent.narration || sent.dialogue) {
+          sent = { narration: "", dialogue: "" };
+          progress({ type: "preview", text: sent });
+        }
+      } else if (part.type === "tool-input-delta" && part.id === inputId)
+        append(part.delta);
+      else if (part.type === "text-delta" && !inputId) append(part.text);
+    }
+    signal.throwIfAborted();
+    if (complete) {
+      const response = complete;
+      return generateText({
+        ...options,
+        model: model(profile, async () => response),
+      });
+    }
+    return {
+      finishReason: await result.finishReason,
+      rawFinishReason: await result.rawFinishReason,
+      toolCalls: await result.toolCalls,
+      text: await result.text,
+    };
+  } catch (error) {
+    signal.throwIfAborted();
+    if (!rejected) throw error;
+    // Only an explicit pre-generation rejection permits the complete-only path.
+    if (completeOnly.size >= 32)
+      completeOnly.delete(completeOnly.keys().next().value!);
+    completeOnly.set(provider, Date.now() + 10 * 60_000);
+    return generateText(options);
+  } finally {
+    clearTimeout(timer);
   }
 }

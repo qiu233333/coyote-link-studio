@@ -1,6 +1,6 @@
 import { ActionCard } from "./ActionCard";
 import { sessionAction } from "./actionCardModel";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import {
   ArrowRight,
   Bot,
@@ -19,12 +19,13 @@ import {
   ShieldCheck,
   Sparkles,
   Square,
+  Trash2,
   WandSparkles,
 } from "lucide-react";
 import type {
   AppSnapshot,
   ControlBounds,
-  ControlSession,
+  RunView,
   RunStatus,
   RunTerminationSource,
   TaskPlan,
@@ -51,20 +52,27 @@ import { Monitor, StageEditor } from "./ConsolePage";
 import { controlBoundsIssue, taskPlanIssue } from "./playbackLimits";
 import { StageIntensityScale } from "./StageIntensityScale";
 import { useStageIntensityScaling } from "./stageIntensityScaling";
+import {
+  DraftBar,
+  useDraft,
+  useDraftStore,
+  useEditorPreference,
+} from "./drafts";
+import { rangeDraft, taskDraft, textDraft } from "./draftSchemas";
 
 type AiProps = { state: AppSnapshot; action: Action; pending: boolean };
 
 export function AiControlPage({ state, action, pending }: AiProps) {
   const run =
     state.run?.owner === "ai-control" && isActive(state) ? state.run : null;
-  const [bounds, setBounds] = useState<ControlBounds>(
-    () => run?.bounds || defaultBounds(state.waveforms),
-  );
+  const draft = useDraft("ai:range", rangeDraft);
+  const confirmed = run?.bounds;
+  const rangeVersion = run ? `${run.id}:${run.boundsVersion}` : "idle";
+  const editing = draft.value !== undefined;
+  const changed = editing && draft.value?.base !== rangeVersion;
+  const bounds =
+    draft.value?.bounds ?? confirmed ?? defaultBounds(state.waveforms);
   const [review, setReview] = useState(false);
-  const [editing, setEditing] = useState(false);
-  useEffect(() => {
-    if (run?.bounds) setBounds(run.bounds);
-  }, [run?.id, run?.boundsVersion]);
   const blocked =
     state.locked ||
     state.stopping ||
@@ -152,12 +160,35 @@ export function AiControlPage({ state, action, pending }: AiProps) {
             )
           }
         >
+          {confirmed && editing && (
+            <details className="bounds-details">
+              <summary>查看后台已确认的授权范围</summary>
+              <RangeReview bounds={confirmed} state={state} />
+            </details>
+          )}
+          {editing && <p className="field-hint">下方是待确认的本地编辑。</p>}
+          <DraftBar draft={draft} label="丢弃范围草稿" />
+          {changed && (
+            <div className="notice notice-pink" role="status">
+              后台授权范围或会话已变化。请先核对当前授权。
+              <button
+                type="button"
+                className="text-button"
+                disabled={!canEdit}
+                onClick={() => draft.cell.write({ bounds, base: rangeVersion })}
+              >
+                继续使用本地范围草稿
+              </button>
+            </div>
+          )}
           <BoundsEditor
             bounds={bounds}
-            onChange={(b) => {
-              setBounds(b);
-              setEditing(true);
-            }}
+            onChange={(bounds) =>
+              draft.cell.write({
+                bounds,
+                base: draft.value?.base ?? rangeVersion,
+              })
+            }
             waves={state.waveforms}
             disabled={!canEdit}
             deviceLimits={
@@ -177,7 +208,8 @@ export function AiControlPage({ state, action, pending }: AiProps) {
                 pending ||
                 !state.device.connected ||
                 !state.aiRuntime.ready ||
-                !!boundsIssue
+                !!boundsIssue ||
+                changed
               }
               onClick={() => setReview(true)}
             >
@@ -215,15 +247,25 @@ export function AiControlPage({ state, action, pending }: AiProps) {
                     </button>
                     <button
                       className="button secondary"
-                      disabled={blocked || pending || !editing || !!boundsIssue}
+                      disabled={
+                        blocked ||
+                        pending ||
+                        !editing ||
+                        !!boundsIssue ||
+                        changed
+                      }
                       onClick={async () => {
                         const result = await action(
                           "/api/ai-control/bounds",
-                          { bounds },
+                          { bounds, expectedRange: rangeVersion },
                           "PATCH",
                           "新的控制范围已保存",
                         );
-                        if (result !== undefined) setEditing(false);
+                        if (
+                          result !== undefined &&
+                          draft.cell.write(undefined, draft.revision)
+                        )
+                          draft.cell.flush();
                       }}
                     >
                       <Save size={16} />
@@ -265,7 +307,9 @@ export function AiControlPage({ state, action, pending }: AiProps) {
         </Card>
         <div className="ai-side">
           <FeedbackPanel
-            run={run}
+            persistInput
+            feedback={run?.feedback}
+            thinking={run?.thinking}
             action={action}
             endpoint="/api/ai-control/feedback"
             disabled={!run || blocked || pending}
@@ -276,7 +320,7 @@ export function AiControlPage({ state, action, pending }: AiProps) {
           />
         </div>
       </div>
-      <Monitor state={state} />
+      <Monitor history={state.history} connected={state.device.connected} />
       {review && (
         <Modal title="确认 AI 控制范围" onClose={() => setReview(false)}>
           <RangeReview bounds={bounds} state={state} />
@@ -302,7 +346,9 @@ export function AiControlPage({ state, action, pending }: AiProps) {
                 pending ||
                 !state.device.connected ||
                 !state.aiRuntime.ready ||
-                !!boundsIssue
+                !!boundsIssue ||
+                changed ||
+                !!run
               }
               onClick={async () => {
                 const result = await action("/api/ai-control/start", {
@@ -311,7 +357,8 @@ export function AiControlPage({ state, action, pending }: AiProps) {
                 });
                 if (result !== undefined) {
                   setReview(false);
-                  setEditing(false);
+                  if (draft.cell.write(undefined, draft.revision))
+                    draft.cell.flush();
                 }
               }}
             >
@@ -332,30 +379,94 @@ function SlidersIcon() {
 export function LockedTaskPage({ state, action, pending }: AiProps) {
   const run =
     state.run?.owner === "locked-task" && isActive(state) ? state.run : null;
-  const [prompt, setPrompt] = useState("");
-  const [plan, setPlan] = useState<TaskPlan | null>(null);
-  const [review, setReview] = useState(false);
-  const [step, setStep] = useState(0);
-  const scaling = useStageIntensityScaling(plan?.stages ?? [], (stages) =>
-    setPlan((current) => (current ? { ...current, stages } : current)),
+  const store = useDraftStore();
+  const requestDraft = useDraft("task:new", textDraft);
+  const prompt = requestDraft.value ?? "";
+  const setPrompt = (text: string) =>
+    requestDraft.cell.write(text || undefined);
+  const [taskId, setTaskId] = useEditorPreference<string>(
+    "task",
+    (value) => (typeof value === "string" ? value : undefined),
+    "",
   );
+  const draft = useDraft(`task:${taskId}`, taskDraft);
+  const remote = state.plans.find(({ id }) => id === taskId);
+  const editor = draft.value?.plan.id === taskId ? draft.value : undefined;
+  const outdated = !!editor && editor.baseVersion !== remote?.version;
+  const useLocal = !!editor && (editor.dirty || !outdated || !remote);
+  const plan = useLocal ? editor.plan : remote;
+  const step = plan ? (useLocal ? editor.step : 1) : 0;
   const blocked =
     state.locked || state.stopping || state.stopUnconfirmed || isActive(state);
   const editingDisabled = blocked || pending;
+  const review = step === 2 && !blocked;
+  const writePlan = (
+    plan: TaskPlan,
+    changes: Partial<NonNullable<typeof draft.value>>,
+  ) =>
+    draft.cell.write({
+      plan,
+      baseVersion: useLocal ? editor.baseVersion : plan.version,
+      dirty: useLocal ? editor.dirty : false,
+      step: step === 2 ? 2 : 1,
+      scaling: useLocal ? editor.scaling : undefined,
+      ...changes,
+    });
+  const setStep = (step: 1 | 2) => {
+    if (plan) writePlan(plan, { step });
+  };
+  const scaling = useStageIntensityScaling(
+    plan?.stages ?? [],
+    (stages, scaling) => {
+      if (plan) writePlan({ ...plan, stages }, { dirty: true, scaling });
+    },
+    useLocal ? editor.scaling : undefined,
+  );
   const planIssue =
     scaling.inputIssue || (plan ? taskPlanIssue(state, plan) : null);
+  const missing = !!taskId && !remote;
+  const versionConflict = outdated && !!editor?.dirty;
+  const maySave = !!remote && !versionConflict && draft.status !== "conflict";
   const generate = async () => {
     const result = await action<TaskPlan>("/api/locked-tasks/draft", {
       prompt,
     });
     if (result?.id) {
-      setPlan(result);
-      scaling.resetBaseline(result.stages);
-      setStep(1);
+      store.cell(`task:${result.id}`, taskDraft).write({
+        plan: result,
+        baseVersion: result.version,
+        dirty: false,
+        step: 1,
+      });
+      setTaskId(result.id);
     }
   };
   const patchPlan = (change: Partial<TaskPlan>) => {
-    if (plan) setPlan({ ...plan, ...change });
+    if (plan) writePlan({ ...plan, ...change }, { dirty: true });
+  };
+  const savePlan = async (success?: string) => {
+    if (!plan || !remote || !maySave) return;
+    const saved = await action<TaskPlan>(
+      `/api/locked-tasks/${plan.id}`,
+      { plan, expectedVersion: remote.version },
+      "PATCH",
+      success,
+    );
+    if (
+      saved &&
+      draft.cell.write(
+        {
+          plan: saved,
+          baseVersion: saved.version,
+          dirty: false,
+          step: step === 2 ? 2 : 1,
+          scaling: useLocal ? editor.scaling : undefined,
+        },
+        draft.revision,
+      )
+    )
+      draft.cell.flush();
+    return saved;
   };
   return (
     <div className="page-content">
@@ -463,7 +574,8 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
             </Card>
             <div className="ai-side">
               <FeedbackPanel
-                run={run}
+                feedback={run?.feedback}
+                thinking={run?.thinking}
                 action={action}
                 endpoint="/api/locked-tasks/feedback"
                 disabled={pending || state.stopping}
@@ -512,6 +624,11 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
                     maxLength={4000}
                   />
                 </Field>
+                <DraftBar
+                  draft={requestDraft}
+                  label="丢弃需求草稿"
+                  disabled={editingDisabled}
+                />
                 <div className="prompt-examples">
                   {[
                     "平稳渐进，穿插休息",
@@ -543,6 +660,21 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
                       : "生成任务草稿"}
                 </button>
               </Card>
+              {missing && (
+                <div className="notice notice-pink" role="status">
+                  后台已找不到此任务，不能保存或开启。
+                  <button
+                    type="button"
+                    className="text-button"
+                    onClick={() => {
+                      draft.cell.discard();
+                      setTaskId("");
+                    }}
+                  >
+                    关闭并丢弃本地任务草稿
+                  </button>
+                </div>
+              )}
               {plan && (
                 <Card
                   title="把草稿改成你的约定"
@@ -550,6 +682,42 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
                   icon={<FilePenLine size={18} />}
                   className="task-plan-editor"
                 >
+                  <DraftBar
+                    draft={draft}
+                    label="丢弃任务修改"
+                    disabled={editingDisabled || missing}
+                  />
+                  {versionConflict && remote && (
+                    <div className="notice notice-pink" role="status">
+                      后台任务已更新为 v{remote.version}「{remote.title}
+                      」，本地仍有修改。
+                      <button
+                        type="button"
+                        className="text-button"
+                        onClick={draft.cell.discard}
+                      >
+                        载入后台任务
+                      </button>
+                      <button
+                        type="button"
+                        className="text-button"
+                        disabled={editingDisabled}
+                        onClick={() => {
+                          if (
+                            confirm(
+                              "保留本地任务内容？下次正式保存会覆盖当前后台版本。",
+                            )
+                          )
+                            writePlan(plan, {
+                              baseVersion: remote.version,
+                              dirty: true,
+                            });
+                        }}
+                      >
+                        保留本地任务修改
+                      </button>
+                    </div>
+                  )}
                   <Field label="任务名称">
                     <input
                       aria-label="任务名称"
@@ -616,15 +784,8 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
                   <div className="button-row wrap">
                     <button
                       className="button secondary"
-                      disabled={editingDisabled || !!planIssue}
-                      onClick={() =>
-                        void action(
-                          `/api/locked-tasks/${plan.id}`,
-                          { plan },
-                          "PATCH",
-                          "草稿已保存",
-                        )
-                      }
+                      disabled={editingDisabled || !!planIssue || !maySave}
+                      onClick={() => void savePlan("任务草稿已正式保存")}
                     >
                       <Save size={16} />
                       保存草稿
@@ -636,10 +797,10 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
                         !state.device.connected ||
                         !state.aiRuntime.ready ||
                         !plan.stages.length ||
-                        !!planIssue
+                        !!planIssue ||
+                        !maySave
                       }
                       onClick={() => {
-                        setReview(true);
                         setStep(2);
                       }}
                     >
@@ -699,10 +860,17 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
                           <button
                             disabled={editingDisabled}
                             onClick={() => {
-                              const loaded = structuredClone(p);
-                              setPlan(loaded);
-                              scaling.resetBaseline(loaded.stages);
-                              setStep(1);
+                              if (p.id === taskId) {
+                                if (
+                                  editor?.dirty &&
+                                  !confirm(
+                                    "载入后台任务会替换此任务尚未正式保存的修改。要继续吗？",
+                                  )
+                                )
+                                  return;
+                                draft.cell.discard();
+                              }
+                              setTaskId(p.id);
                             }}
                           >
                             <strong>{p.title}</strong>
@@ -712,6 +880,33 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
                             </small>
                           </button>
                           <ChevronRight size={15} />
+                          <button
+                            type="button"
+                            className="icon-button"
+                            aria-label={`删除任务 ${p.title}`}
+                            disabled={editingDisabled}
+                            onClick={async () => {
+                              if (
+                                !confirm(
+                                  `删除后台任务「${p.title}」及其本地草稿？`,
+                                )
+                              )
+                                return;
+                              const result = await action(
+                                `/api/locked-tasks/${p.id}`,
+                                { expectedVersion: p.version },
+                                "DELETE",
+                                "任务已删除",
+                              );
+                              if (result === undefined) return;
+                              store
+                                .cell(`task:${p.id}`, taskDraft)
+                                .deleteEntity();
+                              if (taskId === p.id) setTaskId("");
+                            }}
+                          >
+                            <Trash2 size={14} />
+                          </button>
                         </div>
                       ))}
                   </div>
@@ -727,7 +922,6 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
         <Modal
           title="确认约定并上锁"
           onClose={() => {
-            setReview(false);
             setStep(1);
           }}
         >
@@ -739,6 +933,11 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
             </div>
           </div>
           <RangeReview bounds={plan.bounds} state={state} />
+          {!maySave && (
+            <p className="playback-issue" role="status">
+              任务版本或本地草稿已变化，请返回修改并核对后再确认。
+            </p>
+          )}
           <div className="playback-stage-review" aria-label="锁定阶段强度确认">
             {plan.stages.map((stage) => (
               <p key={stage.id}>
@@ -771,7 +970,6 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
             <button
               className="button secondary"
               onClick={() => {
-                setReview(false);
                 setStep(1);
               }}
             >
@@ -780,20 +978,25 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
             <button
               className="button primary pink-primary"
               disabled={
-                editingDisabled || !state.device.connected || !!planIssue
+                editingDisabled ||
+                !state.device.connected ||
+                !!planIssue ||
+                !maySave
               }
               onClick={async () => {
-                const saved = await action(
-                  `/api/locked-tasks/${plan.id}`,
-                  { plan },
-                  "PATCH",
-                );
-                if (saved === undefined) return;
+                const saved = await savePlan();
+                if (!saved) return;
+                const revision = draft.cell.snapshot().revision;
                 const started = await action(
                   `/api/locked-tasks/${plan.id}/start`,
-                  { requestId: requestId() },
+                  { requestId: requestId(), expectedVersion: saved.version },
                 );
-                if (started !== undefined) setReview(false);
+                if (started !== undefined) {
+                  const current = draft.cell.snapshot().value;
+                  if (current)
+                    draft.cell.write({ ...current, step: 1 }, revision);
+                  draft.cell.flush();
+                }
               }}
             >
               <LockKeyhole size={16} />
@@ -870,26 +1073,38 @@ function RangeReview({
   );
 }
 
-function FeedbackPanel({
-  run,
+const FeedbackPanel = memo(function FeedbackPanel({
+  feedback,
+  thinking,
   action,
   endpoint,
   disabled,
+  persistInput = false,
 }: {
-  run: ControlSession | null;
+  feedback: RunView["feedback"] | undefined;
+  thinking: boolean | undefined;
   action: Action;
   endpoint: string;
   disabled: boolean;
+  persistInput?: boolean;
 }) {
-  const [text, setText] = useState("");
+  const draft = useDraft("ai:feedback", textDraft);
+  const [localText, setLocalText] = useState("");
+  const text = persistInput ? (draft.value ?? "") : localText;
+  const setText = (value: string) =>
+    persistInput ? draft.cell.write(value || undefined) : setLocalText(value);
   const bottomRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
-  }, [run?.feedback.length]);
+  }, [feedback?.length]);
   const send = async (value: string) => {
     if (!value.trim() || disabled) return;
     const result = await action(endpoint, { text: value.trim() });
-    if (result !== undefined) setText("");
+    if (result !== undefined && value === text) {
+      if (persistInput) {
+        if (draft.cell.write(undefined, draft.revision)) draft.cell.flush();
+      } else setLocalText((current) => (current === value ? "" : current));
+    }
   };
   return (
     <Card
@@ -899,8 +1114,8 @@ function FeedbackPanel({
       className="feedback-card"
     >
       <div className="chat-messages" aria-live="polite">
-        {run?.feedback.length ? (
-          run.feedback.map((f) => (
+        {feedback?.length ? (
+          feedback.map((f) => (
             <div className={`chat-message ${f.role}`} key={f.id}>
               {f.role === "assistant" && <Avatar size="small" />}
               <div>
@@ -913,13 +1128,13 @@ function FeedbackPanel({
           <div className="chat-empty">
             <Avatar />
             <p>
-              {run
+              {feedback
                 ? "现在感觉如何？告诉我，我会在确认范围里调整。"
                 : "启动之后，你的感受就是下一步的线索。"}
             </p>
           </div>
         )}
-        {run?.thinking && (
+        {thinking && (
           <div className="thinking">
             <span />
             <span />
@@ -936,6 +1151,7 @@ function FeedbackPanel({
           </button>
         ))}
       </div>
+      {persistInput && <DraftBar draft={draft} label="丢弃反馈草稿" />}
       <form
         className="feedback-input"
         onSubmit={(e) => {
@@ -947,7 +1163,7 @@ function FeedbackPanel({
           aria-label="给 AI 的文字反馈"
           value={text}
           onChange={(e) => setText(e.target.value)}
-          placeholder={run ? "告诉我你的感受…" : "开启后可以发送反馈"}
+          placeholder={feedback ? "告诉我你的感受…" : "开启后可以发送反馈"}
           disabled={disabled}
           rows={2}
           maxLength={2000}
@@ -974,7 +1190,7 @@ function FeedbackPanel({
       <p className="field-hint">Enter 发送 · Shift + Enter 换行</p>
     </Card>
   );
-}
+});
 
 const runStatusNames: Record<RunStatus, string> = {
   running: "运行中",
@@ -1002,7 +1218,7 @@ const terminationNames: Record<RunTerminationSource, string> = {
   "service-restart": "本地服务重启",
 };
 
-function RunEndNotice({ run }: { run: ControlSession }) {
+function RunEndNotice({ run }: { run: RunView }) {
   return (
     <div
       className={`notice ${run.status === "faulted" ? "notice-pink" : ""}`}
@@ -1040,7 +1256,7 @@ function RunSummary({
   run,
 }: {
   state: AppSnapshot;
-  run: ControlSession | null;
+  run: RunView | null;
 }) {
   const active = run && ["running", "paused"].includes(run.status);
   const recovery = run?.inferenceRecovery;

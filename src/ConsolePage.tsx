@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   ArrowDown,
@@ -45,13 +45,14 @@ import type {
   Protocol,
   RandomConfig,
   Stage,
-  Waveform,
+  WaveformSummary,
 } from "../shared/types";
 import {
   type Action,
   clockTime,
   duration,
   isActive,
+  loadWaveFrames,
   ownerNames,
   requestId,
   timeLeft,
@@ -63,6 +64,8 @@ import {
 } from "./playbackLimits";
 import { StageIntensityScale } from "./StageIntensityScale";
 import { useStageIntensityScaling } from "./stageIntensityScaling";
+import { DraftBar, useDraft, useEditorPreference } from "./drafts";
+import { randomDraft, sequenceDraft } from "./draftSchemas";
 import { useLiveChannels } from "./useLiveChannels";
 import { MAX_WAVEFORM_FILE_BYTES } from "../shared/waveformImport";
 import {
@@ -103,7 +106,11 @@ export default function ConsolePage({
   pending,
   onNavigateAI,
 }: ConsoleProps) {
-  const [tab, setTab] = useState<Tab>("live");
+  const [tab, setTab] = useEditorPreference<Tab>(
+    "console",
+    (value) => tabs.find((item) => item.id === value)?.id,
+    "live",
+  );
   const [connectionOpen, setConnectionOpen] = useState(false);
   const [confirmConfig, setConfirmConfig] = useState<PlaybackConfig | null>(
     null,
@@ -346,7 +353,10 @@ export default function ConsolePage({
             </div>
           </div>
           <div className="live-bottom">
-            <Monitor state={state} />
+            <Monitor
+              history={state.history}
+              connected={state.device.connected}
+            />
             <Card
               title="正在运行"
               eyebrow="NOW PLAYING"
@@ -364,8 +374,7 @@ export default function ConsolePage({
                     <span>
                       <strong>{w.name}</strong>
                       <small>
-                        {(w.durationMs / 1000).toFixed(1)}s · {w.frames.length}{" "}
-                        帧
+                        {(w.durationMs / 1000).toFixed(1)}s · {w.frameCount} 帧
                       </small>
                     </span>
                     <ChevronRight size={14} />
@@ -378,7 +387,7 @@ export default function ConsolePage({
       )}
       {tab === "waves" && (
         <WaveLibrary
-          state={state}
+          waveforms={state.waveforms}
           action={action}
           disabled={blocked || pending}
         />
@@ -402,7 +411,7 @@ export default function ConsolePage({
           onPlay={setConfirmConfig}
         />
       )}
-      {tab === "logs" && <LogsPanel state={state} />}
+      {tab === "logs" && <LogsPanel entries={state.logs} />}
       {connectionOpen && (
         <Modal title="设备连接管理" onClose={() => setConnectionOpen(false)}>
           <DevicePanel
@@ -717,7 +726,7 @@ function ChannelCard({
       </div>
       <div className="channel-wave">
         <WaveGraph
-          frames={wave?.frames || []}
+          values={wave?.preview}
           color={channel === "A" ? "blue" : "pink"}
         />
       </div>
@@ -924,8 +933,14 @@ function RunPlayer({
   );
 }
 
-export function Monitor({ state }: { state: AppSnapshot }) {
-  const points = state.history.slice(-80);
+export const Monitor = memo(function Monitor({
+  history,
+  connected,
+}: {
+  history: AppSnapshot["history"];
+  connected: boolean;
+}) {
+  const points = history.slice(-80);
   const maximum = Math.max(10, ...points.flatMap((p) => [p.A, p.B]));
   const line = (channel: Channel) =>
     points
@@ -976,41 +991,43 @@ export function Monitor({ state }: { state: AppSnapshot }) {
       </div>
       <div className="monitor-footer">
         <span>
-          <i
-            className={`status-dot ${state.device.connected ? "online" : ""}`}
-          />
-          {state.device.connected ? "状态持续同步中" : "设备连接后显示实时曲线"}
+          <i className={`status-dot ${connected ? "online" : ""}`} />
+          {connected ? "状态持续同步中" : "设备连接后显示实时曲线"}
         </span>
         <span>强度单位 · 设备反馈</span>
       </div>
     </Card>
   );
-}
+});
 
-function WaveLibrary({
-  state,
+const WaveLibrary = memo(function WaveLibrary({
+  waveforms,
   action,
   disabled,
 }: {
-  state: AppSnapshot;
+  waveforms: WaveformSummary[];
   action: Action;
   disabled: boolean;
 }) {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("all");
-  const [preview, setPreview] = useState<Waveform | null>(null);
-  const [rename, setRename] = useState<Waveform | null>(null);
+  const [previewId, setPreview] = useState<string | null>(null);
+  const preview = waveforms.find((wave) => wave.id === previewId);
+  const [rename, setRename] = useState<WaveformSummary | null>(null);
   const [newName, setNewName] = useState("");
   const [localError, setLocalError] = useState("");
   const [dragging, setDragging] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
-  let waves = state.waveforms.filter(
-    (w) =>
-      w.name.toLowerCase().includes(search.toLowerCase()) &&
-      (filter !== "favorite" || w.favorite),
-  );
-  if (filter === "recent")
-    waves = [...waves].sort((a, b) => b.lastUsedAt - a.lastUsedAt);
+  const waves = useMemo(() => {
+    const filtered = waveforms.filter(
+      (w) =>
+        w.name.toLowerCase().includes(search.toLowerCase()) &&
+        (filter !== "favorite" || w.favorite),
+    );
+    return filter === "recent"
+      ? filtered.sort((a, b) => b.lastUsedAt - a.lastUsedAt)
+      : filtered;
+  }, [waveforms, search, filter]);
   const importFile = async (file?: File) => {
     if (!file || disabled) return;
     setLocalError("");
@@ -1063,17 +1080,23 @@ function WaveLibrary({
     }
     if (fileRef.current) fileRef.current.value = "";
   };
-  const exportWave = (w: Waveform) => {
-    const url = URL.createObjectURL(
-      new Blob([JSON.stringify({ label: w.name, raw: w.frames }, null, 2)], {
-        type: "application/json",
-      }),
-    );
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `${w.name}.json`;
-    link.click();
-    URL.revokeObjectURL(url);
+  const exportWave = async (w: WaveformSummary) => {
+    setLocalError("");
+    try {
+      const frames = await loadWaveFrames(w.id, w.hash);
+      const url = URL.createObjectURL(
+        new Blob([JSON.stringify({ label: w.name, raw: frames }, null, 2)], {
+          type: "application/json",
+        }),
+      );
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${w.name}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setLocalError((error as Error).message);
+    }
   };
   return (
     <div
@@ -1186,15 +1209,15 @@ function WaveLibrary({
             </div>
             <button
               className="wave-preview-button"
-              onClick={() => setPreview(w)}
+              onClick={() => setPreview(w.id)}
             >
               <h3>{w.name}</h3>
               <WaveGraph
-                frames={w.frames}
+                values={w.preview}
                 color={index % 2 ? "pink" : "blue"}
               />
               <div className="wave-meta">
-                <span>{w.frames.length} 帧</span>
+                <span>{w.frameCount} 帧</span>
                 <span>{(w.durationMs / 1000).toFixed(1)} 秒</span>
                 <span>
                   预览
@@ -1267,7 +1290,7 @@ function WaveLibrary({
       </div>
       {preview && (
         <Modal title={preview.name} onClose={() => setPreview(null)}>
-          <WaveGraph frames={preview.frames} />
+          <WaveGraph values={preview.preview} />
           <WaveMetadata waveform={preview} />
           {preview.importNote && (
             <p className="small-text muted">{preview.importNote}</p>
@@ -1275,7 +1298,7 @@ function WaveLibrary({
           <div className="review-grid">
             <div>
               <span>帧数</span>
-              <strong>{preview.frames.length}</strong>
+              <strong>{preview.frameCount}</strong>
             </div>
             <div>
               <span>{preview.pulseImport ? "实际时长" : "原始时长"}</span>
@@ -1299,14 +1322,7 @@ function WaveLibrary({
           <p className="field-hint">
             曲线展示波形相对幅度。实际输出同时受通道强度与设备上限影响。
           </p>
-          <div className="raw-frames">
-            {preview.frames.slice(0, 8).map((f, i) => (
-              <code key={i}>{f}</code>
-            ))}
-            {preview.frames.length > 8 && (
-              <span>… 另有 {preview.frames.length - 8} 帧</span>
-            )}
-          </div>
+          <WaveFramePreview id={preview.id} hash={preview.hash} />
           <div className="button-row">
             <button
               className="button secondary"
@@ -1377,7 +1393,67 @@ function WaveLibrary({
       )}
     </div>
   );
-}
+});
+
+const WaveFramePreview = memo(function WaveFramePreview({
+  id,
+  hash,
+}: {
+  id: string;
+  hash: string;
+}) {
+  const [attempt, retry] = useState(0);
+  const [result, setResult] = useState<{
+    hash: string;
+    frames?: string[];
+    error?: string;
+  }>();
+  useEffect(() => {
+    let current = true;
+    loadWaveFrames(id, hash).then(
+      (frames) => {
+        if (current) setResult({ hash, frames });
+      },
+      (error: Error) => {
+        if (current) setResult({ hash, error: error.message });
+      },
+    );
+    return () => {
+      current = false;
+    };
+  }, [id, hash, attempt]);
+  const detail = result?.hash === hash ? result : undefined;
+  if (detail?.error)
+    return (
+      <div className="notice notice-pink">
+        {detail.error}
+        <button
+          className="text-button"
+          onClick={() => {
+            setResult(undefined);
+            retry((n) => n + 1);
+          }}
+        >
+          重试
+        </button>
+      </div>
+    );
+  const frames = detail?.frames;
+  if (!frames)
+    return (
+      <p className="field-hint" role="status">
+        正在读取波形帧…
+      </p>
+    );
+  return (
+    <div className="raw-frames">
+      {frames.slice(0, 8).map((frame, i) => (
+        <code key={i}>{frame}</code>
+      ))}
+      {frames.length > 8 && <span>… 另有 {frames.length - 8} 帧</span>}
+    </div>
+  );
+});
 
 export function StageEditor({
   stages,
@@ -1390,7 +1466,7 @@ export function StageEditor({
 }: {
   stages: Stage[];
   setStages: (stages: Stage[]) => void;
-  waves: Waveform[];
+  waves: WaveformSummary[];
   disabled: boolean;
   mode?: "stages" | "playlist";
   state?: AppSnapshot;
@@ -1658,15 +1734,29 @@ function SequenceEditor({
   canPlay: boolean;
   onPlay: (config: PlaybackConfig) => void;
 }) {
-  const [stages, setStages] = useState<Stage[]>([
-    defaultStage(state.waveforms[0]?.id || "", 0),
-  ]);
-  const [repeat, setRepeat] = useState(1);
-  const [shuffle, setShuffle] = useState(false);
-  const [durationSec, setDurationSec] = useState(600);
-  const [presetName, setPresetName] = useState("");
+  const draft = useDraft(`sequence:${mode}`, sequenceDraft);
+  const firstWave = state.waveforms[0]?.id ?? "";
+  const defaults = useMemo(
+    () => ({
+      stages: [defaultStage(firstWave, 0)],
+      repeat: 1,
+      shuffle: false,
+      durationSec: 600,
+      presetName: "",
+      dirty: false,
+    }),
+    [firstWave],
+  );
+  const editor: NonNullable<typeof draft.value> = draft.value ?? defaults;
+  const { stages, repeat, shuffle, durationSec, presetName } = editor;
+  const edit = (patch: Partial<typeof editor>) =>
+    draft.cell.write({ ...editor, ...patch, dirty: true });
   const [showSave, setShowSave] = useState(false);
-  const scaling = useStageIntensityScaling(stages, setStages);
+  const scaling = useStageIntensityScaling(
+    stages,
+    (stages, scaling) => edit({ stages, scaling }),
+    editor.scaling,
+  );
   const config: PlaybackConfig = { mode, stages, repeat, shuffle, durationSec };
   const draftIssue =
     mode === "stages"
@@ -1703,6 +1793,12 @@ function SequenceEditor({
             保存预设
           </button>
         </div>
+        <DraftBar draft={draft} disabled={disabled} label="丢弃方案草稿" />
+        {editor.presetId && !presets.some((p) => p.id === editor.presetId) && (
+          <p className="field-hint" role="status">
+            原预设已删除，当前编辑内容仍可另存。
+          </p>
+        )}
         {mode === "stages" && (
           <StageIntensityScale scaling={scaling} disabled={disabled} />
         )}
@@ -1721,7 +1817,11 @@ function SequenceEditor({
         </div>
         <StageEditor
           stages={stages}
-          setStages={mode === "stages" ? scaling.updateStages : setStages}
+          setStages={
+            mode === "stages"
+              ? scaling.updateStages
+              : (stages) => edit({ stages })
+          }
           waves={state.waveforms}
           disabled={disabled}
           mode={mode}
@@ -1736,7 +1836,7 @@ function SequenceEditor({
               value={repeat}
               min={1}
               max={1000}
-              onChange={setRepeat}
+              onChange={(repeat) => edit({ repeat })}
               disabled={disabled}
             />
           </Field>
@@ -1749,7 +1849,7 @@ function SequenceEditor({
               value={durationSec}
               min={1}
               max={86400}
-              onChange={setDurationSec}
+              onChange={(durationSec) => edit({ durationSec })}
               disabled={disabled}
             />
           </Field>
@@ -1757,7 +1857,7 @@ function SequenceEditor({
             <Toggle
               label="随机排列条目"
               checked={shuffle}
-              onChange={setShuffle}
+              onChange={(shuffle) => edit({ shuffle })}
               disabled={disabled}
             />
           )}
@@ -1787,15 +1887,25 @@ function SequenceEditor({
                   <button
                     disabled={disabled}
                     onClick={() => {
+                      if (
+                        (editor.dirty || presetName) &&
+                        !confirm(
+                          "载入预设会替换此处尚未正式保存的编辑。要继续吗？",
+                        )
+                      )
+                        return;
                       const loadedStages = structuredClone(p.config.stages).map(
                         (s) => ({ ...s, id: crypto.randomUUID() }),
                       );
-                      if (mode === "stages")
-                        scaling.resetBaseline(loadedStages);
-                      else setStages(loadedStages);
-                      setRepeat(p.config.repeat);
-                      setShuffle(p.config.shuffle);
-                      setDurationSec(p.config.durationSec);
+                      draft.cell.write({
+                        stages: loadedStages,
+                        repeat: p.config.repeat,
+                        shuffle: p.config.shuffle,
+                        durationSec: p.config.durationSec,
+                        presetId: p.id,
+                        presetName: "",
+                        dirty: false,
+                      });
                     }}
                   >
                     <strong>{p.name}</strong>
@@ -1829,7 +1939,9 @@ function SequenceEditor({
             <input
               aria-label="预设名称"
               value={presetName}
-              onChange={(e) => setPresetName(e.target.value)}
+              onChange={(e) =>
+                draft.cell.write({ ...editor, presetName: e.target.value })
+              }
               maxLength={80}
               autoFocus
             />
@@ -1839,13 +1951,25 @@ function SequenceEditor({
             disabled={!presetName.trim() || disabled || !!draftIssue}
             onClick={async () => {
               if (disabled || draftIssue) return;
-              const result = await action(
+              const result = await action<AppSnapshot["presets"][number]>(
                 "/api/presets",
                 { name: presetName.trim(), config },
                 "POST",
                 "预设已保存",
               );
-              if (result !== undefined) setShowSave(false);
+              if (result !== undefined) {
+                draft.cell.write(
+                  {
+                    ...editor,
+                    presetId: result.id,
+                    presetName: "",
+                    dirty: false,
+                  },
+                  draft.revision,
+                );
+                draft.cell.flush();
+                setShowSave(false);
+              }
             }}
           >
             <Save size={16} />
@@ -1873,7 +1997,8 @@ function RandomPanel({
   canPlay: boolean;
   onPlay: (config: PlaybackConfig) => void;
 }) {
-  const [config, setConfig] = useState<RandomConfig>({
+  const draft = useDraft("console:random", randomDraft);
+  const defaults: RandomConfig = {
     channels: ["A", "B"],
     waveformIds: state.waveforms.slice(0, 3).map((w) => w.id),
     minIntensity: { A: 0, B: 0 },
@@ -1885,10 +2010,10 @@ function RandomPanel({
     randomWaveform: true,
     randomIntensity: true,
     randomDuration: false,
-  });
-  const [total, setTotal] = useState(300);
+  };
+  const { config, total } = draft.value ?? { config: defaults, total: 300 };
   const patch = (p: Partial<RandomConfig>) =>
-    setConfig((current) => ({ ...current, ...p }));
+    draft.cell.write({ total, config: { ...config, ...p } });
   const limits = playbackChannelsLimit(state, config.channels);
   const playback: PlaybackConfig = {
     mode: "random",
@@ -1907,6 +2032,7 @@ function RandomPanel({
         icon={<Shuffle size={20} />}
       >
         <p className="muted">先划定边界，再让波形与强度带来恰好的变化。</p>
+        <DraftBar draft={draft} disabled={disabled} label="丢弃随机草稿" />
         <fieldset className="plain-fieldset" disabled={disabled}>
           <Field label="参与通道">
             <ChannelChips
@@ -1922,6 +2048,24 @@ function RandomPanel({
           />
           <Field label="可选波形">
             <div className="wave-checks">
+              {config.waveformIds
+                .filter((id) => !state.waveforms.some((wave) => wave.id === id))
+                .map((id) => (
+                  <button
+                    type="button"
+                    className="choice-chip"
+                    key={id}
+                    onClick={() =>
+                      patch({
+                        waveformIds: config.waveformIds.filter(
+                          (value) => value !== id,
+                        ),
+                      })
+                    }
+                  >
+                    移除缺失波形 {id}
+                  </button>
+                ))}
               {state.waveforms.map((w) => (
                 <label
                   className={`wave-check ${config.waveformIds.includes(w.id) ? "selected" : ""}`}
@@ -2088,7 +2232,7 @@ function RandomPanel({
             value={total}
             min={1}
             max={86400}
-            onChange={setTotal}
+            onChange={(total) => draft.cell.write({ config, total })}
             disabled={disabled}
           />
         </Field>
@@ -2113,13 +2257,17 @@ function RandomPanel({
   );
 }
 
-function LogsPanel({ state }: { state: AppSnapshot }) {
+const LogsPanel = memo(function LogsPanel({
+  entries,
+}: {
+  entries: AppSnapshot["logs"];
+}) {
   const [source, setSource] = useState("all");
   const [level, setLevel] = useState("all");
   const [channel, setChannel] = useState("all");
   const [since, setSince] = useState("");
-  const sources = [...new Set(state.logs.map((l) => l.source))];
-  const logs = state.logs
+  const sources = [...new Set(entries.map((l) => l.source))];
+  const logs = entries
     .filter(
       (l) =>
         (source === "all" || l.source === source) &&
@@ -2215,4 +2363,4 @@ function LogsPanel({ state }: { state: AppSnapshot }) {
       )}
     </Card>
   );
-}
+});

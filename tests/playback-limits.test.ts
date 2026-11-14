@@ -57,7 +57,14 @@ function state(): AppSnapshot {
       {
         id: "wave",
         name: "测试",
-        frames: ["0A0A0A0A32323232"],
+        frameCount: 1,
+        preview: [],
+        range: {
+          minFrequency: 10,
+          maxFrequency: 10,
+          minAmplitude: 0,
+          maxAmplitude: 0,
+        },
         hash: "wave",
         builtin: true,
         favorite: false,
@@ -430,7 +437,6 @@ test("播放器明确说明失联、停止未确认、运行和锁定阻止启�
     stageIndex: 0,
     stageStartedAt: 0,
     elapsedMs: 0,
-    waveformSnapshots: {},
     feedback: [],
     thinking: false,
   };

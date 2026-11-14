@@ -1,4 +1,8 @@
 import { EventEmitter } from "node:events";
+import {
+  STORY_PREVIEW_LIMIT,
+  type StoryInferenceProgress,
+} from "../shared/storyFeed.js";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -40,6 +44,62 @@ export class AiServiceError extends Error {
   ) {
     super(message);
     this.retryable = recoverableErrors.has(code);
+  }
+}
+
+async function readStoryStream<T>(
+  response: Response,
+  signal: AbortSignal,
+  progress: (event: StoryInferenceProgress) => void,
+): Promise<Envelope<T>> {
+  const invalid = () =>
+    new AiServiceError("AI_INVALID_RESPONSE", "AI 返回无效响应。");
+  if (!response.body) throw invalid();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "",
+    result: Envelope<T> | undefined;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      signal.throwIfAborted();
+      buffer += decoder.decode(value, { stream: !done });
+      let end: number;
+      while ((end = buffer.indexOf("\n")) >= 0) {
+        if (end > 262144 || result) throw invalid();
+        let event;
+        try {
+          event = JSON.parse(buffer.slice(0, end));
+        } catch {
+          throw invalid();
+        }
+        buffer = buffer.slice(end + 1);
+        if (event?.type === "result" && typeof event.data?.ok === "boolean")
+          result = event.data;
+        else if (event?.type === "checking") progress({ type: "checking" });
+        else if (
+          event?.type === "preview" &&
+          typeof event.text?.narration === "string" &&
+          typeof event.text?.dialogue === "string"
+        )
+          progress({
+            type: "preview",
+            text: {
+              narration: event.text.narration.slice(0, STORY_PREVIEW_LIMIT),
+              dialogue: event.text.dialogue.slice(0, STORY_PREVIEW_LIMIT),
+            },
+          });
+        else throw invalid();
+      }
+      if (buffer.length > 262144) throw invalid();
+      if (done) break;
+    }
+    if (!result || buffer.trim())
+      throw new AiServiceError("AI_TRANSPORT", "AI 进度连接在结果提交前中断。");
+    return result;
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
 }
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -370,6 +430,7 @@ export class AiService extends EventEmitter {
     profile: AiProfile,
     payload: Record<string, unknown>,
     signal?: AbortSignal,
+    progress?: (event: StoryInferenceProgress) => void,
   ): Promise<T> {
     if (!this.status.ready)
       throw new AiServiceError(
@@ -436,15 +497,23 @@ export class AiService extends EventEmitter {
         headers: {
           "content-type": "application/json",
           authorization: `Bearer ${token}`,
+          ...(progress ? { accept: "application/x-ndjson" } : {}),
         },
         body: JSON.stringify({ requestId, profile, ...payload }),
         signal: controller.signal,
       });
       let body: Envelope<T>;
-      try {
-        body = (await response.json()) as Envelope<T>;
-      } catch {
-        throw new AiServiceError("AI_INVALID_RESPONSE", "AI 返回无效响应。");
+      if (
+        progress &&
+        response.headers.get("content-type")?.includes("application/x-ndjson")
+      )
+        body = await readStoryStream(response, controller.signal, progress);
+      else {
+        try {
+          body = (await response.json()) as Envelope<T>;
+        } catch {
+          throw new AiServiceError("AI_INVALID_RESPONSE", "AI 返回无效响应。");
+        }
       }
       if (controller.signal.aborted) throw controller.signal.reason;
       if (!body || typeof body !== "object" || typeof body.ok !== "boolean")
@@ -515,8 +584,9 @@ export class AiService extends EventEmitter {
     profile: AiProfile,
     context: unknown,
     signal?: AbortSignal,
+    progress?: (event: StoryInferenceProgress) => void,
   ): Promise<unknown> {
-    return this.invoke(operation, profile, { context }, signal);
+    return this.invoke(operation, profile, { context }, signal, progress);
   }
   test(profile: AiProfile): Promise<TestResult> {
     return this.invoke("test", profile, {});

@@ -1,4 +1,10 @@
 import type { AppSnapshot } from "../shared/types";
+import {
+  resourceKeys,
+  type StateUpdate,
+  type SyncCursor,
+} from "../shared/stateSync";
+import { SyncedState } from "./syncState";
 
 export type StateConnection = "connecting" | "live" | "polling" | "stale";
 type StateSocket = Pick<
@@ -14,15 +20,17 @@ export class AppStateStream {
   private poll?: ReturnType<typeof setInterval>;
   private flight?: Promise<void>;
   private abort?: AbortController;
-  private revision = 0;
+  private readonly state = new SyncedState();
   private lastMessageAt = 0;
-  private lastPollAt = 0;
   private connectedAt = 0;
   private failedRead = false;
 
   constructor(
-    private readonly fetchState: (signal: AbortSignal) => Promise<AppSnapshot>,
-    private readonly openSocket: () => StateSocket,
+    private readonly fetchState: (
+      signal: AbortSignal,
+      cursor?: SyncCursor,
+    ) => Promise<StateUpdate>,
+    private readonly openSocket: (cursor?: SyncCursor) => StateSocket,
     private readonly onState: (state: AppSnapshot) => void,
     private readonly onConnection: (state: StateConnection) => void,
     private readonly onError: (error: string) => void,
@@ -41,7 +49,7 @@ export class AppStateStream {
         this.onConnection(this.failedRead ? "stale" : "polling");
         this.socket.close();
       }
-      if (!this.hasLiveState() || Date.now() - this.lastPollAt >= 10000)
+      if (!this.hasLiveState() || this.state.needsResources())
         void this.refresh();
     }, 3000);
   }
@@ -65,21 +73,27 @@ export class AppStateStream {
   refresh(): Promise<void> {
     if (this.stopped) return Promise.resolve();
     if (this.flight) return this.flight;
-    const revision = this.revision;
+    const instance = this.state.cursor()?.instance;
     const abort = new AbortController();
     this.abort = abort;
-    this.lastPollAt = Date.now();
     const timeout = setTimeout(() => abort.abort(), 8000);
-    this.flight = this.fetchState(abort.signal)
-      .then((snapshot) => {
-        if (this.stopped || this.revision !== revision) return;
+    this.flight = this.fetchState(abort.signal, this.state.cursor())
+      .then((update) => {
+        if (this.stopped) return;
+        const current = this.state.cursor()?.instance;
+        if (current !== instance && current !== update.instance) return;
+        this.accept(update);
         this.failedRead = false;
-        this.onState(snapshot);
         this.onError("");
         this.onConnection(this.hasLiveState() ? "live" : "polling");
       })
       .catch((error: unknown) => {
-        if (this.stopped || this.revision !== revision) return;
+        if (
+          this.stopped ||
+          this.state.cursor()?.instance !== instance ||
+          (this.hasLiveState() && !this.state.needsResources())
+        )
+          return;
         this.failedRead = true;
         this.onError(
           abort.signal.aborted
@@ -98,11 +112,39 @@ export class AppStateStream {
     return this.flight;
   }
 
+  async refreshAfterWrite() {
+    if (this.flight) await this.flight;
+    await this.refresh();
+  }
+
+  private accept(update: StateUpdate) {
+    const validWindow = (
+      window: StateUpdate["logs"] | StateUpdate["history"],
+    ) =>
+      window &&
+      Number.isSafeInteger(window.start) &&
+      window.start >= 0 &&
+      Array.isArray(window.entries);
+    if (
+      !update ||
+      typeof update.instance !== "string" ||
+      !Number.isSafeInteger(update.sequence) ||
+      !update.live?.device ||
+      !update.live.channels ||
+      !validWindow(update.logs) ||
+      !validWindow(update.history) ||
+      !resourceKeys.every((key) => Number.isSafeInteger(update.versions?.[key]))
+    )
+      throw new Error("状态消息缺少数据");
+    const view = this.state.apply(update);
+    if (view) this.onState(view);
+  }
+
   private connect() {
     if (this.stopped) return;
     let socket: StateSocket;
     try {
-      socket = this.openSocket();
+      socket = this.openSocket(this.state.cursor());
     } catch {
       this.onError("无法建立实时状态连接，正在使用轮询。");
       this.onConnection(this.failedRead ? "stale" : "polling");
@@ -112,31 +154,23 @@ export class AppStateStream {
     this.socket = socket;
     this.connectedAt = Date.now();
     this.lastMessageAt = 0;
-    socket.onopen = () => {
-      if (this.stopped || this.socket !== socket) return;
-      // OPEN alone says nothing about whether state messages are arriving.
-      void this.refresh();
-    };
     socket.onmessage = (event) => {
       if (this.stopped || this.socket !== socket) return;
       try {
         const message = JSON.parse(String(event.data));
+        if (message.type === "heartbeat") {
+          if (this.lastMessageAt) this.lastMessageAt = Date.now();
+          return;
+        }
         if (message.type !== "state") return;
-        if (
-          !message.data ||
-          typeof message.data !== "object" ||
-          !message.data.device ||
-          !message.data.channels ||
-          !Array.isArray(message.data.waveforms) ||
-          !Array.isArray(message.data.logs)
-        )
-          throw new Error("状态消息缺少数据");
-        this.revision++;
-        this.failedRead = false;
+        this.accept(message.data);
         this.lastMessageAt = Date.now();
-        this.onState(message.data as AppSnapshot);
-        this.onConnection("live");
-        this.onError("");
+        this.onConnection(this.state.hasBaseline() ? "live" : "connecting");
+        if (this.state.needsResources()) void this.refresh();
+        else {
+          this.failedRead = false;
+          this.onError("");
+        }
       } catch {
         this.onError("实时状态消息无效，正在改用轮询并重新连接。");
         this.onConnection("polling");

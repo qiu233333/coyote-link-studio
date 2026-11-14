@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { chromium, type Browser, type Page } from "playwright";
+import { chromium, type Browser, type Locator, type Page } from "playwright";
 import { createApplication } from "../server/app.ts";
 import type {
   AppSnapshot,
@@ -672,8 +672,22 @@ try {
   );
   let savedPresetName = "",
     savedPlan: TaskPlan | undefined;
+  const confirmLoad = async (button: Locator) => {
+    const handle = (dialog: import("playwright").Dialog) =>
+      /^载入(预设|后台任务)会替换/.test(dialog.message())
+        ? dialog.accept()
+        : dialog.dismiss();
+    page!.on("dialog", handle);
+    try {
+      await button.click();
+    } finally {
+      page!.off("dialog", handle);
+    }
+  };
   const loadPreset = async (name: string) => {
-    await page!.getByRole("button", { name: new RegExp(`^${name}`) }).click();
+    await confirmLoad(
+      page!.getByRole("button", { name: new RegExp(`^${name}`) }),
+    );
   };
   const consoleEditor: Editor = {
     name: "console",
@@ -751,9 +765,9 @@ try {
     name: "locked-task",
     load: async () => {
       await navigate("AI 上锁任务");
-      await page!
-        .getByRole("button", { name: /^倍率验收 AI 保留原稿/ })
-        .click();
+      await confirmLoad(
+        page!.getByRole("button", { name: /^倍率验收 AI 保留原稿/ }),
+      );
     },
     saveButton: () =>
       page!.getByRole("button", { name: "保存草稿", exact: true }),
@@ -799,7 +813,9 @@ try {
   await aiEditor.save("重新载入");
   assert.ok(savedPlan);
   await scale("A", 2);
-  await page.getByRole("button", { name: /^倍率验收 AI-重新载入/ }).click();
+  await confirmLoad(
+    page.getByRole("button", { name: /^倍率验收 AI-重新载入/ }),
+  );
   await multipliers();
   await values([2, 4], [4, 10]);
   await scale("A", 2);

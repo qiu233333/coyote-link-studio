@@ -132,10 +132,10 @@ try {
   );
 
   // Reproduce telemetry edge cases as read-only snapshots; the simulator remains isolated.
-  const snapshot = app.controller.snapshot.bind(app.controller);
+  const snapshot = app.controller.liveState.bind(app.controller);
   const baseline = structuredClone(snapshot());
   let view = structuredClone(baseline);
-  app.controller.snapshot = () => view;
+  app.controller.liveState = () => view;
   const publish = async () => {
     app.controller.broadcast(true);
     await page.waitForTimeout(250);
@@ -184,7 +184,7 @@ try {
   await latest.locator(".ai-action-details > summary").click();
   await latest.screenshot({ path: resolve(artifacts, "mobile-collapsed.png") });
   checks.push("390px 展开和收起无水平溢出");
-  app.controller.snapshot = snapshot;
+  app.controller.liveState = snapshot;
   patch = { action: "rest", channels: ["A"] };
   await send();
   await until(() => app.device.state.intensities.A === 0);

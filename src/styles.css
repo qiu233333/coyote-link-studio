@@ -8564,3 +8564,26 @@ body:has(.story-saves-content) .emergency-bar {
     gap: 8px 14px;
   }
 }
+.draft-controls {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: .35rem .85rem;
+  margin: .5rem 0;
+  color: var(--muted, #586780);
+  font-size: .8rem;
+}
+
+.draft-attention {
+  padding: .5rem .75rem;
+  border-radius: .65rem;
+  background: #fff1f6;
+  color: #823c63;
+}
+.story-preview-message {
+  border: 1px dashed #b5c8ef;
+}
+.story-preview-message strong {
+  color: var(--muted, #586780);
+  font-size: .8rem;
+}

@@ -1,4 +1,5 @@
 import {
+  memo,
   useEffect,
   useId,
   useMemo,
@@ -12,7 +13,7 @@ import type {
   ChannelValues,
   ControlBounds,
   Stage,
-  Waveform,
+  WaveformSummary,
 } from "../shared/types";
 
 export function IconButton({
@@ -331,7 +332,7 @@ export function WaveSelect({
 }: {
   value: string;
   onChange: (id: string) => void;
-  waveforms: Waveform[];
+  waveforms: WaveformSummary[];
   disabled?: boolean;
   label?: string;
 }) {
@@ -344,6 +345,9 @@ export function WaveSelect({
         disabled={disabled}
       >
         <option value="">选择波形</option>
+        {value && !waveforms.some((wave) => wave.id === value) && (
+          <option value={value}>波形已删除或不可用</option>
+        )}
         {waveforms.map((w) => (
           <option key={w.id} value={w.id}>
             {w.name}
@@ -386,7 +390,7 @@ export function ChannelChips({
     </div>
   );
 }
-export const defaultBounds = (waves: Waveform[]): ControlBounds => ({
+export const defaultBounds = (waves: WaveformSummary[]): ControlBounds => ({
   channels: ["A", "B"],
   waveformIds: waves.slice(0, 3).map((w) => w.id),
   minIntensity: { A: 0, B: 0 },
@@ -422,7 +426,7 @@ export function BoundsEditor({
 }: {
   bounds: ControlBounds;
   onChange: (b: ControlBounds) => void;
-  waves: Waveform[];
+  waves: WaveformSummary[];
   disabled?: boolean;
   deviceLimits?: ChannelValues;
 }) {
@@ -450,6 +454,24 @@ export function BoundsEditor({
       </div>
       <Field label="允许使用的波形" hint="AI 仅能从勾选的波形中选择。">
         <div className="wave-checks">
+          {bounds.waveformIds
+            .filter((id) => !waves.some((wave) => wave.id === id))
+            .map((id) => (
+              <button
+                type="button"
+                className="choice-chip"
+                key={id}
+                onClick={() =>
+                  patch({
+                    waveformIds: bounds.waveformIds.filter(
+                      (value) => value !== id,
+                    ),
+                  })
+                }
+              >
+                移除缺失波形 {id}
+              </button>
+            ))}
           {waves.map((w) => (
             <label
               key={w.id}
@@ -599,38 +621,24 @@ export function BoundsEditor({
   );
 }
 
-export function WaveGraph({
-  frames,
+const emptyPreview = [0, 0];
+export const WaveGraph = memo(function WaveGraph({
+  values = emptyPreview,
   color = "blue",
   compact = false,
 }: {
-  frames: string[];
+  values?: number[];
   color?: "blue" | "pink";
   compact?: boolean;
 }) {
   const points = useMemo(() => {
-    const total = frames.length * 4;
-    const count = Math.min(100, total);
-    const values = Array.from({ length: count }, (_, i) => {
-      const offset = Math.floor((i * total) / Math.max(1, count));
-      const frame = frames[Math.floor(offset / 4)];
-      return frame && /^[0-9a-f]{16}$/i.test(frame)
-        ? Math.min(
-            100,
-            parseInt(
-              frame.slice(8 + (offset % 4) * 2, 10 + (offset % 4) * 2),
-              16,
-            ),
-          )
-        : 0;
-    });
-    return (values.length > 1 ? values : [0, 0])
+    return (values.length > 1 ? values : emptyPreview)
       .map(
         (v, i, a) =>
           `${((i * 300) / (a.length - 1)).toFixed(1)},${(65 - (v / 100) * 52).toFixed(1)}`,
       )
       .join(" ");
-  }, [frames]);
+  }, [values]);
   const id = useId().replaceAll(":", "");
   return (
     <svg
@@ -658,29 +666,10 @@ export function WaveGraph({
       />
     </svg>
   );
-}
+});
 
-export function WaveMetadata({ waveform }: { waveform: Waveform }) {
-  const range = useMemo(() => {
-    let minFrequency = 255,
-      maxFrequency = 0,
-      minAmplitude = 100,
-      maxAmplitude = 0;
-    for (const frame of waveform.frames) {
-      if (!/^[0-9a-f]{16}$/i.test(frame)) continue;
-      for (let offset = 0; offset < 16; offset += 2) {
-        const value = parseInt(frame.slice(offset, offset + 2), 16);
-        if (offset < 8) {
-          minFrequency = Math.min(minFrequency, value);
-          maxFrequency = Math.max(maxFrequency, value);
-        } else {
-          minAmplitude = Math.min(minAmplitude, value);
-          maxAmplitude = Math.max(maxAmplitude, value);
-        }
-      }
-    }
-    return { minFrequency, maxFrequency, minAmplitude, maxAmplitude };
-  }, [waveform.frames]);
+export function WaveMetadata({ waveform }: { waveform: WaveformSummary }) {
+  const { range } = waveform;
   return (
     <div className="wave-metadata">
       <span>

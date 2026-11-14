@@ -1,6 +1,8 @@
 import { ActionCard } from "./ActionCard";
 import { storyAction } from "./actionCardModel";
-import { useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { DraftBar, useDraft, useDraftStore } from "./drafts";
+import { storyInputDraft, textDraft } from "./draftSchemas";
 import {
   BookOpen,
   Plus,
@@ -36,7 +38,18 @@ import {
 } from "../shared/roleplay";
 import { request, type Action } from "./api";
 import { Badge, Field, Modal, NumberInput } from "./ui";
-import { STORY_FORMAT_MAX_RETRIES } from "../shared/executionPolicy";
+import type {
+  StoryBootstrap,
+  StoryDelta,
+  StorySignal,
+  StorySync,
+} from "../shared/storyFeed";
+import {
+  mergeStoryMessages,
+  StoryFeedClient,
+  StoryProgressView,
+} from "./storyFeedClient";
+import { StoryPreviewMessage, StoryWaiting } from "./StoryGeneration";
 import type { StorySource } from "../shared/storyState";
 import { StoryStatePanel } from "./StoryStatePanel";
 import { StorySaves, type StorySaveView } from "./StorySaves";
@@ -63,19 +76,8 @@ type StoryList = {
   updatedAt: number;
 }[];
 type StoryDetails = RoleplaySession & { sourceAvailable?: boolean };
-type StoryStatus = Pick<
-  StoryDetails,
-  | "id"
-  | "title"
-  | "revision"
-  | "updatedAt"
-  | "memory"
-  | "turnId"
-  | "sourceAvailable"
-> &
-  Partial<Pick<RoleplaySession, "storyState">>;
+const emptyProgress = new StoryProgressView();
 const panelPreference = "coyote.story-state-open";
-const storySelection = "coyote.selected-story";
 function defaultBranchName(title: string, stories: StoryList) {
   const names = new Set(stories.map((story) => story.title));
   let index = 1;
@@ -113,6 +115,17 @@ async function dataUrl(file: File) {
     r.readAsDataURL(file);
   });
 }
+const StoryActionCard = memo(function StoryActionCard({
+  message,
+  state,
+}: {
+  message: StoryMessage;
+  state?: AppSnapshot;
+}) {
+  const record = storyAction(message);
+  return record ? <ActionCard record={record} state={state} /> : null;
+});
+
 export default function RoleplayPage({
   state,
   action,
@@ -159,13 +172,20 @@ export default function RoleplayPage({
   const [linkDialog, setLinkDialog] = useState(false),
     [bounds, setBounds] = useState<RoleplayBounds>(initialBounds);
   const [startWithLink, setStartWithLink] = useState(true);
-  const [input, setInput] = useState(""),
-    [busy, setBusy] = useState(false),
+  const draftStore = useDraftStore();
+  const inputDraft = useDraft(`story:${session?.id ?? ""}`, storyInputDraft);
+  const input = inputDraft.value?.text ?? "";
+  const setInput = (text: string) =>
+    inputDraft.cell.write(
+      text ? { text, editId: crypto.randomUUID() } : undefined,
+    );
+  const [busy, setBusy] = useState(false),
     [notice, setNotice] = useState("");
   const selected = useRef<string | null>(null),
     viewport = useRef<HTMLDivElement>(null),
     sourceArticle = useRef<HTMLElement>(null),
-    stateVersion = useRef(0),
+    baseline = useRef<StoryBootstrap>(undefined),
+    streamRef = useRef<StoryFeedClient>(undefined),
     openRequest = useRef(0),
     sourceRequest = useRef(0),
     followLatest = useRef(true),
@@ -175,6 +195,17 @@ export default function RoleplayPage({
   const [saveView, setSaveView] = useState<StorySaveView>();
   const [saveFeedback, setSaveFeedback] = useState("");
   const [following, setFollowing] = useState(true);
+  const [unseen, setUnseen] = useState(false);
+  const [syncError, setSyncError] = useState("");
+  const [bookmarkVersion, setBookmarkVersion] = useState(0);
+  const [progress, setProgress] = useState(emptyProgress);
+  const follow = useCallback(() => {
+    if (followLatest.current && viewport.current)
+      viewport.current.scrollTop = viewport.current.scrollHeight;
+  }, []);
+  const cancel = useCallback(() => {
+    void action(base + "/cancel", {});
+  }, [action]);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [wide, setWide] = useState(
     () => matchMedia("(min-width: 1024px)").matches,
@@ -214,7 +245,7 @@ export default function RoleplayPage({
     void loadLists()
       .then((stories) => {
         if (openRequest.current) return;
-        const last = sessionStorage.getItem(storySelection);
+        const last = draftStore.preference("story", textDraft, "");
         if (last && stories.some((story) => story.id === last))
           return open(last);
         if (state.roleplay?.activeSessionId)
@@ -223,122 +254,119 @@ export default function RoleplayPage({
       .catch((e) => setNotice(e.message));
   }, []);
   async function open(id: string) {
+    if (id === selected.current && streamRef.current)
+      return streamRef.current.refresh();
     const requestNumber = ++openRequest.current;
-    const [s, m] = await Promise.all([
-      request<StoryDetails>(`${base}/sessions/${id}`, undefined, "GET"),
-      request<{ items: StoryMessage[]; cursor?: number }>(
-        `${base}/sessions/${id}/messages`,
+    const initial = await request<StoryBootstrap>(
+      `${base}/sessions/${id}/sync?initial=1`,
+      undefined,
+      "GET",
+    );
+    const latestTurn = initial.turn;
+    settleStoryInput(id, latestTurn);
+    const sent = draftStore.cell(`story:${id}`, storyInputDraft).snapshot()
+      .value?.sent;
+    if (sent?.turnId && sent.requestId !== latestTurn?.requestId) {
+      void request<RoleplayTurn>(
+        `${base}/sessions/${id}/turns/${sent.turnId}`,
         undefined,
         "GET",
-      ),
-    ]);
-    const latestTurn = s.turnId
-      ? await request<RoleplayTurn>(
-          `${base}/sessions/${id}/turns/${s.turnId}`,
-          undefined,
-          "GET",
-        )
-      : undefined;
-    if (openRequest.current !== requestNumber) return;
-    const switching = selected.current !== id;
-    selected.current = id;
-    if (switching) {
-      sessionStorage.setItem(storySelection, id);
-      sourceRequest.current++;
-      setSourceMessage(undefined);
-      setInput("");
-      setSaveView(undefined);
-      setSaveFeedback("");
-      setLibraryOpen(false);
-      followLatest.current = true;
-      setFollowing(true);
-      stateVersion.current = s.storyState.version;
-      setSession(s);
-      setMessages(m.items);
-      setCursor(m.items.length === 50 ? m.cursor : undefined);
-      setTurn(latestTurn);
-    } else {
-      updateStory(s, m.items, latestTurn);
+      )
+        .then((turn) => settleStoryInput(id, turn))
+        .catch(() => undefined);
     }
+    if (openRequest.current !== requestNumber) return;
+    streamRef.current?.stop();
+    streamRef.current = undefined;
+    baseline.current = initial;
+    selected.current = id;
+    draftStore.setPreference("story", id);
+    sourceRequest.current++;
+    setSourceMessage(undefined);
+    setSaveView(undefined);
+    setSaveFeedback("");
+    setLibraryOpen(false);
+    followLatest.current = true;
+    setFollowing(true);
+    setUnseen(false);
+    setSyncError("");
+    setProgress(emptyProgress);
+    setBookmarkVersion(initial.signal.bookmarkVersion);
+    setSession(initial.story);
+    setMessages(initial.items);
+    setCursor(initial.earlier);
+    setTurn(latestTurn);
   }
-  function updateStory(
-    s: StoryStatus,
-    items: StoryMessage[],
-    latestTurn?: RoleplayTurn,
-  ) {
-    if (s.storyState)
-      stateVersion.current = Math.max(
-        stateVersion.current,
-        s.storyState.version,
-      );
+  function updateStory(delta: StoryDelta, signal: StorySignal) {
+    const { status: s, items, turn: latestTurn, bookmarks, reset } = delta;
+    if (selected.current !== s.id) return;
+    settleStoryInput(s.id, latestTurn);
     setSession((old) => {
       if (old?.id !== s.id) return old;
       return {
-        ...(old.revision > s.revision ? old : { ...old, ...s }),
+        ...(!reset && old.revision > s.revision ? old : { ...old, ...s }),
         storyState:
-          s.storyState && s.storyState.version >= old.storyState.version
+          s.storyState &&
+          (reset || s.storyState.version >= old.storyState.version)
             ? s.storyState
             : old.storyState,
       };
     });
-    if (latestTurn)
-      setTurn((old) =>
-        old?.sessionId === s.id &&
-        (old.revision > latestTurn.revision ||
-          (old.id === latestTurn.id &&
-            old.status !== "pending" &&
-            latestTurn.status === "pending"))
-          ? old
-          : latestTurn,
-      );
-    setMessages((old) => {
-      const merged = new Map(old.map((message) => [message.seq, message]));
-      for (const message of items) merged.set(message.seq, message);
-      return [...merged.values()].sort((a, b) => a.seq - b.seq);
-    });
+    setTurn(latestTurn);
+    if (items.length && !followLatest.current) setUnseen(true);
+    setMessages((old) =>
+      mergeStoryMessages(reset ? [] : old, items, bookmarks),
+    );
+    if (reset) setCursor(delta.earlier);
+    setBookmarkVersion(signal.bookmarkVersion);
+    if (bookmarks)
+      setSourceMessage((old) => {
+        if (!old?.nodeRound || !!old.bookmarked === bookmarks.includes(old.id))
+          return old;
+        return { ...old, bookmarked: bookmarks.includes(old.id) };
+      });
+  }
+  function settleStoryInput(id: string, latest?: RoleplayTurn) {
+    if (!latest) return;
+    const cell = draftStore.cell(`story:${id}`, storyInputDraft);
+    const { value, revision } = cell.snapshot();
+    if (!value?.sent || value.sent.requestId !== latest.requestId) return;
+    if (latest.status === "pending") {
+      if (!value.sent.turnId) {
+        cell.write(
+          {
+            ...value,
+            sent: { requestId: latest.requestId, turnId: latest.id },
+          },
+          revision,
+        );
+        cell.flush();
+      }
+      return;
+    }
+    cell.write(
+      latest.status === "completed" ? undefined : { ...value, sent: undefined },
+      revision,
+    );
+    cell.flush();
   }
   useEffect(() => {
-    if (!session) return;
-    const abort = new AbortController();
-    const id = session.id;
-    let pending = false;
-    const poll = async () => {
-      if (pending) return;
-      pending = true;
-      try {
-        const s = await request<StoryStatus>(
-          `${base}/sessions/${id}?status=1&stateVersion=${stateVersion.current}`,
-          undefined,
-          "GET",
-          abort.signal,
-        );
-        if (selected.current !== id || abort.signal.aborted) return;
-        const latestTurn = s.turnId
-          ? await request<RoleplayTurn>(
-              `${base}/sessions/${id}/turns/${s.turnId}`,
-              undefined,
-              "GET",
-              abort.signal,
-            )
-          : undefined;
-        const m = await request<{ items: StoryMessage[] }>(
-          `${base}/sessions/${id}/messages`,
-          undefined,
-          "GET",
-          abort.signal,
-        );
-        if (!abort.signal.aborted && selected.current === id)
-          updateStory(s, m.items, latestTurn);
-      } catch (e) {
-        if (!abort.signal.aborted) setNotice((e as Error).message);
-      } finally {
-        pending = false;
-      }
-    };
-    const timer = setInterval(() => void poll(), 1500);
+    if (!session || baseline.current?.story.id !== session.id) return;
+    const path = `${base}/sessions/${session.id}`;
+    const stream = new StoryFeedClient(
+      baseline.current,
+      (params, signal) =>
+        request<StorySync>(`${path}/sync?${params}`, undefined, "GET", signal),
+      () => new EventSource(`${path}/events`),
+      updateStory,
+      setSyncError,
+    );
+    streamRef.current = stream;
+    setProgress(stream.progress);
+    stream.start();
     return () => {
-      clearInterval(timer);
-      abort.abort();
+      stream.stop();
+      if (streamRef.current === stream) streamRef.current = undefined;
     };
   }, [session?.id]);
   useEffect(() => {
@@ -351,7 +379,7 @@ export default function RoleplayPage({
     if (viewport.current) viewport.current.scrollTop = 0;
     sourceArticle.current?.scrollIntoView({ block: "nearest" });
     sourceArticle.current?.focus({ preventScroll: true });
-  }, [sourceMessage]);
+  }, [sourceMessage?.id]);
   async function locateSource(source: StorySource) {
     if (!session) return;
     const id = session.id;
@@ -379,6 +407,7 @@ export default function RoleplayPage({
     setSourceMessage(undefined);
     followLatest.current = true;
     setFollowing(true);
+    setUnseen(false);
     if (viewport.current) {
       viewport.current.focus({ preventScroll: true });
       viewport.current.scrollTop = viewport.current.scrollHeight;
@@ -469,35 +498,57 @@ export default function RoleplayPage({
       }
     });
   }
-  async function send(text = input) {
+  async function send(text = input, retryOf?: string) {
     if (
       !session ||
       selected.current !== session.id ||
       !text.trim() ||
       busy ||
       sending.current ||
+      (turn?.status === "pending" &&
+        inputDraft.value?.sent?.requestId === turn.requestId &&
+        text === input) ||
       locked ||
       (activeRun && !run)
     )
       return;
     const navigationAtSend = openRequest.current;
+    const id = session.id;
+    const requestId = crypto.randomUUID();
+    const cell = inputDraft.cell;
+    if (inputDraft.value && text === input) {
+      cell.write(
+        { ...inputDraft.value, sent: { requestId } },
+        inputDraft.revision,
+      );
+      cell.flush();
+    }
     sending.current = true;
     try {
       await task(async () => {
         const result = await action<RoleplayTurn>(
           `${base}/sessions/${session.id}/messages`,
-          { text, requestId: crypto.randomUUID(), revision: session.revision },
+          {
+            text,
+            requestId,
+            revision: session.revision,
+            ...(retryOf && { retryOf }),
+          },
         );
+        if (result) settleStoryInput(id, result);
+        else {
+          const { value, revision } = cell.snapshot();
+          if (value?.sent?.requestId === requestId) {
+            cell.write({ ...value, sent: undefined }, revision);
+            cell.flush();
+          }
+        }
         if (
           selected.current !== session.id ||
           openRequest.current !== navigationAtSend
         )
           return;
-        if (result) {
-          setInput("");
-          setTurn(result);
-          await open(session.id);
-        }
+        if (result) await streamRef.current?.refresh();
       });
     } finally {
       sending.current = false;
@@ -812,11 +863,7 @@ export default function RoleplayPage({
                             "PATCH",
                           );
                           if (r && selected.current === session.id)
-                            setSession((old) =>
-                              old?.id === r.id
-                                ? { ...old, title: r.title }
-                                : old,
-                            );
+                            await streamRef.current?.refresh();
                           await loadLists();
                         });
                     }}
@@ -855,10 +902,15 @@ export default function RoleplayPage({
                             "DELETE",
                           );
                           if (r) {
-                            openRequest.current++;
-                            setSession(null);
-                            selected.current = null;
-                            sessionStorage.removeItem(storySelection);
+                            draftStore
+                              .cell(`story:${session.id}`, storyInputDraft)
+                              .deleteEntity();
+                            if (selected.current === session.id) {
+                              openRequest.current++;
+                              setSession(null);
+                              selected.current = null;
+                              draftStore.setPreference("story", "");
+                            }
                             await loadLists();
                           }
                         });
@@ -1063,6 +1115,7 @@ export default function RoleplayPage({
                     )}
                   </details>
                   <div className="story-history-actions">
+                    {unseen && !sourceMessage && <span>有新消息</span>}
                     {sourceMessage && (
                       <span>正在查看第 {sourceMessage.seq} 条回复</span>
                     )}
@@ -1090,6 +1143,7 @@ export default function RoleplayPage({
                         scrollHeight - scrollTop - clientHeight < 48;
                       followLatest.current = nearLatest;
                       setFollowing(nearLatest);
+                      if (nearLatest) setUnseen(false);
                     }}
                   >
                     {cursor && !sourceMessage && (
@@ -1108,12 +1162,9 @@ export default function RoleplayPage({
                             if (selected.current !== session.id) return;
                             followLatest.current = false;
                             setFollowing(false);
-                            setMessages((old) => [
-                              ...page.items,
-                              ...old.filter(
-                                (m) => !page.items.some((p) => p.id === m.id),
-                              ),
-                            ]);
+                            setMessages((old) =>
+                              mergeStoryMessages(old, page.items),
+                            );
                             setCursor(
                               page.items.length === 50
                                 ? page.cursor
@@ -1163,9 +1214,15 @@ export default function RoleplayPage({
                           </details>
                         )}
                         {(m.control || m.actionRecord) && (
-                          <ActionCard
-                            record={storyAction(m)!}
-                            state={m.inheritedFrom ? undefined : state}
+                          <StoryActionCard
+                            message={m}
+                            state={
+                              !m.inheritedFrom &&
+                              m.actionRecord &&
+                              m.actionRecord.id === state.run?.lastAction?.id
+                                ? state
+                                : undefined
+                            }
                           />
                         )}
                         {m.nodeRound ? (
@@ -1210,25 +1267,42 @@ export default function RoleplayPage({
                         )}
                       </article>
                     ))}
+                    {!sourceMessage && (
+                      <StoryPreviewMessage
+                        view={progress}
+                        turn={turn}
+                        follow={follow}
+                      />
+                    )}
                   </div>
-                  {turn?.status === "pending" && (
-                    <div className="story-thinking">
-                      <Sparkles size={16} />{" "}
-                      {turn.retryKind === "format" && turn.formatAttempt
-                        ? `正在调整回复格式 ${turn.formatAttempt}/${STORY_FORMAT_MAX_RETRIES}${run?.status === "running" ? "，保持当前输出" : ""}`
-                        : turn.attempt
-                          ? `模型暂时不可用，保持输出并重试 ${turn.attempt}/20`
-                          : "角色正在构思下一幕…"}
-                      <button onClick={() => void action(base + "/cancel", {})}>
-                        取消生成
-                      </button>
-                    </div>
+                  {turn && (
+                    <StoryWaiting view={progress} turn={turn} cancel={cancel} />
+                  )}
+                  {syncError && (
+                    <p className="field-hint" role="status">
+                      故事同步暂不可用：{syncError}
+                    </p>
                   )}
                   {turn?.error && (
                     <div role="status" className="notice notice-pink">
                       {turn.error} · 输入仍可重新发送。
                     </div>
                   )}
+                  {turn &&
+                    ["failed", "cancelled", "interrupted"].includes(
+                      turn.status,
+                    ) &&
+                    latestMessage?.role === "user" &&
+                    latestMessage.turnId === (turn.retryOf ?? turn.id) && (
+                      <button
+                        type="button"
+                        className="button small secondary"
+                        disabled={busy || locked || !!(activeRun && !run)}
+                        onClick={() => void send(latestMessage.text, turn.id)}
+                      >
+                        重试本轮
+                      </button>
+                    )}
                   {replyOptions.length === 3 && (
                     <div
                       className="story-quick-replies"
@@ -1298,6 +1372,7 @@ export default function RoleplayPage({
                       发送
                     </button>
                   </form>
+                  <DraftBar draft={inputDraft} label="丢弃这条回复草稿" />
                   <p className="field-hint">Enter 发送 · Shift+Enter 换行</p>
                   <details className="story-memory">
                     <summary>六部分故事记忆</summary>
@@ -1357,18 +1432,12 @@ export default function RoleplayPage({
           onView={setSaveView}
           storyId={session.id}
           title={session.title}
+          bookmarkVersion={bookmarkVersion}
           branchName={defaultBranchName(session.title, stories)}
           locked={locked}
-          onBookmarkChange={(messageId, bookmarked, feedback) => {
+          onBookmarkChange={(_messageId, _bookmarked, feedback) => {
             if (selected.current !== session.id) return;
-            setMessages((old) =>
-              old.map((message) =>
-                message.id === messageId ? { ...message, bookmarked } : message,
-              ),
-            );
-            setSourceMessage((old) =>
-              old?.id === messageId ? { ...old, bookmarked } : old,
-            );
+            void streamRef.current?.refresh();
             setSaveFeedback(feedback);
           }}
           onBranch={async (id) => {

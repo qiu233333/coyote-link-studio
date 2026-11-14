@@ -11,6 +11,7 @@ import { story } from "../lib/roleplay.ts";
 import * as inference from "../lib/inference.ts";
 import { safeInferenceError } from "../lib/errors.ts";
 import { profileSchema } from "../lib/schemas.ts";
+import type { StoryInferenceProgress } from "../../shared/storyFeed.ts";
 
 interface ActiveInference {
   controller: AbortController;
@@ -41,6 +42,8 @@ const json = (data: unknown, status = 200) =>
 async function run(
   request: Request,
   operation: "test" | "decide" | "draft" | "roleplay" | "card" | "summarize",
+  progress?: (event: StoryInferenceProgress) => void,
+  transport?: AbortSignal,
 ) {
   if (!authorized(request))
     return json({ ok: false, error: "Unauthorized" }, 401);
@@ -52,6 +55,9 @@ async function run(
   let abort: (() => void) | undefined;
   let current: ActiveInference | undefined;
   let settle: (() => void) | undefined;
+  const upstream = transport
+    ? AbortSignal.any([request.signal, transport])
+    : request.signal;
   try {
     const raw = await request.text();
     if (raw.length > 524288) return json({ ok: false, error: "请求过大" }, 413);
@@ -88,8 +94,8 @@ async function run(
     };
     active.set(requestId, current);
     abort = () => controller.abort(new DOMException("Cancelled", "AbortError"));
-    request.signal.addEventListener("abort", abort, { once: true });
-    if (request.signal.aborted) abort();
+    upstream.addEventListener("abort", abort, { once: true });
+    if (upstream.aborted) abort();
     timer = setTimeout(
       () => controller.abort(new DOMException("Timed out", "TimeoutError")),
       aiTimeoutSeconds(profile, operation) * 1000,
@@ -100,6 +106,7 @@ async function run(
           profile,
           payload.context,
           controller.signal,
+          progress,
         )
       : operation === "test"
         ? await inference.test(profile, controller.signal)
@@ -141,7 +148,7 @@ async function run(
     return json({ ok: false, ...classified }, 502);
   } finally {
     if (timer) clearTimeout(timer);
-    if (abort) request.signal.removeEventListener("abort", abort);
+    if (abort) upstream.removeEventListener("abort", abort);
     // A rejected duplicate must never delete another request's controller.
     if (requestId && current && active.get(requestId) === current)
       active.delete(requestId);
@@ -151,6 +158,49 @@ async function run(
       if (now - time > (AI_TIMEOUT_MAX_SEC + 60) * 1000) cancelled.delete(id);
     profile = undefined;
   }
+}
+
+async function roleplayResponse(request: Request) {
+  if (!request.headers.get("accept")?.includes("application/x-ndjson"))
+    return run(request, "roleplay");
+  if (!authorized(request))
+    return json({ ok: false, error: "Unauthorized" }, 401);
+  const transport = new AbortController();
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const send = (data: unknown) => {
+        if (!transport.signal.aborted)
+          controller.enqueue(encoder.encode(JSON.stringify(data) + "\n"));
+      };
+      void run(request, "roleplay", send, transport.signal)
+        .then(async (response) =>
+          send({ type: "result", data: await response.json() }),
+        )
+        .catch(() =>
+          send({
+            type: "result",
+            data: {
+              ok: false,
+              errorCode: "AI_REQUEST_FAILED",
+              error: "AI 请求失败。",
+            },
+          }),
+        )
+        .finally(() => {
+          if (!transport.signal.aborted) controller.close();
+        });
+    },
+    cancel() {
+      transport.abort();
+    },
+  });
+  return new Response(body, {
+    headers: {
+      "content-type": "application/x-ndjson; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
 }
 
 export default defineChannel({
@@ -167,7 +217,7 @@ export default defineChannel({
           })
         : json({ ok: false, error: "Unauthorized" }, 401),
     ),
-    POST("/internal/roleplay", (request) => run(request, "roleplay")),
+    POST("/internal/roleplay", roleplayResponse),
     POST("/internal/card", (request) => run(request, "card")),
     POST("/internal/summarize", (request) => run(request, "summarize")),
     POST("/internal/test", (request) => run(request, "test")),

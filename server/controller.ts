@@ -33,7 +33,16 @@ import type {
   Stage,
   TaskPlan,
   Waveform,
+  WaveformSummary,
 } from "../shared/types.js";
+import {
+  HISTORY_WINDOW,
+  LOG_WINDOW,
+  type LiveState,
+  type StateResources,
+  type ResourceKey,
+} from "../shared/stateSync.js";
+import { summarizeWave } from "./waveSummary.js";
 import { AppError, assert } from "./errors.js";
 import { Store } from "./store.js";
 import { AiServiceError } from "./ai.js";
@@ -76,6 +85,20 @@ const decisionSchema = z.object({
   stageDurationSec: z.number().min(0.1).max(86400).optional(),
 });
 
+function recentWindow<T>(
+  items: T[],
+  end: number,
+  limit: number,
+  cursor?: number,
+) {
+  const earliest = Math.max(0, end - Math.min(limit, items.length));
+  const start =
+    cursor !== undefined && cursor >= earliest && cursor <= end
+      ? cursor
+      : earliest;
+  return { start, entries: items.slice(items.length - (end - start)) };
+}
+
 export class Controller extends EventEmitter {
   public run: ControlSession | null;
   public config: Record<Channel, ChannelConfig>;
@@ -85,7 +108,14 @@ export class Controller extends EventEmitter {
   public roleplayBusy = false;
   public roleplaySummary?: () => AppSnapshot["roleplay"];
   private logs: LogEntry[];
+  private logEnd = 0;
+  private historyEnd = 0;
   private history: AppSnapshot["history"] = [];
+  private waveRevision = -1;
+  private waveLibrary = new Map<string, Waveform>();
+  private resourceCache: Partial<{
+    [K in ResourceKey]: { revision: number; data: StateResources[K] };
+  }> = {};
   private timer: ReturnType<typeof setInterval>;
   private epoch = 0;
   private actionEpoch = -1;
@@ -156,12 +186,12 @@ export class Controller extends EventEmitter {
     builtins: { name: string; frames: string[] }[] = [],
   ) {
     super();
-    if (!store.list<Waveform>("waveforms").length)
+    if (!this.waves().length)
       for (const waveform of builtins) {
         const item = normalizeWaveform(waveform.frames, waveform.name, true);
         store.set("waveforms", item.id, item);
       }
-    const first = store.list<Waveform>("waveforms")[0]?.id ?? "";
+    const first = this.waves()[0]?.id ?? "";
     this.config = store.get("settings", "channels") ?? {
       A: {
         enabled: true,
@@ -181,6 +211,7 @@ export class Controller extends EventEmitter {
     for (const channel of channels) this.config[channel].target = 0;
     this.synced = store.get<boolean>("settings", "synced") ?? false;
     this.logs = store.list<LogEntry>("logs").slice(0, 500).reverse();
+    this.logEnd = this.logs.length;
     // Normalize saved scalar-era records before any snapshot or frozen run can
     // expose them. Invalid partial maps fail validation instead of gaining zeroes.
     for (const saved of store.list<TaskPlan>("plans"))
@@ -194,7 +225,7 @@ export class Controller extends EventEmitter {
         ...saved,
         config: parsePlayback(saved.config),
       });
-    this.run = store.get<ControlSession>("runtime", "current") ?? null;
+    this.run = store.loadRun();
     if (this.run) {
       if (this.run.bounds) this.run.bounds = parseBounds(this.run.bounds);
       if (this.run.plan) this.run.plan = parsePlan(this.run.plan);
@@ -202,7 +233,6 @@ export class Controller extends EventEmitter {
         this.run.playback = parsePlayback(this.run.playback);
       if (this.run.lastDecision)
         this.run.lastDecision = decisionSchema.parse(this.run.lastDecision);
-      store.set("runtime", "current", this.run);
     }
     if (active(this.run)) {
       this.run!.status = "interrupted";
@@ -210,9 +240,9 @@ export class Controller extends EventEmitter {
       this.run!.reason = "服务重启，原运行已中断，设备输出不会自动恢复。";
       this.run!.termination = { source: "service-restart", at: Date.now() };
       this.run!.inferenceRecovery = undefined;
-      store.set("runtime", "current", this.run);
       this.log("warning", "系统", this.run!.reason);
     }
+    this.persist();
     device.on("state", (state) => {
       // Hardware ceilings may fall between ticks. Immediately lower configured
       // targets and live ramp state without waiting for another scheduler tick.
@@ -374,39 +404,80 @@ export class Controller extends EventEmitter {
       this.log("warning", "控制器", "设备上限降低，已下调目标强度。");
     }
   }
-  snapshot(): AppSnapshot {
+  liveState(): LiveState {
+    const run = this.run;
+    let view: LiveState["run"] = null;
+    if (run) {
+      const { waveformSnapshots: _waves, ...rest } = run;
+      view = rest;
+    }
     return {
+      draftScope: this.store.draftScope,
       actionExecution: this.currentActionExecution(),
       roleplay: this.roleplaySummary?.(),
       device: this.device.state,
       channels: this.config,
       synced: this.synced,
       owner: active(this.run) ? this.run!.owner : "manual",
-      run: this.run,
+      run: view,
       locked: this.isLocked(),
       stopUnconfirmed: this.stopUnconfirmed,
       stopping: this.stopping,
-      waveforms: this.store
-        .list<Waveform>("waveforms")
-        .sort(
-          (a, b) =>
-            Number(b.builtin) - Number(a.builtin) ||
-            a.name.localeCompare(b.name, "zh-CN"),
-        ),
-      logs: this.logs.slice(-300).reverse(),
-      history: this.history,
-      settings: this.store.settings(),
-      plans: this.store.list<TaskPlan>("plans"),
-      presets: this.store.list("presets"),
       aiRuntime: this.ai.status,
     };
   }
+  resource<K extends ResourceKey>(key: K): StateResources[K] {
+    const revision = this.store.revision(key);
+    const cached = this.resourceCache[key] as
+      { revision: number; data: StateResources[K] } | undefined;
+    if (cached?.revision === revision) return cached.data;
+    const read: { [P in ResourceKey]: () => StateResources[P] } = {
+      waveforms: () => {
+        const previous = new Map(
+          this.resourceCache.waveforms?.data.map((wave) => [wave.id, wave]),
+        );
+        return this.waves()
+          .map((wave) => summarizeWave(wave, previous.get(wave.id)))
+          .sort(
+            (a, b) =>
+              Number(b.builtin) - Number(a.builtin) ||
+              a.name.localeCompare(b.name, "zh-CN"),
+          );
+      },
+      settings: () => this.store.settings(),
+      plans: () => this.store.list("plans"),
+      presets: () => this.store.list("presets"),
+    };
+    const data = read[key]();
+    Object.assign(this.resourceCache, { [key]: { revision, data } });
+    return data;
+  }
+  stateOffsets() {
+    return { logs: this.logEnd, history: this.historyEnd };
+  }
+  logWindow(cursor?: number) {
+    return recentWindow(this.logs, this.logEnd, LOG_WINDOW, cursor);
+  }
+  historyWindow(cursor?: number) {
+    return recentWindow(this.history, this.historyEnd, HISTORY_WINDOW, cursor);
+  }
+  snapshot(): AppSnapshot {
+    return {
+      ...this.liveState(),
+      waveforms: this.resource("waveforms"),
+      logs: this.logWindow().entries.reverse(),
+      history: this.historyWindow().entries,
+      settings: this.resource("settings"),
+      plans: this.resource("plans"),
+      presets: this.resource("presets"),
+    };
+  }
   broadcast(force = false) {
-    if (this.closed) return;
+    if (this.closed || !this.listenerCount("state")) return;
     const now = Date.now();
     if (!force && now - this.emitAt < 400) return;
     this.emitAt = now;
-    this.emit("state", this.snapshot());
+    this.emit("state");
   }
   log(
     level: LogEntry["level"],
@@ -423,6 +494,7 @@ export class Controller extends EventEmitter {
       channel,
     };
     this.logs.push(entry);
+    this.logEnd++;
     this.store.set("logs", entry.id, entry);
     if (this.logs.length > 500) {
       const old = this.logs.shift()!;
@@ -431,13 +503,29 @@ export class Controller extends EventEmitter {
     this.broadcast(true);
   }
   private persist() {
-    if (this.run) this.store.set("runtime", "current", this.run);
+    if (this.run) this.store.saveRun(this.run);
   }
   private waves() {
-    return this.store.list<Waveform>("waveforms");
+    this.loadWaves();
+    return [...this.waveLibrary.values()];
   }
-  private requireWave(id: string) {
-    const wave = this.waves().find((w) => w.id === id);
+  private loadWaves() {
+    const revision = this.store.revision("waveforms");
+    if (revision === this.waveRevision) return;
+    this.waveLibrary = new Map(
+      this.store.list<Waveform>("waveforms").map((wave) => [wave.id, wave]),
+    );
+    this.waveRevision = revision;
+  }
+  private saveWave(wave: Waveform) {
+    this.loadWaves();
+    this.store.set("waveforms", wave.id, wave);
+    this.waveLibrary.set(wave.id, wave);
+    this.waveRevision = this.store.revision("waveforms");
+  }
+  requireWave(id: string) {
+    this.loadWaves();
+    const wave = this.waveLibrary.get(id);
     assert(wave, "所选波形不存在。", "WAVEFORM_NOT_FOUND", 404);
     return wave;
   }
@@ -460,7 +548,7 @@ export class Controller extends EventEmitter {
       "DUPLICATE_WAVEFORM",
       409,
     );
-    this.store.set("waveforms", wave.id, wave);
+    this.saveWave(wave);
     this.log(
       "info",
       "波形库",
@@ -470,7 +558,7 @@ export class Controller extends EventEmitter {
   }
   updateWaveform(id: string, patch: { name?: string; favorite?: boolean }) {
     this.assertUnlocked();
-    const wave = this.requireWave(id);
+    const wave = { ...this.requireWave(id) };
     if (patch.name !== undefined) {
       assert(
         patch.name.trim().length > 0 && patch.name.length <= 100,
@@ -482,7 +570,7 @@ export class Controller extends EventEmitter {
       assert(typeof patch.favorite === "boolean", "收藏状态无效。");
       wave.favorite = patch.favorite;
     }
-    this.store.set("waveforms", id, wave);
+    this.saveWave(wave);
     this.broadcast(true);
   }
   deleteWaveform(id: string) {
@@ -495,6 +583,8 @@ export class Controller extends EventEmitter {
       409,
     );
     this.store.delete("waveforms", id);
+    this.waveLibrary.delete(id);
+    this.waveRevision = this.store.revision("waveforms");
     this.broadcast(true);
   }
   savePreset(name: string, config: unknown) {
@@ -657,9 +747,7 @@ export class Controller extends EventEmitter {
     this.store.set("settings", "channels", this.config);
     this.store.set("settings", "synced", false);
     if (active(this.run) && this.run?.mode === "live") {
-      this.run.waveformSnapshots = Object.fromEntries(
-        this.waves().map((wave) => [wave.id, structuredClone(wave)]),
-      );
+      this.includeSelectedWaves(this.run, next);
       this.persist();
     }
     this.log("info", "实时控制", "已更新实时通道");
@@ -777,11 +865,23 @@ export class Controller extends EventEmitter {
       stage.intensity = { A: next.A.target, B: next.B.target };
       stage.waveformId = next.A.waveformId;
       stage.waveformBId = next.B.waveformId;
-      this.run.waveformSnapshots = Object.fromEntries(
-        this.waves().map((w) => [w.id, structuredClone(w)]),
-      );
+      this.includeSelectedWaves(this.run, next, stage.channels);
     }
     this.log("info", "控制台", "已更新通道配置");
+  }
+  private includeSelectedWaves(
+    run: ControlSession,
+    config: Record<Channel, ChannelConfig>,
+    selected = channels,
+  ) {
+    const missing = [
+      ...new Set(selected.map((channel) => config[channel].waveformId)),
+    ].filter((id) => id && !run.waveformSnapshots[id]);
+    if (missing.length)
+      run.waveformSnapshots = {
+        ...run.waveformSnapshots,
+        ...Object.fromEntries(missing.map((id) => [id, this.requireWave(id)])),
+      };
   }
   private checkStage(stage: Stage, bounds?: ControlBounds) {
     if (stage.behavior !== "rest") {
@@ -1019,10 +1119,9 @@ export class Controller extends EventEmitter {
     const now = Date.now();
     const snapshots = Object.fromEntries(
       [...new Set(waveformIds)].map((id) => {
-        const wave = this.requireWave(id);
-        wave.lastUsedAt = now;
-        this.store.set("waveforms", wave.id, wave);
-        return [id, structuredClone(wave)];
+        const wave = { ...this.requireWave(id), lastUsedAt: now };
+        this.saveWave(wave);
+        return [id, wave];
       }),
     );
     this.progressAt = now;
@@ -1226,10 +1325,20 @@ export class Controller extends EventEmitter {
     this.log("info", "上锁任务", `已生成草稿「${plan.title}」，等待编辑和确认`);
     return plan;
   }
-  updatePlan(id: string, input: unknown) {
+  private requirePlan(id: string, expectedVersion?: unknown) {
+    const plan = this.store.get<TaskPlan>("plans", id);
+    assert(plan, "任务草稿不存在。", "NOT_FOUND", 404);
+    assert(
+      expectedVersion === undefined || expectedVersion === plan.version,
+      "后台任务已更新，请核对新版任务。",
+      "TASK_CONFLICT",
+      409,
+    );
+    return plan;
+  }
+  updatePlan(id: string, input: unknown, expectedVersion?: unknown) {
     this.assertUnlocked();
-    const old = this.store.get<TaskPlan>("plans", id);
-    assert(old, "任务草稿不存在。", "NOT_FOUND", 404);
+    const old = this.requirePlan(id, expectedVersion);
     const plan = parsePlan({
       ...(input as object),
       id,
@@ -1241,11 +1350,18 @@ export class Controller extends EventEmitter {
     this.broadcast(true);
     return plan;
   }
-  async startTask(id: string, requestId: string) {
+  deletePlan(id: string, expectedVersion?: unknown) {
+    this.assertIdle();
+    assert(!this.stopUnconfirmed, "设备停止未确认。", "STOP_UNCONFIRMED", 409);
+    this.requirePlan(id, expectedVersion);
+    this.store.delete("plans", id);
+    this.broadcast(true);
+    return { deleted: true };
+  }
+  async startTask(id: string, requestId: string, expectedVersion?: unknown) {
     if (this.seenRequest(requestId)) return;
     this.assertUnlocked();
-    const saved = this.store.get<TaskPlan>("plans", id);
-    assert(saved, "任务草稿不存在。", "NOT_FOUND", 404);
+    const saved = this.requirePlan(id, expectedVersion);
     const plan = parsePlan(saved);
     this.checkBounds(plan.bounds);
     this.requireAi();
@@ -1256,6 +1372,7 @@ export class Controller extends EventEmitter {
       "阶段总时长超过任务最长时间。",
     );
     await this.prepare(requestId);
+    if (expectedVersion !== undefined) this.requirePlan(id, expectedVersion);
     this.checkBounds(plan.bounds);
     for (const stage of plan.stages) this.checkStage(stage, plan.bounds);
     this.profile = this.store.profile();
@@ -1375,7 +1492,7 @@ export class Controller extends EventEmitter {
     this.persist();
     this.log("info", "控制器", "用户已确认恢复，从零重新渐变");
   }
-  async changeBounds(input: unknown) {
+  async changeBounds(input: unknown, expectedRange?: unknown) {
     this.assertUnlocked();
     assert(
       active(this.run) && this.run?.owner === "ai-control",
@@ -1383,9 +1500,19 @@ export class Controller extends EventEmitter {
       "OWNER_CONFLICT",
       409,
     );
+    const checkVersion = () =>
+      assert(
+        expectedRange === undefined ||
+          expectedRange === `${this.run?.id}:${this.run?.boundsVersion}`,
+        "后台授权范围已更新，请核对新版范围。",
+        "RANGE_CONFLICT",
+        409,
+      );
+    checkVersion();
     const bounds = parseBounds(input);
     this.checkBounds(bounds);
     if (this.run.status === "running") await this.pause("ai-control");
+    checkVersion();
     assert(
       this.run.status === "paused" && !this.stopUnconfirmed,
       "无法确认暂停，不允许修改范围。",
@@ -2089,7 +2216,8 @@ export class Controller extends EventEmitter {
     this.tickAt = now;
     if (now - (this.history.at(-1)?.at ?? 0) >= 1000) {
       this.history.push({ at: now, ...this.device.state.intensities });
-      if (this.history.length > 180) this.history.shift();
+      this.historyEnd++;
+      if (this.history.length > HISTORY_WINDOW) this.history.shift();
     }
     if (!active(this.run)) {
       this.broadcast();

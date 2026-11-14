@@ -112,7 +112,7 @@ test("HTTP 本机同源保护、密钥加密、WebSocket 和实际模拟器控�
       websocket!.once("error", reject);
     });
     assert.equal(push.type, "state");
-    assert.equal(push.data.device.protocol, "simulator");
+    assert.equal(push.data.live.device.protocol, "simulator");
     const waveformId = initial.waveforms[0].id;
     const requestId = crypto.randomUUID();
     const config = {
@@ -285,7 +285,11 @@ test("HTTP 本机同源保护、密钥加密、WebSocket 和实际模拟器控�
     assert.equal(
       (
         await call("/api/waveforms/import", {
-          content: initial.waveforms[0].frames,
+          content: (
+            await fetch(url + `/api/waveforms/${waveformId}`).then((r) =>
+              r.json(),
+            )
+          ).data.frames,
         })
       ).status,
       409,

@@ -141,7 +141,7 @@ async function capture(name: string) {
   screenshots.push(path);
 }
 
-async function unchanged(waves: Waveform[], writeCount: number) {
+async function unchanged(waves: AppSnapshot["waveforms"], writeCount: number) {
   const state = await snapshot();
   assert.deepEqual(state.waveforms, waves, "拒绝的导入不得写入或改名波形");
   assert.deepEqual(state.device.intensities, { A: 0, B: 0 });
@@ -163,7 +163,9 @@ async function imported(
   const state = await waitState(`导入 ${expected.name}`, (state) =>
     state.waveforms.some((wave) => wave.name === expected.name),
   );
-  const wave = state.waveforms.find((wave) => wave.name === expected.name)!;
+  const summary = state.waveforms.find((wave) => wave.name === expected.name)!;
+  const wave = (await api(`/api/waveforms/${summary.id}`, undefined, "GET"))
+    .data as Waveform;
   if ("frames" in expected)
     assert.deepEqual(
       wave.frames,
@@ -173,6 +175,7 @@ async function imported(
   const frameCount =
     "frames" in expected ? expected.frames.length : expected.frameCount;
   assert.equal(wave.frames.length, frameCount);
+  assert.equal(summary.frameCount, frameCount);
   assert.equal(wave.durationMs, expected.durationMs);
   if (expected.pulseImport)
     assert.deepEqual(wave.pulseImport, expected.pulseImport);
@@ -849,9 +852,10 @@ try {
     true,
   );
   const locked = await waitState("真实接口锁定任务", (state) => state.locked);
+  assert.ok(!Object.hasOwn(locked.run!, "waveformSnapshots"));
   assert.deepEqual(
-    locked.run?.waveformSnapshots[wave.id],
-    locked.waveforms.find((item) => item.id === wave.id),
+    application.controller.run?.waveformSnapshots[wave.id].frames,
+    wave.frames,
     "锁定任务冻结已导入波形快照",
   );
   await until("锁定导入按钮禁用", () =>

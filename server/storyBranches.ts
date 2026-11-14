@@ -38,6 +38,7 @@ export class StoryBranches {
   constructor(
     private store: Store,
     private assertUnlocked: () => void,
+    private onBookmarkChange: (id: string) => void = () => {},
   ) {}
 
   private story(id: string) {
@@ -121,6 +122,7 @@ export class StoryBranches {
       savedAt: Date.now(),
     };
     this.store.set(bookmarks(storyId), messageId, value);
+    this.onBookmarkChange(storyId);
     return value;
   }
 
@@ -135,6 +137,7 @@ export class StoryBranches {
     assert(existing, "存档不存在", "NOT_FOUND", 404);
     const value = { ...existing, name };
     this.store.set(bookmarks(storyId), messageId, value);
+    this.onBookmarkChange(storyId);
     return value;
   }
 
@@ -142,6 +145,7 @@ export class StoryBranches {
     this.assertUnlocked();
     this.story(storyId);
     this.store.delete(bookmarks(storyId), messageId);
+    this.onBookmarkChange(storyId);
   }
 
   clear(storyId: string) {

@@ -351,7 +351,13 @@ try {
       name: `实时验收波形 ${index + 1}`,
     });
     assert.equal(result.ok, true);
-    fixtures.push(result.data);
+    const detail = await api(
+      `/api/waveforms/${result.data.id}`,
+      undefined,
+      "GET",
+    );
+    assert.equal(detail.ok, true);
+    fixtures.push(detail.data);
   }
   await wave("A").selectOption(fixtures[0].id);
   await wave("B").selectOption(fixtures[1].id);
