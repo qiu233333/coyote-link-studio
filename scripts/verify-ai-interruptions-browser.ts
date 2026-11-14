@@ -393,6 +393,7 @@ try {
   await page.goto(baseUrl, { waitUntil: "networkidle" });
   await state("eve ready", (s) => s.aiRuntime.ready, 120000);
   await navigate("系统设置");
+  await page.getByText("高级设置", { exact: true }).click();
   if (deepseek) {
     await page
       .getByRole("combobox", { name: "AI 服务", exact: true })

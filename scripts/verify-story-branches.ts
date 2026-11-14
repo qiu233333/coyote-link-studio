@@ -204,9 +204,9 @@ try {
       await page.goto(url);
       await openRoleplay();
       await namedStory(sourceTitle).click();
-      await page
-        .getByText("开场白不能作为存档节点。", { exact: true })
-        .waitFor();
+      const greeting = page.locator(".story-message.assistant").first();
+      await greeting.waitFor();
+      assert.equal(await greeting.locator(".story-message-tools").count(), 0);
       const input = page.getByRole("textbox", { name: "回复剧情" });
       await input.fill(opening);
       await input.press("Enter");

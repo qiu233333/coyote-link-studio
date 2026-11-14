@@ -85,7 +85,7 @@ type DraftControlsProps = {
   label?: string;
 };
 const draftMessages: Record<DraftStatus, string> = {
-  empty: "本地自动保存",
+  empty: "",
   saving: "保存中…",
   saved: "本地草稿已保存",
   error: "本地保存失败。请保留此页面并重试。",
@@ -100,6 +100,7 @@ export function DraftControls({
   retry,
   label = "丢弃草稿",
 }: DraftControlsProps) {
+  if (status === "empty") return null;
   return (
     <div
       className={`draft-controls ${["error", "invalid", "conflict"].includes(status) ? "draft-attention" : ""}`}
@@ -121,7 +122,7 @@ export function DraftControls({
               重试保存
             </button>
           )}
-          {discard && status !== "empty" && (
+          {discard && (
             <button type="button" className="text-button" onClick={discard}>
               {label}
             </button>

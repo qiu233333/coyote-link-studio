@@ -561,11 +561,9 @@ export default function RoleplayPage({
     const id = session.id;
     const requestId = crypto.randomUUID();
     const cell = inputDraft.cell;
-    if (inputDraft.value && text === input) {
-      cell.write(
-        { ...inputDraft.value, sent: { requestId } },
-        inputDraft.revision,
-      );
+    const { value, revision } = cell.snapshot();
+    if (value && text === value.text) {
+      cell.write({ ...value, sent: { requestId } }, revision);
       cell.flush();
     }
     sending.current = true;
@@ -752,12 +750,8 @@ export default function RoleplayPage({
     );
   return (
     <div className="roleplay-page">
-      <div className="page-heading">
-        <div>
-          <Badge color="pink">STORY STUDIO</Badge>
-          <h1>情景演绎</h1>
-          <p>你来回答，故事向前。角色与设备节奏随剧情自然变化。</p>
-        </div>
+      <div className="section-title">
+        <h1>情景演绎</h1>
         <button className="button secondary" onClick={() => setFormat(true)}>
           角色卡格式
         </button>
@@ -932,75 +926,78 @@ export default function RoleplayPage({
                     无限时游戏 · 已开始 {elapsed(session.createdAt)}
                   </small>
                 </div>
-                <div className="story-toolbar">
-                  <button
-                    className="button small secondary"
-                    onClick={() => {
-                      const value = prompt("故事新名称", session.title);
-                      if (value)
-                        void task(async () => {
-                          const r = await action<RoleplaySession>(
-                            `${base}/sessions/${session.id}`,
-                            { title: value },
-                            "PATCH",
-                          );
-                          if (r && selected.current === session.id)
-                            await streamRef.current?.refresh();
-                          await loadLists();
-                        });
-                    }}
-                  >
-                    重命名
-                  </button>
-                  <button
-                    className="button small secondary"
-                    onClick={() =>
-                      void task(async () =>
-                        download(
-                          session.title + ".txt",
-                          await request(
-                            `${base}/sessions/${session.id}/export`,
-                            undefined,
-                            "GET",
-                          ),
-                          true,
-                        ),
-                      )
-                    }
-                  >
-                    导出
-                  </button>
-                  <button
-                    className="button small secondary"
-                    disabled={
-                      !!run || busy || turn?.status === "pending" || locked
-                    }
-                    onClick={() => {
-                      if (confirm("删除这个故事及其聊天记录？"))
-                        void task(async () => {
-                          const r = await action(
-                            `${base}/sessions/${session.id}`,
-                            undefined,
-                            "DELETE",
-                          );
-                          if (r) {
-                            draftStore
-                              .cell(`story:${session.id}`, storyInputDraft)
-                              .deleteEntity();
-                            if (selected.current === session.id) {
-                              openRequest.current++;
-                              setSession(null);
-                              selected.current = null;
-                              draftStore.setPreference("story", "");
-                            }
+                <details className="story-menu inline-details">
+                  <summary>故事管理</summary>
+                  <div className="story-toolbar">
+                    <button
+                      className="button small secondary"
+                      onClick={() => {
+                        const value = prompt("故事新名称", session.title);
+                        if (value)
+                          void task(async () => {
+                            const r = await action<RoleplaySession>(
+                              `${base}/sessions/${session.id}`,
+                              { title: value },
+                              "PATCH",
+                            );
+                            if (r && selected.current === session.id)
+                              await streamRef.current?.refresh();
                             await loadLists();
-                          }
-                        });
-                    }}
-                  >
-                    删除
-                  </button>
-                </div>
+                          });
+                      }}
+                    >
+                      重命名
+                    </button>
+                    <button
+                      className="button small secondary"
+                      onClick={() =>
+                        void task(async () =>
+                          download(
+                            session.title + ".txt",
+                            await request(
+                              `${base}/sessions/${session.id}/export`,
+                              undefined,
+                              "GET",
+                            ),
+                            true,
+                          ),
+                        )
+                      }
+                    >
+                      导出
+                    </button>
+                    <button
+                      className="button small secondary"
+                      disabled={
+                        !!run || busy || turn?.status === "pending" || locked
+                      }
+                      onClick={() => {
+                        if (confirm("删除这个故事及其聊天记录？"))
+                          void task(async () => {
+                            const r = await action(
+                              `${base}/sessions/${session.id}`,
+                              undefined,
+                              "DELETE",
+                            );
+                            if (r) {
+                              draftStore
+                                .cell(`story:${session.id}`, storyInputDraft)
+                                .deleteEntity();
+                              if (selected.current === session.id) {
+                                openRequest.current++;
+                                setSession(null);
+                                selected.current = null;
+                                draftStore.setPreference("story", "");
+                              }
+                              await loadLists();
+                            }
+                          });
+                      }}
+                    >
+                      删除
+                    </button>
+                  </div>
+                </details>
               </div>
               {session.origin && (
                 <div className="story-branch-origin">
@@ -1367,15 +1364,7 @@ export default function RoleplayPage({
                               创建分支
                             </button>
                           </div>
-                        ) : (
-                          m.role === "assistant" && (
-                            <small className="story-node-unavailable">
-                              {m.seq === 1
-                                ? "开场白不能作为存档节点。"
-                                : "此回复创建于存档功能启用前。"}
-                            </small>
-                          )
-                        )}
+                        ) : null}
                       </article>
                     ))}
                     {!sourceMessage && (
@@ -1420,9 +1409,7 @@ export default function RoleplayPage({
                       role="group"
                       aria-label="快捷回复"
                     >
-                      <p>
-                        试试这样回复 <span>点击即发送，也可在下方自由输入</span>
-                      </p>
+                      <p>快捷回复 · 点击发送</p>
                       {replyOptions.map((option, index) => (
                         <button
                           type="button"
@@ -1435,7 +1422,6 @@ export default function RoleplayPage({
                           }
                           onClick={() => void send(option)}
                         >
-                          <span aria-hidden="true">{index + 1}</span>
                           {option}
                         </button>
                       ))}
@@ -1450,7 +1436,7 @@ export default function RoleplayPage({
                   >
                     <textarea
                       aria-label="回复剧情"
-                      placeholder="正常回复剧情，例如：我接过徽章，问她下一步去哪里。"
+                      placeholder="输入剧情回复…"
                       value={input}
                       onChange={(e) => setInput(e.target.value)}
                       onCompositionStart={() => {
@@ -1484,9 +1470,8 @@ export default function RoleplayPage({
                     </button>
                   </form>
                   <DraftBar draft={inputDraft} label="丢弃这条回复草稿" />
-                  <p className="field-hint">Enter 发送 · Shift+Enter 换行</p>
                   <details className="story-memory">
-                    <summary>六部分故事记忆</summary>
+                    <summary>故事记忆</summary>
                     <h4>角色与玩家设定</h4>
                     <p>
                       {session.card.character.personality} ·{" "}
@@ -1520,19 +1505,18 @@ export default function RoleplayPage({
           ) : (
             <div className="story-empty">
               <BookOpen size={46} />
-              <h2>让故事从一次回答开始</h2>
-              <p>
-                选择角色，设定自己的身份。无需连接设备，也可以先进行纯文字演绎。
-              </p>
-              <button
-                className="button primary"
-                onClick={() =>
-                  setEditor({ file: structuredClone(cardTemplate) })
-                }
-              >
-                <Plus size={16} />
-                创建第一个角色
-              </button>
+              <h2>选择角色或打开历史故事</h2>
+              {!cards.length && (
+                <button
+                  className="button primary"
+                  onClick={() =>
+                    setEditor({ file: structuredClone(cardTemplate) })
+                  }
+                >
+                  <Plus size={16} />
+                  创建角色
+                </button>
+              )}
             </div>
           )}
         </section>

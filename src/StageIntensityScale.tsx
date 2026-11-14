@@ -28,10 +28,14 @@ export function StageIntensityScale({
           恢复 1 倍
         </button>
       </div>
-      <p id={`${id}-help`} className="stage-intensity-scale-help">
-        A/B 独立缩放所有阶段的起始与目标强度，归零休息保持 0；恢复 1
-        倍可还原当前基准。
-      </p>
+      <details className="inline-details">
+        <summary>倍率说明</summary>
+        <p id={`${id}-help`}>
+          分别缩放 A/B
+          各阶段的起始与目标强度，休息阶段保持归零。载入方案、修改强度或增删阶段后，会以当前强度为新的
+          1 倍基准。
+        </p>
+      </details>
       <div className="stage-intensity-scale-channels">
         {(["A", "B"] as Channel[]).map((channel) => (
           <fieldset
@@ -71,10 +75,6 @@ export function StageIntensityScale({
           </fieldset>
         ))}
       </div>
-      <p className="stage-intensity-scale-help stage-intensity-scale-baseline">
-        本地草稿会保留倍率和计算基准。载入后台方案、手动改强度、增删或复制阶段时，以当前强度重新设为
-        1 倍。
-      </p>
       {scaling.inputIssue && (
         <p id={`${id}-issue`} className="playback-issue" role="alert">
           {scaling.inputIssue}

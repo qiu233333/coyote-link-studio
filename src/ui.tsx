@@ -46,14 +46,12 @@ export function Card({
   children,
   className = "",
   title,
-  eyebrow,
   icon,
   actions,
 }: {
   children: ReactNode;
   className?: string;
   title?: string;
-  eyebrow?: string;
   icon?: ReactNode;
   actions?: ReactNode;
 }) {
@@ -63,10 +61,7 @@ export function Card({
         <div className="card-heading">
           <div className="card-title-wrap">
             {icon && <span className="card-icon">{icon}</span>}
-            <div>
-              {eyebrow && <span className="eyebrow">{eyebrow}</span>}
-              <h2>{title}</h2>
-            </div>
+            <h2>{title}</h2>
           </div>
           {actions}
         </div>
@@ -203,12 +198,13 @@ export function Modal({
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
     const dialog = dialogRef.current;
-    const focusable = () =>
-      Array.from(
+    const focusable = () => {
+      return Array.from(
         dialog?.querySelectorAll<HTMLElement>(
-          'button:not(:disabled),a[href],input:not(:disabled),select:not(:disabled),textarea:not(:disabled),[tabindex="0"]',
+          'button:not(:disabled),a[href],input:not(:disabled),select:not(:disabled),textarea:not(:disabled),summary,[tabindex="0"]',
         ) || [],
-      );
+      ).filter((element) => element.getClientRects().length > 0);
+    };
     (focusable()[0] || dialog)?.focus();
     const handleKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -219,15 +215,22 @@ export function Modal({
         const elements = focusable();
         const first = elements[0],
           last = elements.at(-1);
+        const stop = document.querySelector<HTMLButtonElement>(
+          ".emergency-button:not(:disabled)",
+        );
+        const focused = document.activeElement;
         if (!first) {
           event.preventDefault();
           dialog?.focus();
-        } else if (event.shiftKey && document.activeElement === first) {
+        } else if (stop && focused === stop) {
           event.preventDefault();
-          last?.focus();
-        } else if (!event.shiftKey && document.activeElement === last) {
+          (event.shiftKey ? last : first)?.focus();
+        } else if (event.shiftKey && focused === first) {
           event.preventDefault();
-          first.focus();
+          (stop ?? last)?.focus();
+        } else if (!event.shiftKey && focused === last) {
+          event.preventDefault();
+          (stop ?? first).focus();
         }
       }
     };
@@ -452,7 +455,8 @@ export function BoundsEditor({
           />
         </Field>
       </div>
-      <Field label="允许使用的波形" hint="AI 仅能从勾选的波形中选择。">
+      <details className="inline-details wave-picker">
+        <summary>允许使用的波形（已选 {bounds.waveformIds.length} 个）</summary>
         <div className="wave-checks">
           {bounds.waveformIds
             .filter((id) => !waves.some((wave) => wave.id === id))
@@ -492,7 +496,7 @@ export function BoundsEditor({
             </label>
           ))}
         </div>
-      </Field>
+      </details>
       <div className="per-channel-settings ai-channel-settings">
         {(["A", "B"] as Channel[]).map((channel) => (
           <fieldset

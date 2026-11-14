@@ -357,12 +357,20 @@ try {
     "model request did not reach the local stub before reload",
     () => !!releaseStory,
   );
+  const sentBeforeReload = JSON.parse(
+    (await readDraft(key(`story:${stories[0].id}`))) ?? "{}",
+  );
+  assert.ok(
+    sentBeforeReload.value?.sent?.requestId,
+    "立即发送后刷新也应保留已发送草稿的请求 ID",
+  );
   await page.reload();
   await input.waitFor();
   releaseStory!();
   await value(input, "");
   await changeStory("草稿故事 B");
   await value(input, "B 未发");
+  await page.getByText("故事管理", { exact: true }).click();
   page.once("dialog", (dialog) => dialog.accept());
   await page
     .locator(".story-toolbar")

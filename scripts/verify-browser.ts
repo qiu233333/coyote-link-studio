@@ -362,6 +362,7 @@ try {
   steps.push("本地应用与独立 eve 运行时实际启动");
 
   await navigate(page, "系统设置");
+  await page.getByText("高级设置", { exact: true }).click();
   if (deepseek) {
     await page
       .getByRole("combobox", { name: "AI 服务", exact: true })
@@ -841,7 +842,18 @@ try {
   );
   assert.equal(forbiddenSettings.status, 423);
   await navigate(page, "AI 上锁任务");
-  await page.getByRole("button", { name: /^紧急停止/ }).click();
+  await page.getByRole("button", { name: "使用说明", exact: true }).click();
+  const help = page.getByRole("dialog", { name: "使用说明" });
+  await help.waitFor();
+  await help.getByRole("button", { name: "关闭弹窗", exact: true }).focus();
+  await page.keyboard.press("Shift+Tab");
+  const emergency = page.getByRole("button", { name: "紧急停止", exact: true });
+  assert.equal(
+    await emergency.evaluate((button) => button === document.activeElement),
+    true,
+    "弹窗打开时应能通过键盘到达急停",
+  );
+  await emergency.click();
   await waitState(
     page,
     "上锁急停、解锁及归零确认",
@@ -853,7 +865,11 @@ try {
       state.device.intensities.A === 0 &&
       state.device.intensities.B === 0,
   );
-  steps.push("上锁任务：生成、编辑、确认、锁定只读、后端 423、反馈及急停解锁");
+  await page.keyboard.press("Escape");
+  await help.waitFor({ state: "hidden" });
+  steps.push(
+    "上锁任务：生成、编辑、确认、锁定只读、后端 423、反馈及弹窗打开时可急停解锁",
+  );
 
   await navigate(page, "控制台");
   await page.setViewportSize({ width: 390, height: 844 });

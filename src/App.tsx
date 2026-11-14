@@ -1,14 +1,11 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
   ArrowUpRight,
   AudioLines,
   Bot,
   BookOpen,
   Check,
-  ChevronRight,
   CircleHelp,
-  Command,
-  Heart,
   LayoutDashboard,
   LoaderCircle,
   LockKeyhole,
@@ -18,8 +15,6 @@ import {
   RefreshCw,
   Settings2,
   ShieldCheck,
-  Sparkles,
-  Wifi,
   X,
 } from "lucide-react";
 import ConsolePage from "./ConsolePage";
@@ -34,16 +29,15 @@ const RoleplayPage = lazy(() => import("./RoleplayPage"));
 
 type Page = "console" | "ai-control" | "locked-task" | "settings" | "roleplay";
 const pages = [
-  { id: "console", label: "控制台", en: "Console", icon: LayoutDashboard },
-  { id: "ai-control", label: "AI 控制", en: "AI Control", icon: Bot },
+  { id: "console", label: "控制台", icon: LayoutDashboard },
+  { id: "ai-control", label: "AI 控制", icon: Bot },
   {
     id: "locked-task",
     label: "AI 上锁任务",
-    en: "Locked Tasks",
     icon: LockKeyhole,
   },
-  { id: "roleplay", label: "情景演绎", en: "Roleplay", icon: BookOpen },
-  { id: "settings", label: "系统设置", en: "Settings", icon: Settings2 },
+  { id: "roleplay", label: "情景演绎", icon: BookOpen },
+  { id: "settings", label: "系统设置", icon: Settings2 },
 ] as const;
 
 export default function App() {
@@ -77,13 +71,24 @@ function Workspace({
     "console",
   );
   const [mobileNav, setMobileNav] = useState(false);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  const currentNavButton = useRef<HTMLButtonElement>(null);
+  const mainContent = useRef<HTMLElement>(null);
   const [help, setHelp] = useState(false);
   const [systemInfo, setSystemInfo] = useState(false);
   const [emergencyPending, setEmergencyPending] = useState(false);
+  useEffect(() => {
+    if (mobileNav) currentNavButton.current?.focus();
+  }, [mobileNav]);
+  const closeNavigation = () => {
+    setMobileNav(false);
+    menuButton.current?.focus();
+  };
   const navigate = (to: Page) => {
     setPage(to);
     setMobileNav(false);
     window.scrollTo({ top: 0, behavior: "instant" });
+    mainContent.current?.focus({ preventScroll: true });
   };
   const emergency = async () => {
     setEmergencyPending(true);
@@ -94,17 +99,33 @@ function Workspace({
     }
   };
   const active = state ? isActive(state) : false;
-  const currentPage = pages.find((p) => p.id === page)!;
 
   return (
     <div className="app-shell">
+      <a className="skip-link" href="#main-content">
+        跳到主要内容
+      </a>
       <div className="ambient ambient-one" />
       <div className="ambient ambient-two" />
       <div className="star-field" />
-      {mobileNav && (
-        <div className="nav-scrim" onClick={() => setMobileNav(false)} />
-      )}
-      <aside className={`sidebar ${mobileNav ? "mobile-open" : ""}`}>
+      {mobileNav && <div className="nav-scrim" onClick={closeNavigation} />}
+      <aside
+        className={`sidebar ${mobileNav ? "mobile-open" : ""}`}
+        id="workspace-sidebar"
+        onKeyDown={(event) => {
+          if (mobileNav && event.key === "Escape") closeNavigation();
+        }}
+      >
+        {mobileNav && (
+          <button
+            type="button"
+            className="sidebar-close icon-button"
+            aria-label="收起导航"
+            onClick={closeNavigation}
+          >
+            <X size={18} />
+          </button>
+        )}
         <a
           className="brand"
           href="#"
@@ -119,84 +140,60 @@ function Workspace({
             <i />
           </span>
           <span>
-            <strong>
-              星涟联动<span>✦</span>
-            </strong>
-            <small>COYOTE LINK STUDIO</small>
+            <strong>星涟联动</strong>
           </span>
         </a>
-        <div className="sidebar-label">
-          WORKSPACE <span>你的控制空间</span>
-        </div>
         <nav className="main-nav" aria-label="主要模块">
-          {pages.map((item, i) => (
+          {pages.map((item) => (
             <button
               key={item.id}
               className={page === item.id ? "active" : ""}
+              ref={page === item.id ? currentNavButton : undefined}
               onClick={() => navigate(item.id)}
               aria-current={page === item.id ? "page" : undefined}
             >
               <item.icon size={20} />
-              <span>
-                {item.label}
-                <small>{item.en}</small>
-              </span>
+              <span>{item.label}</span>
               {item.id === "locked-task" && state?.locked ? (
                 <LockKeyhole className="nav-lock" size={13} />
               ) : page === item.id ? (
                 <span className="nav-active-dot" />
-              ) : (
-                <span className="nav-index">0{i + 1}</span>
-              )}
+              ) : null}
             </button>
           ))}
         </nav>
-        <div className="sidebar-companion">
-          <span className="companion-sparkle">✧</span>
-          <Avatar size="large" />
-          <Badge color="pink">YOUR LITTLE CO-PILOT</Badge>
-          <strong>星涟一直在这里</strong>
-          <p>
-            每一次变化，
-            <br />
-            都从你的选择开始。
-          </p>
-          <button onClick={() => navigate("ai-control")}>
-            一起探索 <ArrowUpRight size={14} />
-          </button>
-        </div>
         <div className="sidebar-bottom">
-          <span>
-            <i />
-            本地运行 · 数据留在身边
-          </span>
-          <div>
-            <small>COYOTE LINK · v{appVersion}</small>
-            <button
-              className="system-info-trigger"
-              aria-label="系统信息"
-              title="系统信息"
-              onClick={() => setSystemInfo(true)}
-            >
-              <CircleHelp size={17} />
-            </button>
-          </div>
+          <button
+            className="system-info-trigger"
+            aria-label="系统信息"
+            onClick={() => setSystemInfo(true)}
+          >
+            <Avatar size="small" />
+            <span>系统信息</span>
+          </button>
         </div>
       </aside>
       <div className="main-shell">
         <header className="topbar">
-          <div className="breadcrumbs">
-            <button
-              className="mobile-menu"
-              aria-label="打开导航"
-              onClick={() => setMobileNav(true)}
-            >
-              <Menu size={21} />
-            </button>
-            <span>工作空间</span>
-            <ChevronRight size={13} />
-            <strong>{currentPage.label}</strong>
-          </div>
+          <button
+            className="mobile-menu"
+            ref={menuButton}
+            aria-label={mobileNav ? "关闭导航" : "打开导航"}
+            aria-expanded={mobileNav}
+            aria-controls="workspace-sidebar"
+            onClick={() => {
+              if (mobileNav) {
+                closeNavigation();
+                return;
+              }
+              setMobileNav(true);
+            }}
+            onKeyDown={(event) => {
+              if (mobileNav && event.key === "Escape") closeNavigation();
+            }}
+          >
+            <Menu size={21} />
+          </button>
           <div className="topbar-actions">
             <span
               className={`server-indicator ${connection === "live" ? "live" : ""}`}
@@ -205,25 +202,22 @@ function Workspace({
               {connection === "live"
                 ? "实时同步"
                 : connection === "polling"
-                  ? "轮询同步"
+                  ? "定时同步"
                   : connection === "stale"
                     ? "状态同步中断"
                     : "连接服务中"}
             </span>
-            <span className="topbar-divider" />
             <button
               className="help-button"
               onClick={() => setHelp(true)}
               aria-label="使用说明"
             >
               <CircleHelp size={18} />
+              <span>使用说明</span>
             </button>
-            <span className="user-orb">
-              <Sparkles size={17} />
-            </span>
           </div>
         </header>
-        <main id="main-content">
+        <main id="main-content" ref={mainContent} tabIndex={-1}>
           {error && (
             <div className="global-error">
               <Radio size={17} />
@@ -238,7 +232,7 @@ function Workspace({
             <div className="notice notice-pink" role="status">
               <Radio size={17} />
               <span>
-                浏览器状态同步中断，当前显示上次收到的状态。后台会话是否结束以恢复同步后的状态为准。
+                状态同步中断。当前显示上次收到的状态，后台运行可能仍在继续。
               </span>
             </div>
           )}
@@ -328,15 +322,6 @@ function Workspace({
             </div>
           )}
         </main>
-        <footer className="app-footer">
-          <span>
-            MADE FOR YOUR OWN RHYTHM <Heart size={10} />
-          </span>
-          <span>
-            <ShieldCheck size={12} />
-            本机控制 · 明确边界 · 随时急停
-          </span>
-        </footer>
       </div>
       <div className={`emergency-bar ${state?.locked ? "is-locked" : ""}`}>
         <div className="emergency-status">
@@ -349,17 +334,15 @@ function Workspace({
                   ? `${ownerNames[state.owner]}${state.run?.status === "paused" ? "已暂停" : "运行中"}`
                   : "当前待机"}
             </strong>
-            <span>
-              {active && state?.run ? (
-                state.run.deadlineAt === null ? (
-                  "无限时联动 · 持续保持输出"
+            {active && state?.run && (
+              <span>
+                {state.run.deadlineAt === null ? (
+                  "无限时联动"
                 ) : (
                   <Countdown deadline={state.run.deadlineAt} />
-                )
-              ) : (
-                "设备输出以实际回传为准"
-              )}
-            </span>
+                )}
+              </span>
+            )}
           </div>
           {state?.locked && <LockKeyhole size={15} />}
         </div>
@@ -372,7 +355,6 @@ function Workspace({
           <OctagonX size={21} />
           <span>
             {emergencyPending || state?.stopping ? "正在停止…" : "紧急停止"}
-            <small>清队列 · 双通道归零</small>
           </span>
         </button>
       </div>
@@ -437,60 +419,44 @@ function Workspace({
         </Modal>
       )}
       {help && (
-        <div className="modal-backdrop" onClick={() => setHelp(false)}>
-          <section
-            className="modal glass-card"
-            role="dialog"
-            aria-modal="true"
-            aria-label="使用说明"
-            onClick={(e) => e.stopPropagation()}
+        <Modal title="使用说明" onClose={() => setHelp(false)}>
+          <div className="help-steps">
+            <div>
+              <span>01</span>
+              <p>
+                <strong>连接设备</strong>在控制台打开连接管理，使用官方 APP
+                扫码。可选择模拟设备试用。
+              </p>
+            </div>
+            <div>
+              <span>02</span>
+              <p>
+                <strong>设置输出</strong>
+                在实时控制中分别选择 A/B
+                的波形和目标强度。播放时修改立即生效，暂停时只更新设置。
+              </p>
+            </div>
+            <div>
+              <span>03</span>
+              <p>
+                <strong>配置 AI</strong>
+                在系统设置中保存并测试模型接口，启动联动前确认设备的控制范围。
+              </p>
+            </div>
+          </div>
+          <div className="notice notice-pink">
+            <ShieldCheck size={18} />
+            <span>
+              紧急停止独立于模型。关闭网页后后台仍继续运行，停止服务会中断任务。
+            </span>
+          </div>
+          <button
+            className="button primary full"
+            onClick={() => setHelp(false)}
           >
-            <div className="card-heading">
-              <h2>欢迎来到星涟联动</h2>
-              <IconButton label="关闭使用说明" onClick={() => setHelp(false)}>
-                <X size={18} />
-              </IconButton>
-            </div>
-            <div className="help-steps">
-              <div>
-                <span>01</span>
-                <p>
-                  <strong>连接设备</strong>在控制台打开连接管理，使用官方 APP
-                  扫码。也可先使用模拟设备熟悉功能。
-                </p>
-              </div>
-              <div>
-                <span>02</span>
-                <p>
-                  <strong>划定边界</strong>
-                  确认设备回传的 A/B
-                  上限，分别设置各通道的强度、波形与播放方式。AI
-                  模块需先配置兼容接口，再分别确认 A/B 控制范围。
-                </p>
-              </div>
-              <div>
-                <span>03</span>
-                <p>
-                  <strong>选一种节奏</strong>手动编排、可随时接管的 AI
-                  控制，或确认后冻结范围的 AI 上锁任务。
-                </p>
-              </div>
-            </div>
-            <div className="notice notice-pink">
-              <ShieldCheck size={18} />
-              <span>
-                紧急停止不依赖模型。关闭网页后后台仍继续运行；停止服务后不会自动恢复任务。
-              </span>
-            </div>
-            <button
-              className="button primary full"
-              onClick={() => setHelp(false)}
-            >
-              开始探索
-              <ArrowUpRight size={15} />
-            </button>
-          </section>
-        </div>
+            知道了
+          </button>
+        </Modal>
       )}
     </div>
   );

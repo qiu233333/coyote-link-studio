@@ -162,12 +162,25 @@ export default function ConsolePage({
   return (
     <div className="page-content">
       <div className="section-title">
-        <div>
-          <span className="eyebrow">YOUR PERSONAL CONTROL SPACE</span>
-          <h1>
-            控制台<span className="title-dot">.</span>
-          </h1>
-          <p>连接设备，让每一次变化都恰到好处。</p>
+        <h1>控制台</h1>
+      </div>
+      <section className="connection-strip glass-card">
+        <div className="device-orb">
+          <Radio size={24} />
+        </div>
+        <div className="connection-primary">
+          <strong>
+            {state.device.protocol === "simulator" && state.device.connected
+              ? "模拟设备已连接"
+              : state.device.connected
+                ? state.device.name || "郊狼已连接"
+                : "设备未连接"}
+          </strong>
+          <span>
+            {state.device.protocol === "simulator"
+              ? "模拟设备 · 不产生真实输出"
+              : `${state.device.protocol.toUpperCase()} 协议`}
+          </span>
         </div>
         <button
           className="button secondary"
@@ -176,60 +189,6 @@ export default function ConsolePage({
         >
           <Cable size={16} />
           连接管理
-          <ChevronRight size={14} />
-        </button>
-      </div>
-      <section className="connection-strip glass-card">
-        <div className="device-orb">
-          <Radio size={24} />
-        </div>
-        <div className="connection-primary">
-          <strong>
-            {state.device.connected
-              ? state.device.name || "郊狼已连接"
-              : "等待连接你的郊狼"}
-          </strong>
-          <span>
-            {state.device.protocol === "simulator"
-              ? "模拟设备 · 不产生真实输出"
-              : `${state.device.protocol.toUpperCase()} 协议 · ${state.device.connected ? "设备已就绪" : "扫码配对后开始控制"}`}
-          </span>
-        </div>
-        <div className="connection-steps">
-          <span
-            className={state.device.relayStatus === "connected" ? "online" : ""}
-          >
-            <i />
-            中继
-          </span>
-          <span className={state.device.appStatus === "paired" ? "online" : ""}>
-            <i />
-            APP
-          </span>
-          <span className={state.device.connected ? "online" : ""}>
-            <i />
-            设备
-          </span>
-        </div>
-        <div className="connection-metric">
-          <span>当前控制方</span>
-          <strong>{active ? ownerNames[state.owner] : "待机"}</strong>
-        </div>
-        <div className="connection-metric latency">
-          <span>连接延迟</span>
-          <strong>
-            {state.device.latencyMs == null
-              ? "—"
-              : `${state.device.latencyMs} ms`}
-          </strong>
-        </div>
-        <button
-          className="text-button"
-          onClick={() => setConnectionOpen(true)}
-          disabled={state.locked}
-        >
-          {state.device.connected ? "查看连接" : "连接设备"}
-          <ChevronRight size={14} />
         </button>
       </section>
       {otherOwner && (
@@ -273,12 +232,10 @@ export default function ConsolePage({
             key={item.id}
             className={tab === item.id ? "active" : ""}
             onClick={() => setTab(item.id)}
+            aria-current={tab === item.id ? "page" : undefined}
           >
             <item.icon size={16} />
             {item.label}
-            {item.id === "waves" && (
-              <span className="tab-count">{state.waveforms.length}</span>
-            )}
           </button>
         ))}
       </nav>
@@ -324,6 +281,11 @@ export default function ConsolePage({
                     : "开始播放"}
                 </button>
               </div>
+              {liveIssue && (
+                <p className="playback-issue" role="status">
+                  {liveIssue}
+                </p>
+              )}
               <div className="channel-grid">
                 {(["A", "B"] as Channel[]).map((channel) => (
                   <ChannelCard
@@ -338,18 +300,6 @@ export default function ConsolePage({
                   />
                 ))}
               </div>
-              <div className="help-line">
-                <ShieldCheck size={14} />
-                <span>
-                  A / B
-                  独立控制，强度上限随设备回传更新。播放时修改立即生效，暂停时只更新设置。
-                </span>
-              </div>
-              {liveIssue && (
-                <p className="playback-issue" role="status">
-                  {liveIssue}
-                </p>
-              )}
             </div>
           </div>
           <div className="live-bottom">
@@ -359,28 +309,10 @@ export default function ConsolePage({
             />
             <Card
               title="正在运行"
-              eyebrow="NOW PLAYING"
               icon={<Play size={17} />}
               className="now-playing"
             >
               <RunPlayer state={state} action={action} pending={pending} />
-              <div className="quick-waves">
-                <span className="muted small-text">探索波形</span>
-                {state.waveforms.slice(0, 2).map((w) => (
-                  <button key={w.id} onClick={() => setTab("waves")}>
-                    <span className="mini-wave">
-                      <Waves size={17} />
-                    </span>
-                    <span>
-                      <strong>{w.name}</strong>
-                      <small>
-                        {(w.durationMs / 1000).toFixed(1)}s · {w.frameCount} 帧
-                      </small>
-                    </span>
-                    <ChevronRight size={14} />
-                  </button>
-                ))}
-              </div>
             </Card>
           </div>
         </>
@@ -637,10 +569,27 @@ function DevicePanel({
       )}
       <div className="device-details">
         <span>
-          中继<strong>{state.device.relayStatus}</strong>
+          中继
+          <strong>
+            {
+              {
+                disconnected: "未连接",
+                connecting: "连接中",
+                connected: "已连接",
+                fault: "故障",
+              }[state.device.relayStatus]
+            }
+          </strong>
         </span>
         <span>
-          APP<strong>{state.device.appStatus}</strong>
+          APP
+          <strong>
+            {
+              { waiting: "等待配对", paired: "已配对", disconnected: "未连接" }[
+                state.device.appStatus
+              ]
+            }
+          </strong>
         </span>
         <span>
           最近更新
@@ -652,6 +601,14 @@ function DevicePanel({
           设备上限 A / B
           <strong>
             {state.device.limits.A} / {state.device.limits.B}
+          </strong>
+        </span>
+        <span>
+          连接延迟
+          <strong>
+            {state.device.latencyMs == null
+              ? "—"
+              : `${state.device.latencyMs} ms`}
           </strong>
         </span>
       </div>
@@ -711,18 +668,16 @@ function ChannelCard({
           {state.device.intensities[channel].toString().padStart(2, "0")}
         </span>
         <div>
-          <span>设备强度</span>
-          <small>目标 {config.target}</small>
+          <span>设备回传</span>
+          <small aria-label={`${channel} 通道上限摘要`}>
+            目标 {config.target} · 强度上限 {deviceLimit}
+          </small>
         </div>
         <span
           className={`signal-indicator ${state.device.connected ? "on" : ""}`}
         >
           <Activity size={17} />
         </span>
-      </div>
-      <div className="channel-cap" aria-label={`${channel} 通道上限摘要`}>
-        <span>强度上限</span>
-        <strong>{deviceLimit}</strong>
       </div>
       <div className="channel-wave">
         <WaveGraph
@@ -755,10 +710,6 @@ function ChannelCard({
           >
             <Plus size={16} />
           </IconButton>
-        </div>
-        <div className="range-labels">
-          <span>0</span>
-          <span>{deviceLimit}</span>
         </div>
         <div className="target-number">
           <NumberInput
@@ -839,8 +790,7 @@ function RunPlayer({
         <span className="idle-play">
           <Play size={24} />
         </span>
-        <strong>留一点空间，等待下一段节奏</strong>
-        <p>设置通道强度和波形，开始下一段节奏</p>
+        <strong>没有正在播放的内容</strong>
       </div>
     );
   const own = state.owner === "manual";
@@ -952,7 +902,6 @@ export const Monitor = memo(function Monitor({
   return (
     <Card
       title="实时强度"
-      eyebrow="LIVE MONITOR"
       icon={<Activity size={17} />}
       className="monitor-card"
       actions={
@@ -994,7 +943,6 @@ export const Monitor = memo(function Monitor({
           <i className={`status-dot ${connected ? "online" : ""}`} />
           {connected ? "状态持续同步中" : "设备连接后显示实时曲线"}
         </span>
-        <span>强度单位 · 设备反馈</span>
       </div>
     </Card>
   );
@@ -1168,11 +1116,10 @@ const WaveLibrary = memo(function WaveLibrary({
           onChange={(e) => void importFile(e.target.files?.[0])}
         />
       </div>
-      <p className="small-text muted">
-        支持 JSON 与 APP 3.4.4 文本
-        .pulse，包含频率渐变。非整帧周期末尾补零幅度静音，预览显示实际时长。APP
-        附加参数不修改设备设置。
-      </p>
+      <details className="inline-details">
+        <summary>支持的文件格式</summary>
+        <p>支持 JSON 和 APP 3.4.4 的文本 .pulse。波形预览会标出实际时长。</p>
+      </details>
       {localError && <p className="error-inline">{localError}</p>}
       {dragging && (
         <div className="drop-overlay">
@@ -2026,12 +1973,7 @@ function RandomPanel({
   const issue = playbackConfigIssue(state, playback);
   return (
     <div className="editor-layout">
-      <Card
-        title="一点未知，也在你的范围之内"
-        eyebrow="BOUNDED RANDOM"
-        icon={<Shuffle size={20} />}
-      >
-        <p className="muted">先划定边界，再让波形与强度带来恰好的变化。</p>
+      <Card title="一点未知，也在你的范围之内" icon={<Shuffle size={20} />}>
         <DraftBar draft={draft} disabled={disabled} label="丢弃随机草稿" />
         <fieldset className="plain-fieldset" disabled={disabled}>
           <Field label="参与通道">
@@ -2278,11 +2220,7 @@ const LogsPanel = memo(function LogsPanel({
     .slice()
     .reverse();
   return (
-    <Card
-      title="每一步，都有迹可循"
-      eyebrow="ACTIVITY HISTORY"
-      icon={<History size={19} />}
-    >
+    <Card title="运行记录" icon={<History size={19} />}>
       <div className="log-filters">
         <select
           aria-label="筛选日志来源"

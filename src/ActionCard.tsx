@@ -48,12 +48,12 @@ export function ActionCard({
           </span>
         ))}
       </div>
-      {record.reason && <p className="ai-action-reason">{record.reason}</p>}
       <details className="ai-action-details">
         <summary>
           <ChevronDown size={14} aria-hidden="true" />
           查看变化详情
         </summary>
+        {record.reason && <p className="ai-action-reason">{record.reason}</p>}
         <div className="ai-action-channels">
           {(["A", "B"] as Channel[]).map((c) => {
             const channel = record.channels[c],

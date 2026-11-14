@@ -702,6 +702,7 @@ try {
   );
 
   await navigate("系统设置");
+  await page.getByText("高级设置", { exact: true }).click();
   for (const [label, value] of [
     ["模型上下文窗口", "4096"],
     ["AI 请求超时", "15"],

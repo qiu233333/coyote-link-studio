@@ -83,45 +83,11 @@ export function AiControlPage({ state, action, pending }: AiProps) {
   return (
     <div className="page-content">
       <div className="section-title">
-        <div>
-          <span className="eyebrow">IN YOUR BOUNDARIES, AT YOUR PACE</span>
-          <h1>
-            AI 控制<span className="title-dot">.</span>
-          </h1>
-          <p>设定范围，把变化交给星涟。你的反馈，随时被听见。</p>
-        </div>
-        <Badge color="blue">
-          <Bot size={14} />
-          自由控制 · 随时接管
-        </Badge>
+        <h1>AI 控制</h1>
       </div>
       {state.run?.owner === "ai-control" && !run && (
         <RunEndNotice run={state.run} />
       )}
-      <div className="ai-intro glass-card">
-        <Avatar size="large" />
-        <div>
-          <Badge color="pink">星涟 · AI ASSISTANT</Badge>
-          <h2>
-            {run
-              ? run.status === "paused"
-                ? "休息一下，等你准备好。"
-                : run.inferenceRecovery
-                  ? "正在等待 AI 重试…"
-                  : run.thinking
-                    ? "正在想下一段节奏…"
-                    : "我会在你划定的范围里，慢慢探索。"
-              : "你定边界，我来编排。"}
-          </h2>
-          <p>
-            {run?.lastDecision?.reason ||
-              "从波形、强度到休息节奏，都以你确认的范围为准。你可以暂停、修改，也可以随时收回控制权。"}
-          </p>
-        </div>
-        <div className="intro-sparkle">
-          <Sparkles size={28} />
-        </div>
-      </div>
       {!state.aiRuntime.ready && (
         <div className="notice notice-pink">
           <Bot size={18} />
@@ -146,7 +112,6 @@ export function AiControlPage({ state, action, pending }: AiProps) {
       <div className="ai-workspace">
         <Card
           title="控制范围"
-          eyebrow="YOU SET THE RULES"
           icon={<SlidersIcon />}
           actions={
             run && (
@@ -471,24 +436,18 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
   return (
     <div className="page-content">
       <div className="section-title">
-        <div>
-          <span className="eyebrow">A COMMITMENT WITH A CLEAR END</span>
-          <h1>
-            AI 上锁任务<span className="title-dot">.</span>
-          </h1>
-          <p>先一起打磨任务，再把约定交给时间。</p>
-        </div>
-        <Badge color="pink">
-          <LockKeyhole size={14} />
-          确认后锁定
-        </Badge>
+        <h1>AI 上锁任务</h1>
       </div>
       {state.run?.owner === "locked-task" && !run && (
         <RunEndNotice run={state.run} />
       )}
       <div className="task-stepper">
         {["描述需求", "编辑任务", "确认上锁", "执行与反馈"].map((s, i) => (
-          <div key={s} className={(run ? 3 : step) >= i ? "active" : ""}>
+          <div
+            key={s}
+            className={(run ? 3 : step) >= i ? "active" : ""}
+            aria-current={(run ? 3 : step) === i ? "step" : undefined}
+          >
             <span>
               {(run ? 3 : step) > i ? (
                 <Check size={15} />
@@ -600,19 +559,7 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
           )}
           <div className="task-create-layout">
             <div>
-              <Card
-                title="告诉星涟，你想完成什么"
-                eyebrow="LET'S MAKE A PLAN"
-                icon={<WandSparkles size={19} />}
-              >
-                <div className="assistant-greeting">
-                  <Avatar />
-                  <p>
-                    我会先帮你写好一份草稿。
-                    <br />
-                    <span>强度、波形、阶段和截止时间，都由你最终确认。</span>
-                  </p>
-                </div>
+              <Card title="生成任务草稿" icon={<WandSparkles size={19} />}>
                 <Field label="任务需求">
                   <textarea
                     aria-label="任务需求"
@@ -678,7 +625,6 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
               {plan && (
                 <Card
                   title="把草稿改成你的约定"
-                  eyebrow="EDIT YOUR PLAN"
                   icon={<FilePenLine size={18} />}
                   className="task-plan-editor"
                 >
@@ -813,42 +759,6 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
               )}
             </div>
             <div className="ai-side">
-              <Card
-                title="上锁前，请先了解"
-                icon={<LockKeyhole size={17} />}
-                className="lock-explainer"
-              >
-                <ol>
-                  <li>
-                    <span>01</span>
-                    <div>
-                      <strong>先生成，再确认</strong>
-                      <p>草稿不会产生设备输出，所有细节可编辑。</p>
-                    </div>
-                  </li>
-                  <li>
-                    <span>02</span>
-                    <div>
-                      <strong>开启即冻结范围</strong>
-                      <p>用户不能暂停、改强度、跳阶段或延长时间。</p>
-                    </div>
-                  </li>
-                  <li>
-                    <span>03</span>
-                    <div>
-                      <strong>反馈由 AI 评估</strong>
-                      <p>AI 可在既定范围内调整，不能突破边界。</p>
-                    </div>
-                  </li>
-                  <li>
-                    <span>04</span>
-                    <div>
-                      <strong>截止一定结束</strong>
-                      <p>关闭网页仍继续；急停随时可用。</p>
-                    </div>
-                  </li>
-                </ol>
-              </Card>
               <Card title="已保存的任务草稿" icon={<FilePenLine size={17} />}>
                 {state.plans.length ? (
                   <div className="preset-list">
@@ -911,7 +821,7 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
                       ))}
                   </div>
                 ) : (
-                  <Empty title="等待第一个约定">生成的草稿会保存在这里。</Empty>
+                  <Empty title="暂无任务草稿" />
                 )}
               </Card>
             </div>
@@ -1106,10 +1016,16 @@ const FeedbackPanel = memo(function FeedbackPanel({
       } else setLocalText((current) => (current === value ? "" : current));
     }
   };
+  if (!feedback) {
+    return (
+      <Card title="文字反馈" icon={<MessageCircle size={18} />}>
+        <p className="muted">开始运行后可发送反馈。</p>
+      </Card>
+    );
+  }
   return (
     <Card
-      title="和星涟聊聊"
-      eyebrow="YOUR FEEDBACK MATTERS"
+      title="文字反馈"
       icon={<MessageCircle size={18} />}
       className="feedback-card"
     >
@@ -1127,11 +1043,7 @@ const FeedbackPanel = memo(function FeedbackPanel({
         ) : (
           <div className="chat-empty">
             <Avatar />
-            <p>
-              {feedback
-                ? "现在感觉如何？告诉我，我会在确认范围里调整。"
-                : "启动之后，你的感受就是下一步的线索。"}
-            </p>
+            <p>暂无反馈</p>
           </div>
         )}
         {thinking && (
@@ -1163,7 +1075,7 @@ const FeedbackPanel = memo(function FeedbackPanel({
           aria-label="给 AI 的文字反馈"
           value={text}
           onChange={(e) => setText(e.target.value)}
-          placeholder={feedback ? "告诉我你的感受…" : "开启后可以发送反馈"}
+          placeholder="输入反馈…"
           disabled={disabled}
           rows={2}
           maxLength={2000}
@@ -1171,7 +1083,8 @@ const FeedbackPanel = memo(function FeedbackPanel({
             if (
               e.key === "Enter" &&
               !e.shiftKey &&
-              !e.nativeEvent.isComposing
+              !e.nativeEvent.isComposing &&
+              e.nativeEvent.keyCode !== 229
             ) {
               e.preventDefault();
               void send(text);
@@ -1187,7 +1100,6 @@ const FeedbackPanel = memo(function FeedbackPanel({
           <Send size={17} />
         </button>
       </form>
-      <p className="field-hint">Enter 发送 · Shift + Enter 换行</p>
     </Card>
   );
 });
@@ -1280,14 +1192,12 @@ function RunSummary({
           {state.device.intensities.A} / {state.device.intensities.B}
         </strong>
       </div>
-      <div className="summary-line">
-        <span>范围版本</span>
-        <strong>{run ? `v${run.boundsVersion}` : "—"}</strong>
-      </div>
-      <div className="summary-line">
-        <span>剩余时间</span>
-        <strong>{active ? duration(timeLeft(run.deadlineAt)) : "—"}</strong>
-      </div>
+      {active && (
+        <div className="summary-line">
+          <span>剩余时间</span>
+          <strong>{duration(timeLeft(run.deadlineAt))}</strong>
+        </div>
+      )}
       {recovery && (
         <div
           className="notice notice-pink"

@@ -1,17 +1,13 @@
 import { memo, useEffect, useMemo, useState } from "react";
 import {
   Check,
-  ChevronRight,
   Eye,
   EyeOff,
   KeyRound,
   Link,
   Save,
   Server,
-  Settings2,
   ShieldCheck,
-  Sparkles,
-  Terminal,
   WandSparkles,
   X,
 } from "lucide-react";
@@ -149,17 +145,7 @@ const SettingsPage = memo(function SettingsPage({
   return (
     <div className="page-content">
       <div className="section-title">
-        <div>
-          <span className="eyebrow">MAKE IT YOURS</span>
-          <h1>
-            系统设置<span className="title-dot">.</span>
-          </h1>
-          <p>连接你的模型，让星涟拥有属于你的思考方式。</p>
-        </div>
-        <Badge color="blue">
-          <ShieldCheck size={14} />
-          仅本机保存
-        </Badge>
+        <h1>系统设置</h1>
       </div>
       {active && (
         <div className="notice notice-pink">
@@ -172,29 +158,12 @@ const SettingsPage = memo(function SettingsPage({
         </div>
       )}
       <div className="settings-layout">
-        <Card
-          title="AI 接口配置"
-          eyebrow="OPENAI COMPATIBLE"
-          icon={<WandSparkles size={19} />}
-        >
+        <Card title="AI 接口配置" icon={<WandSparkles size={19} />}>
           <div className="settings-status">
-            <span className="settings-icon">
-              <Sparkles size={22} />
-            </span>
-            <div>
-              <strong>
-                {aiRuntime.ready ? "AI 运行时已就绪" : "连接你的 AI 模型"}
-              </strong>
-              <p>
-                {aiRuntime.ready
-                  ? "控制范围由后端校验，模型仅能调用授权业务工具。"
-                  : aiRuntime.error ||
-                    "支持提供聊天与工具调用的 OpenAI 兼容接口。"}
-              </p>
-            </div>
             <Badge color={aiRuntime.ready ? "blue" : "gray"} dot>
-              {aiRuntime.ready ? "可用" : "待配置"}
+              {aiRuntime.ready ? "AI 运行时已就绪" : "AI 运行时未就绪"}
             </Badge>
+            {!aiRuntime.ready && aiRuntime.error && <p>{aiRuntime.error}</p>}
           </div>
           <DraftBar
             draft={draft}
@@ -237,16 +206,19 @@ const SettingsPage = memo(function SettingsPage({
             </div>
           )}
           <form
+            onInvalid={(event) => {
+              if (!(event.target instanceof HTMLElement)) return;
+              const advanced =
+                event.target.closest<HTMLDetailsElement>(".settings-advanced");
+              if (advanced) advanced.open = true;
+            }}
             onSubmit={(e) => {
               e.preventDefault();
               void save();
             }}
           >
             <fieldset className="plain-fieldset" disabled={disabled}>
-              <Field
-                label="AI 服务"
-                hint="切换服务或地址后需重新输入密钥，旧密钥不会自动转发。"
-              >
+              <Field label="AI 服务">
                 <select
                   aria-label="AI 服务"
                   value={provider}
@@ -258,31 +230,7 @@ const SettingsPage = memo(function SettingsPage({
                   <option value="deepseek">DeepSeek</option>
                 </select>
               </Field>
-              {provider === "deepseek" && (
-                <div className="notice notice-blue">
-                  <span>
-                    DeepSeek 官方预设：deepseek-flash；也可填写
-                    deepseek-v4-pro。默认关闭思考以减少控制等待。请使用 DeepSeek
-                    开放平台的 API Key。
-                    <a
-                      href="https://platform.deepseek.com/api_keys"
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      {" "}
-                      获取密钥
-                    </a>
-                  </span>
-                </div>
-              )}
-              <Field
-                label="Base URL"
-                hint={
-                  provider === "deepseek"
-                    ? "官方地址为 https://api.deepseek.com；使用代理时请确认地址与密钥的归属。"
-                    : "填写兼容 API 的基础地址，通常以 /v1 结尾。"
-                }
-              >
+              <Field label="Base URL">
                 <div className="input-with-icon">
                   <Link size={17} />
                   <input
@@ -302,10 +250,10 @@ const SettingsPage = memo(function SettingsPage({
                 label="API Key"
                 hint={
                   targetChanged && settings.apiKeySet
-                    ? "地址或服务已变化：请重新输入此服务的密钥。原配置在成功保存前保持有效。"
+                    ? "地址或服务已变化，请重新输入对应的密钥。"
                     : savedKeyUsable
-                      ? "已加密保存。留空保留现有密钥，填写新值可替换。"
-                      : "密钥仅保存在后端，不会进入浏览器持久化或日志。"
+                      ? "留空保留已保存的密钥。"
+                      : undefined
                 }
               >
                 <div className="input-with-icon">
@@ -331,11 +279,18 @@ const SettingsPage = memo(function SettingsPage({
                     {showKey ? <EyeOff size={17} /> : <Eye size={17} />}
                   </button>
                 </div>
+                {provider === "deepseek" && !savedKeyUsable && (
+                  <a
+                    className="text-button"
+                    href="https://platform.deepseek.com/api_keys"
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    获取 DeepSeek 密钥
+                  </a>
+                )}
               </Field>
-              <Field
-                label="模型名称"
-                hint="请使用提供商支持工具调用的模型 ID。"
-              >
+              <Field label="模型名称">
                 <div className="input-with-icon">
                   <Server size={17} />
                   <input
@@ -351,70 +306,69 @@ const SettingsPage = memo(function SettingsPage({
                   />
                 </div>
               </Field>
-              {provider === "deepseek" && (
-                <Field
-                  label="DeepSeek 思考模式"
-                  hint="开启后可能更慢；仍需返回有效业务工具，超时或无效输出不会产生动作。任务截止时间不变。"
-                >
-                  <select
-                    aria-label="DeepSeek 思考模式"
-                    value={form.deepseekThinking ?? "disabled"}
-                    onChange={(e) =>
-                      setForm({
-                        ...form,
-                        deepseekThinking: e.target.value as
-                          "enabled" | "disabled",
-                      })
-                    }
+              <details className="inline-details settings-advanced">
+                <summary>高级设置</summary>
+                {provider === "deepseek" && (
+                  <Field
+                    label="DeepSeek 思考模式"
+                    hint="开启思考可能增加等待时间。"
                   >
-                    <option value="disabled">关闭（推荐用于实时控制）</option>
-                    <option value="enabled">开启</option>
-                  </select>
-                </Field>
-              )}
-              <div className="form-grid">
-                <Field
-                  label="上下文窗口 / tokens"
-                  hint="填写模型实际支持的整数 token 数，范围为 1024–2000000。"
-                >
-                  <NumberInput
-                    label="模型上下文窗口"
-                    value={form.contextWindow}
-                    min={1024}
-                    max={2000000}
-                    step={1}
-                    onChange={(contextWindow) =>
-                      setForm({ ...form, contextWindow })
-                    }
-                  />
-                </Field>
-                <Field
-                  label="决策与测试超时 / 秒"
-                  hint="模型响应较慢时可提高等待时间；不会延长任务截止时间。"
-                >
-                  <NumberInput
-                    label="AI 请求超时"
-                    value={form.timeoutSec}
-                    min={AI_TIMEOUT_MIN_SEC}
-                    max={AI_TIMEOUT_MAX_SEC}
-                    onChange={(timeoutSec) => setForm({ ...form, timeoutSec })}
-                  />
-                </Field>
-                <Field
-                  label="任务草稿超时 / 秒"
-                  hint="草稿包含多阶段方案，默认等待 180 秒，可单独调整。"
-                >
-                  <NumberInput
-                    label="AI 任务草稿超时"
-                    value={aiTimeoutSeconds(form, "draft")}
-                    min={AI_TIMEOUT_MIN_SEC}
-                    max={AI_TIMEOUT_MAX_SEC}
-                    onChange={(draftTimeoutSec) =>
-                      setForm({ ...form, draftTimeoutSec })
-                    }
-                  />
-                </Field>
-              </div>
+                    <select
+                      aria-label="DeepSeek 思考模式"
+                      value={form.deepseekThinking ?? "disabled"}
+                      onChange={(e) =>
+                        setForm({
+                          ...form,
+                          deepseekThinking: e.target.value as
+                            "enabled" | "disabled",
+                        })
+                      }
+                    >
+                      <option value="disabled">关闭（推荐用于实时控制）</option>
+                      <option value="enabled">开启</option>
+                    </select>
+                  </Field>
+                )}
+                <div className="form-grid">
+                  <Field
+                    label="上下文窗口 / tokens"
+                    hint="按模型规格填写，范围 1,024–2,000,000。"
+                  >
+                    <NumberInput
+                      label="模型上下文窗口"
+                      value={form.contextWindow}
+                      min={1024}
+                      max={2000000}
+                      step={1}
+                      onChange={(contextWindow) =>
+                        setForm({ ...form, contextWindow })
+                      }
+                    />
+                  </Field>
+                  <Field label="决策与测试超时 / 秒">
+                    <NumberInput
+                      label="AI 请求超时"
+                      value={form.timeoutSec}
+                      min={AI_TIMEOUT_MIN_SEC}
+                      max={AI_TIMEOUT_MAX_SEC}
+                      onChange={(timeoutSec) =>
+                        setForm({ ...form, timeoutSec })
+                      }
+                    />
+                  </Field>
+                  <Field label="任务草稿超时 / 秒">
+                    <NumberInput
+                      label="AI 任务草稿超时"
+                      value={aiTimeoutSeconds(form, "draft")}
+                      min={AI_TIMEOUT_MIN_SEC}
+                      max={AI_TIMEOUT_MAX_SEC}
+                      onChange={(draftTimeoutSec) =>
+                        setForm({ ...form, draftTimeoutSec })
+                      }
+                    />
+                  </Field>
+                </div>
+              </details>
             </fieldset>
             {settings.apiKeySet && (
               <button
@@ -501,63 +455,22 @@ const SettingsPage = memo(function SettingsPage({
               <p>{result.message}</p>
             </div>
           )}
-        </Card>
-        <div className="settings-side">
-          <Card title="配置小贴士" icon={<Settings2 size={18} />}>
-            <div className="tip-item">
-              <span>01</span>
-              <div>
-                <strong>使用兼容接口</strong>
-                <p>Base URL 指向 API 基础地址，避免填写网页聊天地址。</p>
-              </div>
-            </div>
-            <div className="tip-item">
-              <span>02</span>
-              <div>
-                <strong>工具调用很重要</strong>
-                <p>
-                  AI 会通过受限工具控制设备；仅支持聊天的接口不能用于 AI 控制。
-                </p>
-              </div>
-            </div>
-            <div className="tip-item">
-              <span>03</span>
-              <div>
-                <strong>先测试，再开始</strong>
-                <p>测试会发送少量模型请求，分别验证聊天和工具调用能力。</p>
-              </div>
-            </div>
-          </Card>
-          <Card title="本地运行" icon={<Terminal size={18} />}>
-            <div className="summary-line">
-              <span>访问范围</span>
-              <strong>本机</strong>
-            </div>
-            <div className="summary-line">
-              <span>数据存储</span>
-              <strong>SQLite</strong>
-            </div>
-            <div className="summary-line">
-              <span>密钥存储</span>
-              <strong>后端加密</strong>
-            </div>
-            <p className="field-hint">
-              浏览器关闭后，后台服务继续计时和调度。停止服务会中断运行，重启后不会自动恢复输出。
+          <details className="inline-details">
+            <summary>接口配置说明</summary>
+            <p>
+              填写支持工具调用的模型。Base URL 使用 API 基础地址，例如
+              https://api.openai.com/v1。密钥加密保存在本机后端，连接测试会分别验证聊天和工具调用。
             </p>
-          </Card>
-          <a
-            className="docs-link"
-            href="https://github.com/dungeonlab-open/dglab-kit"
-            target="_blank"
-            rel="noreferrer"
-          >
-            <span>
-              <strong>郊狼官方开发文档</strong>
-              <small>协议与设备连接说明</small>
-            </span>
-            <ChevronRight size={17} />
-          </a>
-        </div>
+            <a
+              className="text-button"
+              href="https://github.com/dungeonlab-open/dglab-kit"
+              target="_blank"
+              rel="noreferrer"
+            >
+              郊狼设备文档
+            </a>
+          </details>
+        </Card>
       </div>
     </div>
   );
