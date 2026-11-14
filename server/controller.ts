@@ -1,7 +1,10 @@
 import { recordAction, type ActionExecution } from "../shared/actionRecord.js";
 import {
   applyOutputPatch,
+  fitRoleplayIntensity,
   roleplayBoundsSchema,
+  roleplayIntensityError,
+  roleplayIntensitySchema,
   type RoleplayBounds,
   type RoleplayPatch,
 } from "../shared/roleplay.js";
@@ -20,6 +23,7 @@ import type {
   AppSnapshot,
   Channel,
   ChannelConfig,
+  ChannelValues,
   ControlBounds,
   ControlSession,
   TimedControlSession,
@@ -988,12 +992,20 @@ export class Controller extends EventEmitter {
       if (this.epoch === epoch) this.stopping = false;
     }
   }
-  async startRoleplay(sessionId: string, input: unknown, requestId: string) {
+  async startRoleplay(
+    sessionId: string,
+    input: unknown,
+    requestId: string,
+    initialIntensity: unknown = channelValues(0),
+  ) {
     if (this.seenRequest(requestId)) return;
     const bounds = roleplayBoundsSchema.parse(input);
+    const targets = roleplayIntensitySchema.parse(initialIntensity);
     this.checkRoleplayBounds(bounds);
+    this.checkRoleplayIntensity(targets, bounds);
     await this.prepare(requestId);
     this.checkRoleplayBounds(bounds);
+    this.checkRoleplayIntensity(targets, bounds);
     const run: ControlSession = {
       ...this.makeRun("manual", "roleplay", 1, bounds.waveformIds),
       owner: "roleplay",
@@ -1003,12 +1015,12 @@ export class Controller extends EventEmitter {
         bounds,
         output: {
           A: {
-            target: 0,
+            target: targets.A,
             waveformId: bounds.waveformIds[0],
             rampPerSecond: bounds.rampPerSecond.A,
           },
           B: {
-            target: 0,
+            target: targets.B,
             waveformId: bounds.waveformIds[0],
             rampPerSecond: bounds.rampPerSecond.B,
           },
@@ -1028,6 +1040,51 @@ export class Controller extends EventEmitter {
       );
     }
     for (const id of bounds.waveformIds) this.requireWave(id);
+  }
+  private checkRoleplayIntensity(
+    targets: ChannelValues,
+    bounds: RoleplayBounds,
+  ) {
+    const limits = this.roleplayLimits(bounds);
+    const error = roleplayIntensityError(targets, bounds, limits);
+    assert(!error, error ?? "演绎强度无效");
+  }
+  private roleplayLimits(bounds: RoleplayBounds): ChannelValues {
+    return {
+      A: channelLimit(this.config, this.device.state.limits, "A", bounds),
+      B: channelLimit(this.config, this.device.state.limits, "B", bounds),
+    };
+  }
+  changeRoleplayIntensity(input: unknown, expectedRun: unknown) {
+    this.assertUnlocked();
+    const run = this.run;
+    assert(
+      run?.owner === "roleplay" && active(run),
+      "当前没有演绎联动",
+      "OWNER_CONFLICT",
+      409,
+    );
+    assert(
+      expectedRun === `${run.id}:${run.boundsVersion}:${run.status}`,
+      "演绎联动状态或授权已变化，请重新打开强度设置。",
+      "RANGE_CONFLICT",
+      409,
+    );
+    this.assertDevice();
+    const targets = roleplayIntensitySchema.parse(input);
+    this.checkRoleplayIntensity(targets, run.roleplay.bounds);
+    if (run.status === "paused") run.roleplay.resumeIntensity = targets;
+    else {
+      this.emit("roleplay-cancel");
+      for (const c of channels) run.roleplay.output[c].target = targets[c];
+      this.actionId = undefined;
+    }
+    this.persist();
+    this.log(
+      "info",
+      "情景演绎",
+      `${run.status === "paused" ? "已设置恢复强度" : "已手动设置目标强度"} A ${targets.A} / B ${targets.B}`,
+    );
   }
   applyRoleplay(
     runId: string,
@@ -1422,8 +1479,11 @@ export class Controller extends EventEmitter {
       epoch = ++this.epoch;
     run.elapsedMs += Date.now() - this.progressAt;
     run.status = "paused";
-    if (run.roleplay)
+    if (run.roleplay) {
+      const { A, B } = run.roleplay.output;
+      run.roleplay.resumeIntensity = { A: A.target, B: B.target };
       for (const c of channels) run.roleplay.output[c].target = 0;
+    }
     this.cancelAi();
     this.stopping = true;
     this.broadcast(true);
@@ -1483,6 +1543,16 @@ export class Controller extends EventEmitter {
       409,
     );
     if (this.run.mode === "live") this.checkLiveChannels();
+    const link = this.run.roleplay;
+    if (link) {
+      const targets = fitRoleplayIntensity(
+        link.resumeIntensity ?? channelValues(0),
+        link.bounds,
+        this.roleplayLimits(link.bounds),
+      );
+      for (const c of channels) link.output[c].target = targets[c];
+      delete link.resumeIntensity;
+    }
     this.run.status = "running";
     this.progressAt = Date.now();
     this.tickAt = Date.now();

@@ -425,7 +425,7 @@ try {
   await api(root + "/link/resume", {});
   assert.equal(
     (await api<AppSnapshot>("/api/state")).run!.roleplay!.output.A.target,
-    0,
+    8,
   );
   await send("继续探索");
   const fail = await send("持续错误");
@@ -447,7 +447,7 @@ try {
       "complete JSON and duplicate tools are recovered",
       "format retries preserve output and resend retains run",
       "cancel and late result",
-      "pause and no replay",
+      "pause zeroes output and resume restores the story targets",
       "21 HTTP503 requests then confirmed stop",
     ],
     failures,
@@ -645,6 +645,12 @@ try {
       for (const c of ["A", "B"] as const) {
         assert.equal(
           await dialog
+            .getByRole("spinbutton", { name: `${c} 初始强度`, exact: true })
+            .inputValue(),
+          String(Math.floor(app.device.state.limits[c] / 2)),
+        );
+        assert.equal(
+          await dialog
             .getByRole("spinbutton", { name: `${c} 最低强度`, exact: true })
             .inputValue(),
           "0",
@@ -704,9 +710,25 @@ try {
       await page
         .getByRole("spinbutton", { name: "B 最高强度", exact: true })
         .blur();
+      assert.equal(
+        await dialog
+          .getByRole("spinbutton", { name: "A 初始强度", exact: true })
+          .inputValue(),
+        "12",
+      );
+      assert.equal(
+        await dialog
+          .getByRole("spinbutton", { name: "B 初始强度", exact: true })
+          .inputValue(),
+        "7",
+      );
+      for (const c of ["A", "B"] as const)
+        await dialog
+          .getByRole("spinbutton", { name: `${c} 初始强度`, exact: true })
+          .fill("0");
       await page
         .getByRole("button", {
-          name: "确认授权，等待下一条玩家回复",
+          name: "确认并启用联动",
           exact: true,
         })
         .click();
@@ -745,10 +767,7 @@ try {
         .last();
       await heldZero.waitFor();
       await heldZero.locator(".ai-action-details > summary").click();
-      await heldZero
-        .getByText("保持零值", { exact: true })
-        .first()
-        .waitFor();
+      await heldZero.getByText("保持零值", { exact: true }).first().waitFor();
       assert.equal(app.controller.run!.roleplay!.output.A.target, 0);
       assert.equal(app.controller.run!.roleplay!.output.B.target, 0);
       await page
@@ -822,7 +841,69 @@ try {
       await page.getByRole("button", { name: "暂停输出", exact: true }).click();
       await until(async () => app.device.state.intensities.A === 0);
       await page.getByRole("button", { name: "恢复联动", exact: true }).click();
-      assert.equal(app.controller.run!.roleplay!.output.A.target, 0);
+      await until(
+        async () => app.controller.run!.roleplay!.output.A.target === 8,
+      );
+      assert.equal(app.controller.run!.roleplay!.output.B.target, 4);
+      await page.getByRole("button", { name: "暂停输出", exact: true }).click();
+      await page.getByRole("button", { name: "修改强度", exact: true }).click();
+      const intensity = page.getByRole("dialog", {
+        name: "修改强度",
+        exact: true,
+      });
+      assert.equal(
+        await intensity
+          .getByRole("spinbutton", { name: "A 目标强度", exact: true })
+          .inputValue(),
+        "8",
+      );
+      await intensity
+        .getByRole("spinbutton", { name: "A 目标强度", exact: true })
+        .fill("6");
+      await intensity
+        .getByRole("spinbutton", { name: "B 目标强度", exact: true })
+        .fill("3");
+      await intensity
+        .getByRole("button", { name: "保存强度", exact: true })
+        .click();
+      await intensity.waitFor({ state: "hidden" });
+      assert.deepEqual(app.device.state.intensities, { A: 0, B: 0 });
+      await page.getByRole("button", { name: "恢复联动", exact: true }).click();
+      await until(
+        async () =>
+          app.device.state.intensities.A === 6 &&
+          app.device.state.intensities.B === 3,
+      );
+      await page.getByRole("button", { name: "修改强度", exact: true }).click();
+      await intensity
+        .getByRole("spinbutton", { name: "A 目标强度", exact: true })
+        .fill("0");
+      await intensity
+        .getByRole("button", { name: "保存强度", exact: true })
+        .click();
+      await until(async () => app.device.state.intensities.A === 0);
+      assert.equal(app.device.state.intensities.B, 3);
+      await page.getByRole("button", { name: "结束联动", exact: true }).click();
+      await page
+        .getByRole("button", { name: "启用设备联动", exact: true })
+        .click();
+      assert.equal(
+        await dialog
+          .getByRole("spinbutton", { name: "A 初始强度", exact: true })
+          .inputValue(),
+        "20",
+      );
+      await dialog
+        .getByRole("spinbutton", { name: "A 初始强度", exact: true })
+        .fill("5");
+      await dialog
+        .getByRole("spinbutton", { name: "B 初始强度", exact: true })
+        .fill("0");
+      await dialog
+        .getByRole("button", { name: "确认并启用联动", exact: true })
+        .click();
+      await until(async () => app.device.state.intensities.A === 5);
+      assert.equal(app.device.state.intensities.B, 0);
       await page.getByRole("button", { name: "结束联动", exact: true }).click();
       await page
         .getByRole("button", { name: "启用设备联动", exact: true })
@@ -844,7 +925,8 @@ try {
       await page.getByRole("button", { name: "进入故事", exact: true }).click();
       await page.getByText("持续联动中", { exact: true }).waitFor();
       assert.equal(calls, beforeOpening, "linked opening does not call AI");
-      assert.equal(app.controller.run!.roleplay!.output.A.target, 0);
+      assert.equal(app.controller.run!.roleplay!.output.A.target, 20);
+      assert.equal(app.controller.run!.roleplay!.output.B.target, 20);
       const newRun = app.controller.run!.id;
       const input = page.getByRole("textbox", {
         name: "回复剧情",
@@ -1069,7 +1151,7 @@ try {
           "create story and pure dialogue",
           "three contextual quick replies, reload persistence, one-click send without double submission and narrow screens",
           "authorize A/B",
-          "new link defaults to all channels/waves/permissions, 0-device limits and 5/s",
+          "new link defaults to all enabled channels/waves/permissions, 0-device limits, 50% initial targets and 5/s",
           "cancelled new link restores defaults on reopening",
           "editing an active link preserves confirmed bounds",
           "keep at zero is explicit and preserves zero",
@@ -1077,9 +1159,10 @@ try {
           "continuous output",
           "375/390 responsive with fixed emergency",
           "reload restores true state",
-          "pause/resume no replay",
-          "stop",
-          "new story starts linked without a second enable action",
+          "pause zeroes output and resume restores the story targets",
+          "manual A/B targets apply while running or wait while paused",
+          "stop and re-enable with new initial targets",
+          "new story starts linked at half the device ceilings without a second enable action",
           "Enter sends, Shift+Enter inserts newline and IME confirmation does not send",
           "format exhaustion and resend leave continuous device linkage active",
           "story state empty/loaded/pending, grouping, desktop placement and 390px collapse",

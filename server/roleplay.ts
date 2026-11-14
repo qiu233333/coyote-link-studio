@@ -13,6 +13,7 @@ import {
   substitute,
   roleplayExecutionLabel,
   roleplayBoundsSchema,
+  roleplayIntensitySchema,
   type CharacterCard,
   type RoleplaySession,
   type RoleplayTurn,
@@ -485,10 +486,20 @@ export class RoleplayService {
     this.phase(unit, "unfinished", { retry: undefined });
     this.feed.change(unit.turn!.sessionId);
   }
-  async startLink(id: string, bounds: unknown, requestId: string) {
+  async startLink(
+    id: string,
+    bounds: unknown,
+    requestId: string,
+    initialIntensity?: unknown,
+  ) {
     this.session(id);
     this.available();
-    await this.controller.startRoleplay(id, bounds, requestId);
+    await this.controller.startRoleplay(
+      id,
+      bounds,
+      requestId,
+      initialIntensity,
+    );
   }
   async createWithLink(raw: unknown) {
     const input = z
@@ -502,6 +513,7 @@ export class RoleplayService {
           .object({
             bounds: roleplayBoundsSchema,
             requestId: z.string().uuid(),
+            initialIntensity: roleplayIntensitySchema.optional(),
           })
           .strict()
           .optional(),
@@ -513,7 +525,12 @@ export class RoleplayService {
     const session = this.create(data);
     if (!link) return session;
     try {
-      await this.startLink(session.id, link.bounds, link.requestId);
+      await this.startLink(
+        session.id,
+        link.bounds,
+        link.requestId,
+        link.initialIntensity,
+      );
       assert(
         this.controller.run?.roleplay?.sessionId === session.id,
         "启动请求已使用，请重新进入故事",

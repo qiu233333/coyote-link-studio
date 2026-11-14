@@ -438,6 +438,7 @@ export async function createApplication(
       String(req.params.id),
       req.body.bounds,
       String(req.body.requestId),
+      req.body.initialIntensity,
     ),
   );
   route("post", "/api/roleplay/sessions/:id/link/pause", (req) => {
@@ -451,6 +452,13 @@ export async function createApplication(
   route("patch", "/api/roleplay/sessions/:id/link/bounds", (req) => {
     roleplay.link(String(req.params.id));
     return controller.changeRoleplayBounds(req.body.bounds);
+  });
+  route("patch", "/api/roleplay/sessions/:id/link/intensity", (req) => {
+    roleplay.link(String(req.params.id));
+    return controller.changeRoleplayIntensity(
+      req.body.targets,
+      req.body.expectedRun,
+    );
   });
   route("post", "/api/roleplay/sessions/:id/link/stop", (req) => {
     roleplay.link(String(req.params.id));

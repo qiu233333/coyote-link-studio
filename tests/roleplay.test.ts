@@ -1226,7 +1226,7 @@ test("format errors retry without zero, exhaustion preserves linkage, and resend
   }
 });
 
-test("entering a story can start linked at zero; conflicting or disconnected starts leave no orphan story", async () => {
+test("entering and re-enabling a story use confirmed initial targets; failed starts leave no orphan story", async () => {
   const f = await fixture();
   const data = {
     cardId: f.card.id,
@@ -1236,14 +1236,19 @@ test("entering a story can start linked at zero; conflicting or disconnected sta
   try {
     const s = await f.service.createWithLink({
       ...data,
-      link: { bounds: f.bounds, requestId: randomUUID() },
+      link: {
+        bounds: f.bounds,
+        requestId: randomUUID(),
+        initialIntensity: { A: 10, B: 9 },
+      },
     });
     assert.equal(f.controller.run!.roleplay!.sessionId, s.id);
-    assert.equal(f.controller.run!.roleplay!.output.A.target, 0);
+    assert.equal(f.controller.run!.roleplay!.output.A.target, 10);
+    assert.equal(f.controller.run!.roleplay!.output.B.target, 9);
     assert.equal(
       f.calls(),
       0,
-      "opening never triggers model or nonzero output",
+      "opening sets a target without calling the model",
     );
     const count = f.service.sessions().length;
     await assert.rejects(() =>
@@ -1253,6 +1258,14 @@ test("entering a story can start linked at zero; conflicting or disconnected sta
       }),
     );
     assert.equal(f.service.sessions().length, count);
+    await f.controller.stop("roleplay");
+    await assert.rejects(
+      () => f.service.startLink(s.id, f.bounds, randomUUID(), { A: 21, B: 9 }),
+      /A 强度/,
+    );
+    await f.service.startLink(s.id, f.bounds, randomUUID(), { A: 3, B: 6 });
+    assert.equal(f.controller.run!.roleplay!.output.A.target, 3);
+    assert.equal(f.controller.run!.roleplay!.output.B.target, 6);
     await f.controller.stop("roleplay");
     await f.controller.disconnect();
     await assert.rejects(() =>
@@ -1269,7 +1282,7 @@ test("entering a story can start linked at zero; conflicting or disconnected sta
     await f.close();
   }
 });
-test("pause/range/resume cannot replay output; late inference after emergency is discarded", async () => {
+test("resume uses the latest story intensity within new bounds; emergency discards late inference", async () => {
   const f = await fixture();
   try {
     await f.service.startLink(f.session.id, f.bounds, randomUUID());
@@ -1285,7 +1298,7 @@ test("pause/range/resume cannot replay output; late inference after emergency is
     });
     assert.equal(f.controller.run!.boundsVersion, 2);
     await f.controller.resume("roleplay");
-    assert.equal(f.controller.run!.roleplay!.output.A.target, 0);
+    assert.equal(f.controller.run!.roleplay!.output.A.target, 4);
     let done!: (v: unknown) => void;
     f.setReply(() => new Promise((r) => (done = r)));
     const turn = f.service.send(f.session.id, {
@@ -1300,6 +1313,49 @@ test("pause/range/resume cannot replay output; late inference after emergency is
     assert.equal(f.service.turn(f.session.id, turn.id).status, "cancelled");
     assert.equal(f.controller.run!.status, "stopped");
     assert.equal(f.device.state.intensities.A, 0);
+  } finally {
+    await f.close();
+  }
+});
+test("manual roleplay targets cancel stale AI actions and paused edits wait for explicit resume", async () => {
+  const f = await fixture();
+  try {
+    await f.service.startLink(f.session.id, f.bounds, randomUUID(), {
+      A: 10,
+      B: 9,
+    });
+    const run = f.controller.run!;
+    const token = () => `${run.id}:${run.boundsVersion}:${run.status}`;
+    const wave = run.roleplay!.output.A.waveformId;
+    let done!: (value: RoleplayReply) => void;
+    f.setReply(() => new Promise((resolve) => (done = resolve)));
+    const turn = f.service.send(f.session.id, {
+      text: "继续",
+      requestId: randomUUID(),
+    });
+    await until(() => !!done);
+    f.controller.changeRoleplayIntensity({ A: 7, B: 0 }, token());
+    done(answer({ action: "update", channels: { A: { target: 11 } } }));
+    await until(() => !f.controller.roleplayBusy);
+    assert.equal(f.service.turn(f.session.id, turn.id).status, "cancelled");
+    assert.equal(run.roleplay!.output.A.target, 7);
+    assert.equal(run.roleplay!.output.A.waveformId, wave);
+
+    await f.controller.pause("roleplay");
+    assert.deepEqual(run.roleplay!.resumeIntensity, { A: 7, B: 0 });
+    assert.deepEqual(f.device.state.intensities, { A: 0, B: 0 });
+    const pausedToken = token();
+    f.controller.changeRoleplayIntensity({ A: 5, B: 4 }, pausedToken);
+    assert.equal(run.roleplay!.output.A.target, 0);
+    assert.equal(run.roleplay!.output.B.target, 0);
+    await f.controller.resume("roleplay");
+    assert.equal(run.roleplay!.output.A.target, 5);
+    assert.equal(run.roleplay!.output.B.target, 4);
+    assert.equal(run.roleplay!.resumeIntensity, undefined);
+    assert.throws(
+      () => f.controller.changeRoleplayIntensity({ A: 1, B: 1 }, pausedToken),
+      /状态或授权已变化/,
+    );
   } finally {
     await f.close();
   }

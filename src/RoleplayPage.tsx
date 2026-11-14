@@ -21,14 +21,17 @@ import {
   Bookmark,
   GitBranch,
 } from "lucide-react";
-import type { AppSnapshot, Channel } from "../shared/types";
+import type { AppSnapshot, Channel, ChannelValues } from "../shared/types";
+import { channelLimit } from "../shared/limits";
 import {
   cardFields,
   cardInstructions,
   cardSchema,
   cardTemplate,
   fileOf,
+  fitRoleplayIntensity,
   roleplayExecutionLabel,
+  roleplayIntensityError,
   type CardFile,
   type CharacterCard,
   type RoleplayBounds,
@@ -160,7 +163,7 @@ export default function RoleplayPage({
     [scenario, setScenario] = useState(""),
     [greeting, setGreeting] = useState(0);
   const initialBounds = (): RoleplayBounds => ({
-    channels: ["A", "B"],
+    channels: (["A", "B"] as const).filter((c) => state.channels[c].enabled),
     waveformIds: state.waveforms.map((w) => w.id),
     minIntensity: { A: 0, B: 0 },
     maxIntensity: { ...state.device.limits },
@@ -169,8 +172,13 @@ export default function RoleplayPage({
     allowRest: true,
     allowRamp: true,
   });
-  const [linkDialog, setLinkDialog] = useState(false),
+  const [linkDialog, setLinkDialog] = useState<"start" | "bounds" | null>(null),
     [bounds, setBounds] = useState<RoleplayBounds>(initialBounds);
+  const [initialEdits, setInitialEdits] = useState<Partial<ChannelValues>>({});
+  const [intensityDialog, setIntensityDialog] = useState<{
+    targets: ChannelValues;
+    expectedRun: string;
+  } | null>(null);
   const [startWithLink, setStartWithLink] = useState(true);
   const draftStore = useDraftStore();
   const inputDraft = useDraft(`story:${session?.id ?? ""}`, storyInputDraft);
@@ -226,6 +234,41 @@ export default function RoleplayPage({
       ? state.run
       : null;
   const run = activeRun?.roleplay?.sessionId === session?.id ? activeRun : null;
+  const linkState = run?.roleplay;
+  const linkToken = run ? `${run.id}:${run.boundsVersion}:${run.status}` : "";
+  const hardwareLimits = {
+    A: channelLimit(state.channels, state.device.limits, "A"),
+    B: channelLimit(state.channels, state.device.limits, "B"),
+  };
+  const defaultIntensity = fitRoleplayIntensity(
+    {
+      A: Math.floor(hardwareLimits.A / 2),
+      B: Math.floor(hardwareLimits.B / 2),
+    },
+    bounds,
+    hardwareLimits,
+  );
+  const initialIntensity = {
+    A: bounds.channels.includes("A")
+      ? (initialEdits.A ?? defaultIntensity.A)
+      : 0,
+    B: bounds.channels.includes("B")
+      ? (initialEdits.B ?? defaultIntensity.B)
+      : 0,
+  };
+  const initialError = roleplayIntensityError(
+    initialIntensity,
+    bounds,
+    hardwareLimits,
+  );
+  const intensityError =
+    linkState && intensityDialog
+      ? roleplayIntensityError(
+          intensityDialog.targets,
+          linkState.bounds,
+          hardwareLimits,
+        )
+      : undefined;
   const locked = state.locked;
   const latestMessage = messages.at(-1);
   const replyOptions =
@@ -285,6 +328,8 @@ export default function RoleplayPage({
     setSourceMessage(undefined);
     setSaveView(undefined);
     setSaveFeedback("");
+    setLinkDialog(null);
+    setIntensityDialog(null);
     setLibraryOpen(false);
     followLatest.current = true;
     setFollowing(true);
@@ -561,8 +606,44 @@ export default function RoleplayPage({
       body,
       method,
     );
-    if (r) setLinkDialog(false);
+    if (r) {
+      if (op === "start" || op === "bounds") setLinkDialog(null);
+      if (op === "intensity") setIntensityDialog(null);
+    }
   }
+  const intensityFields = (
+    label: string,
+    targets: ChannelValues,
+    range: RoleplayBounds,
+    update: (channel: Channel, target: number) => void,
+  ) => (
+    <div className="form-grid">
+      {(["A", "B"] as const).map((c) => (
+        <Field label={`${c} ${label}`} key={c}>
+          <NumberInput
+            label={`${c} ${label}`}
+            value={targets[c]}
+            min={0}
+            max={Math.min(range.maxIntensity[c], hardwareLimits[c])}
+            disabled={!range.channels.includes(c) || busy}
+            onChange={(target) => update(c, target)}
+          />
+        </Field>
+      ))}
+    </div>
+  );
+  const initialFields = () => (
+    <>
+      {intensityFields("初始强度", initialIntensity, bounds, (c, target) =>
+        setInitialEdits((current) => ({ ...current, [c]: target })),
+      )}
+      {initialError && (
+        <p className="notice" role="status">
+          {initialError}
+        </p>
+      )}
+    </>
+  );
   const boundsFields = () => (
     <>
       <div className="story-toolbar">
@@ -761,6 +842,7 @@ export default function RoleplayPage({
                       setNewCard(card);
                       setStartWithLink(true);
                       setBounds(initialBounds());
+                      setInitialEdits({});
                       setScenario(card.character.scenario);
                       setGreeting(0);
                     }}
@@ -1012,11 +1094,14 @@ export default function RoleplayPage({
                           !!activeRun ||
                           locked ||
                           busy ||
+                          state.stopping ||
+                          state.stopUnconfirmed ||
                           turn?.status === "pending"
                         }
                         onClick={() => {
                           setBounds(initialBounds());
-                          setLinkDialog(true);
+                          setInitialEdits({});
+                          setLinkDialog("start");
                         }}
                       >
                         启用设备联动
@@ -1025,7 +1110,9 @@ export default function RoleplayPage({
                       <>
                         <button
                           className="button small"
-                          disabled={state.stopping}
+                          disabled={
+                            state.stopping || (run.status === "paused" && busy)
+                          }
                           onClick={() =>
                             void link(
                               run.status === "paused" ? "resume" : "pause",
@@ -1041,9 +1128,33 @@ export default function RoleplayPage({
                         </button>
                         <button
                           className="button small secondary"
+                          disabled={
+                            state.stopping || state.stopUnconfirmed || busy
+                          }
+                          onClick={() => {
+                            const current = run.roleplay!;
+                            setIntensityDialog({
+                              expectedRun: linkToken,
+                              targets: fitRoleplayIntensity(
+                                run.status === "paused"
+                                  ? (current.resumeIntensity ?? { A: 0, B: 0 })
+                                  : {
+                                      A: current.output.A.target,
+                                      B: current.output.B.target,
+                                    },
+                                current.bounds,
+                                hardwareLimits,
+                              ),
+                            });
+                          }}
+                        >
+                          修改强度
+                        </button>
+                        <button
+                          className="button small secondary"
                           onClick={() => {
                             setBounds(structuredClone(run.roleplay!.bounds));
-                            setLinkDialog(true);
+                            setLinkDialog("bounds");
                           }}
                         >
                           修改范围
@@ -1792,9 +1903,9 @@ export default function RoleplayPage({
                 通道，A {bounds.minIntensity.A}–{bounds.maxIntensity.A} / B{" "}
                 {bounds.minIntensity.B}–{bounds.maxIntensity.B}，最大变化速率 A{" "}
                 {bounds.rampPerSecond.A}/s、B {bounds.rampPerSecond.B}
-                /s。开场输出为零，首条玩家回复后由 AI
-                调整；等待回复及关闭网页后保持输出，可随时暂停、结束或急停。
+                /s。确认后按初始强度逐步输出，首条玩家回复后由 AI 调整。
               </p>
+              {initialFields()}
               <details>
                 <summary>查看或调整联动范围</summary>
                 {boundsFields()}
@@ -1814,7 +1925,9 @@ export default function RoleplayPage({
               busy ||
               locked ||
               (startWithLink &&
-                (!state.device.connected ||
+                (!!initialError ||
+                  !bounds.channels.length ||
+                  !state.device.connected ||
                   !!activeRun ||
                   state.stopping ||
                   state.stopUnconfirmed))
@@ -1827,7 +1940,13 @@ export default function RoleplayPage({
                   scenario,
                   greetingIndex: greeting,
                   ...(startWithLink
-                    ? { link: { bounds, requestId: crypto.randomUUID() } }
+                    ? {
+                        link: {
+                          bounds,
+                          initialIntensity,
+                          requestId: crypto.randomUUID(),
+                        },
+                      }
                     : {}),
                 });
                 if (r) {
@@ -1844,37 +1963,99 @@ export default function RoleplayPage({
             {startWithLink
               ? "进入故事后自动启用联动，无需再次点击开启。"
               : "纯文字演绎，之后也可单独启用设备联动。"}
-            开场不会产生输出。
           </p>
         </Modal>
       )}
       {linkDialog && session && (
         <Modal
-          title={run ? "修改演绎授权范围" : "确认持续设备联动"}
-          onClose={() => setLinkDialog(false)}
+          title={
+            linkDialog === "bounds" ? "修改演绎授权范围" : "确认持续设备联动"
+          }
+          onClose={() => setLinkDialog(null)}
         >
           <p className="notice notice-pink">
-            无限时保持输出。等待回复及关闭网页后，后台仍保持当前输出；可随时暂停、停止或急停。修改范围会先暂停归零，确认后由下一条消息生成新动作。
+            {linkDialog === "bounds"
+              ? "修改范围会先暂停归零。恢复时，目标强度会按新范围和设备上限调整。"
+              : "确认后按初始强度逐步输出。等待回复及关闭网页后，后台仍保持联动，可随时暂停、结束或急停。"}
           </p>
+          {linkDialog === "start" && initialFields()}
           {boundsFields()}
           <button
             className="button primary"
             disabled={
               busy ||
               state.stopping ||
-              (!run && (!state.device.connected || !!activeRun))
+              (linkDialog === "bounds"
+                ? !run
+                : !!initialError ||
+                  !bounds.channels.length ||
+                  !state.device.connected ||
+                  !!activeRun ||
+                  state.stopUnconfirmed)
             }
             onClick={() =>
               void task(() =>
                 link(
-                  run ? "bounds" : "start",
-                  { bounds, requestId: crypto.randomUUID() },
-                  run ? "PATCH" : "POST",
+                  linkDialog,
+                  linkDialog === "bounds"
+                    ? { bounds }
+                    : {
+                        bounds,
+                        initialIntensity,
+                        requestId: crypto.randomUUID(),
+                      },
+                  linkDialog === "bounds" ? "PATCH" : "POST",
                 ),
               )
             }
           >
-            {run ? "确认新范围并保持暂停" : "确认授权，等待下一条玩家回复"}
+            {linkDialog === "bounds"
+              ? "确认新范围并保持暂停"
+              : "确认并启用联动"}
+          </button>
+        </Modal>
+      )}
+      {intensityDialog && run && linkState && (
+        <Modal title="修改强度" onClose={() => setIntensityDialog(null)}>
+          <p>
+            {run.status === "paused"
+              ? "保存后保持暂停，点击「恢复联动」才会逐步输出。"
+              : "保存后会按当前波形和变化速率调整到新的目标强度。"}
+          </p>
+          {intensityFields(
+            "目标强度",
+            intensityDialog.targets,
+            linkState.bounds,
+            (c, target) =>
+              setIntensityDialog(
+                (current) =>
+                  current && {
+                    ...current,
+                    targets: { ...current.targets, [c]: target },
+                  },
+              ),
+          )}
+          {(intensityError || intensityDialog.expectedRun !== linkToken) && (
+            <p className="notice" role="status">
+              {intensityDialog.expectedRun !== linkToken
+                ? "联动状态或授权已变化，请重新打开强度设置。"
+                : intensityError}
+            </p>
+          )}
+          <button
+            className="button primary"
+            disabled={
+              busy ||
+              state.stopping ||
+              state.stopUnconfirmed ||
+              !!intensityError ||
+              intensityDialog.expectedRun !== linkToken
+            }
+            onClick={() =>
+              void task(() => link("intensity", intensityDialog, "PATCH"))
+            }
+          >
+            保存强度
           </button>
         </Modal>
       )}

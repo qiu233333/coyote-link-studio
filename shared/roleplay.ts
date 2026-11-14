@@ -83,6 +83,50 @@ export const roleplayBoundsSchema = z
         });
   });
 export type RoleplayBounds = z.infer<typeof roleplayBoundsSchema>;
+export const roleplayIntensitySchema = values;
+
+export function fitRoleplayIntensity(
+  targets: ChannelValues,
+  bounds: RoleplayBounds,
+  limits: ChannelValues,
+): ChannelValues {
+  const fit = (channel: Channel) => {
+    if (!bounds.channels.includes(channel)) return 0;
+    const target = Math.min(
+      targets[channel],
+      bounds.maxIntensity[channel],
+      limits[channel],
+    );
+    return Number.isInteger(target) && target >= bounds.minIntensity[channel]
+      ? Math.max(0, target)
+      : 0;
+  };
+  const A = fit("A");
+  return { A, B: !bounds.allowSync && A > 0 ? 0 : fit("B") };
+}
+
+export function roleplayIntensityError(
+  targets: ChannelValues,
+  bounds: RoleplayBounds,
+  limits: ChannelValues,
+): string | undefined {
+  for (const channel of ["A", "B"] as const) {
+    const target = targets[channel];
+    if (target === 0) continue;
+    if (!bounds.channels.includes(channel)) return `${channel} 通道未授权`;
+    const max = Math.min(bounds.maxIntensity[channel], limits[channel]);
+    if (
+      !Number.isInteger(target) ||
+      target < bounds.minIntensity[channel] ||
+      target < 0 ||
+      target > max
+    )
+      return `${channel} 强度须为 0 或在 ${Math.max(1, bounds.minIntensity[channel])}–${max} 内的整数`;
+  }
+  if (!bounds.allowSync && targets.A > 0 && targets.B > 0)
+    return "当前授权只允许单通道输出，请将另一路强度设为 0";
+}
+
 export interface RoleplayOutputState {
   A: { target: number; waveformId: string; rampPerSecond: number };
   B: { target: number; waveformId: string; rampPerSecond: number };
@@ -222,6 +266,7 @@ export interface RoleplayLink {
   sessionId: string;
   bounds: RoleplayBounds;
   output: RoleplayOutputState;
+  resumeIntensity?: ChannelValues;
 }
 export const emptyMemory = (): StoryMemory => ({
   recentPlot: "",
