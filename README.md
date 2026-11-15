@@ -10,7 +10,7 @@
 
 在浏览器中控制郊狼 3。支持 A/B 双通道、波形编排、AI 控制、AI 上锁任务和情景演绎。
 
-[**下载 Windows 免安装版**](https://github.com/qiu233333/coyote-link-studio/releases/latest) · [快速启动](#quick-start) · [第一次使用](#first-use) · [功能一览](#features) · [波形导入](#waveforms)
+[**下载 Windows 免安装版**](https://github.com/qiu233333/coyote-link-studio/releases/latest) · [快速启动](#quick-start) · [第一次使用](#first-use) · [功能一览](#features) · [波形导入](#waveforms) <br>
 [**在线游玩**](https://coyote.qiu233.top:8443/)
 
 </div>
