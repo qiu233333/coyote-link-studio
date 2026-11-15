@@ -105,9 +105,6 @@ function Workspace({
       <a className="skip-link" href="#main-content">
         跳到主要内容
       </a>
-      <div className="ambient ambient-one" />
-      <div className="ambient ambient-two" />
-      <div className="star-field" />
       {mobileNav && <div className="nav-scrim" onClick={closeNavigation} />}
       <aside
         className={`sidebar ${mobileNav ? "mobile-open" : ""}`}

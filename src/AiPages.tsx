@@ -112,6 +112,7 @@ export function AiControlPage({ state, action, pending }: AiProps) {
       <div className="ai-workspace">
         <Card
           title="控制范围"
+          className="ai-range-card"
           icon={<SlidersIcon />}
           actions={
             run && (
@@ -445,7 +446,6 @@ export function LockedTaskPage({ state, action, pending }: AiProps) {
         {["描述需求", "编辑任务", "确认上锁", "执行与反馈"].map((s, i) => (
           <div
             key={s}
-            className={(run ? 3 : step) >= i ? "active" : ""}
             aria-current={(run ? 3 : step) === i ? "step" : undefined}
           >
             <span>

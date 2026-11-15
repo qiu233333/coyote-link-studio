@@ -164,8 +164,11 @@ export default function ConsolePage({
       <div className="section-title">
         <h1>控制台</h1>
       </div>
-      <section className="connection-strip glass-card">
-        <div className="device-orb">
+      <section
+        className="connection-strip glass-card"
+        data-connected={state.device.connected}
+      >
+        <div className="device-orb" aria-hidden="true">
           <Radio size={24} />
         </div>
         <div className="connection-primary">
@@ -679,72 +682,75 @@ function ChannelCard({
           <Activity size={17} />
         </span>
       </div>
-      <div className="channel-wave">
+      <figure className="channel-wave">
+        <figcaption>波形预览</figcaption>
         <WaveGraph
           values={wave?.preview}
           color={channel === "A" ? "blue" : "pink"}
         />
+      </figure>
+      <div className="channel-actions">
+        <Field label="目标强度">
+          <div className="range-control">
+            <IconButton
+              label={`${channel} 通道减少强度`}
+              disabled={disabled || config.target <= 0}
+              onClick={() => updateTarget(Math.max(0, config.target - 1))}
+            >
+              <Minus size={16} />
+            </IconButton>
+            <input
+              aria-label={`${channel} 通道目标强度滑块`}
+              type="range"
+              min={0}
+              max={deviceLimit}
+              value={Math.min(config.target, deviceLimit)}
+              disabled={disabled || deviceLimit <= 0}
+              onChange={(e) => updateTarget(Number(e.target.value))}
+            />
+            <IconButton
+              label={`${channel} 通道增加强度`}
+              disabled={disabled || config.target >= deviceLimit}
+              onClick={() => updateTarget(config.target + 1)}
+            >
+              <Plus size={16} />
+            </IconButton>
+          </div>
+          <div className="target-number">
+            <NumberInput
+              label={`${channel} 通道目标强度`}
+              value={config.target}
+              max={deviceLimit}
+              disabled={disabled}
+              onChange={updateTarget}
+              onBlur={() => setInvalidTarget(false)}
+            />
+            <button
+              className="text-button muted"
+              disabled={disabled}
+              onClick={() => updateTarget(0)}
+            >
+              归零
+            </button>
+          </div>
+          {invalidTarget && (
+            <span className="error-inline">
+              请输入 0–{deviceLimit} 之间的整数。
+            </span>
+          )}
+        </Field>
+        <Field label="当前波形">
+          <WaveSelect
+            label={`${channel} 通道波形`}
+            value={config.waveformId}
+            waveforms={state.waveforms}
+            disabled={disabled}
+            onChange={(waveformId) => {
+              if (waveformId) onPatch({ waveformId });
+            }}
+          />
+        </Field>
       </div>
-      <Field label="目标强度">
-        <div className="range-control">
-          <IconButton
-            label={`${channel} 通道减少强度`}
-            disabled={disabled || config.target <= 0}
-            onClick={() => updateTarget(Math.max(0, config.target - 1))}
-          >
-            <Minus size={16} />
-          </IconButton>
-          <input
-            aria-label={`${channel} 通道目标强度滑块`}
-            type="range"
-            min={0}
-            max={deviceLimit}
-            value={Math.min(config.target, deviceLimit)}
-            disabled={disabled || deviceLimit <= 0}
-            onChange={(e) => updateTarget(Number(e.target.value))}
-          />
-          <IconButton
-            label={`${channel} 通道增加强度`}
-            disabled={disabled || config.target >= deviceLimit}
-            onClick={() => updateTarget(config.target + 1)}
-          >
-            <Plus size={16} />
-          </IconButton>
-        </div>
-        <div className="target-number">
-          <NumberInput
-            label={`${channel} 通道目标强度`}
-            value={config.target}
-            max={deviceLimit}
-            disabled={disabled}
-            onChange={updateTarget}
-            onBlur={() => setInvalidTarget(false)}
-          />
-          <button
-            className="text-button muted"
-            disabled={disabled}
-            onClick={() => updateTarget(0)}
-          >
-            归零
-          </button>
-        </div>
-        {invalidTarget && (
-          <span className="error-inline">
-            请输入 0–{deviceLimit} 之间的整数。
-          </span>
-        )}
-      </Field>
-      <Field label="当前波形">
-        <WaveSelect
-          label={`${channel} 通道波形`}
-          value={config.waveformId}
-          waveforms={state.waveforms}
-          disabled={disabled}
-          onChange={(waveformId) => {
-            if (waveformId) onPatch({ waveformId });
-          }}
-        />
-      </Field>
     </Card>
   );
 }
@@ -907,11 +913,11 @@ export const Monitor = memo(function Monitor({
       actions={
         <div className="chart-legend">
           <span>
-            <i className="blue" />
+            <i className="blue" aria-hidden="true" />
             通道 A
           </span>
           <span>
-            <i className="pink" />
+            <i className="pink" aria-hidden="true" />
             通道 B
           </span>
         </div>
@@ -927,7 +933,7 @@ export const Monitor = memo(function Monitor({
           viewBox="0 0 620 145"
           preserveAspectRatio="none"
           role="img"
-          aria-label="A/B 通道强度变化曲线"
+          aria-label="设备回传强度：通道 A 实线，通道 B 虚线"
         >
           <path d="M0 18H620M0 74H620M0 130H620" className="chart-grid" />
           <polyline points={line("A")} className="line-a" />
